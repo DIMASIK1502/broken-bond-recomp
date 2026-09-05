@@ -91,18 +91,10 @@ and initializes its submodules.
 
 ### 2. Provide the game files
 
-Extract your ripped Xbox 360 ISO into `game/`. The entrypoint executable must be
-at `game/default.xex` (the path set in `broken_bond_manifest.toml`). Keep the
-original directory layout for all other assets.
+Extract the Xbox 360 disc into the `game/` folder in this repo and keep the
+original directory layout. The entrypoint must be `game/default.xex`.
 
-If the dump already lives elsewhere:
-
-```bat
-mklink /J game "D:\Xbox360\Naruto Broken Bond"
-```
-
-> **Do not commit anything under `game/`** — it contains copyrighted assets used
-> locally for recompilation only.
+`game/` is gitignored. Do not commit ISOs, XEX files, or other copyrighted assets.
 
 ### 3. Build the SDK CLI (one time)
 
@@ -181,8 +173,8 @@ This repo is source-only. A playable folder is assembled locally:
    - ReXGlue runtime / GPU plugin DLLs (`rexruntime*.dll`, `rexgpu-xenos*.dll`,
      and anything else the build placed next to the exe)
 3. Copy the launcher from `tools/` if you want a GUI start.
-4. On the target PC, create `game\` and extract **that user’s** Xbox 360 dump
-   into it (`default.xex` plus the original asset layout).
+4. On the target PC, extract the game into `game/` (`default.xex` plus the
+   original asset layout).
 5. First launch will compile D3D12 pipelines; later runs reuse the shader cache
    under the user-data folder.
 
