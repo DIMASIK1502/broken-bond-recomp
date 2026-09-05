@@ -1,0 +1,168 @@
+diff --git a/include/rex/audio/xma/context.h b/include/rex/audio/xma/context.h
+index 8426798..755be44 100644
+--- a/include/rex/audio/xma/context.h
++++ b/include/rex/audio/xma/context.h
+@@ -237,7 +237,7 @@ class XmaContext {
+   }
+ 
+  private:
+-  static void SwapInputBuffer(XMA_CONTEXT_DATA* data);
++  void SwapInputBuffer(XMA_CONTEXT_DATA* data);
+   static int GetSampleRate(int id);
+   static int16_t GetPacketNumber(size_t size, size_t bit_offset);
+   static uint32_t GetCurrentInputBufferSize(XMA_CONTEXT_DATA* data);
+@@ -306,6 +306,18 @@ class XmaContext {
+   bool carry_valid_ = false;
+   uint8_t pending_output_limit_ = 0;
+   uint8_t pending_start_skip_ = 0;
++
++  // Last frame spans into the next packet, which is not submitted yet.
++  // Hardware is realtime; this decoder is not. Swap before the guest drains
++  // output (kick-count EOS) chops ping-pong. Never swapping hangs JP dialogue.
++  // Wait until this input has produced samples AND the output ring is drained,
++  // then decode the truncated tail and let the normal end-of-buffer swap run.
++  bool input_starved_ = false;
++  bool produced_output_this_input_ = false;
++  uint32_t starve_read_offset_ = 0;
++  uint32_t starve_kicks_ = 0;
++
++  void ClearStarvedEosState();
+ };
+ 
+ }  // namespace rex::audio
+diff --git a/src/audio/xma_context.cpp b/src/audio/xma_context.cpp
+index 11b83be..68a4b1d 100644
+--- a/src/audio/xma_context.cpp
++++ b/src/audio/xma_context.cpp
+@@ -132,11 +132,13 @@ bool XmaContext::Work() {
+     return true;
+   }
+ 
++  input_starved_ = false;
+   while (remaining_subframe_blocks_in_output_buffer_ >= minimum_subframe_decode_count) {
+     Decode(&data);
+     Consume(&output_rb, &data);
++    data.output_buffer_write_offset = output_rb.write_offset() / kOutputBytesPerBlock;
+ 
+-    if (!data.IsAnyInputBufferValid() || data.error_status == 4) {
++    if (input_starved_ || !data.IsAnyInputBufferValid() || data.error_status == 4) {
+       break;
+     }
+   }
+@@ -209,6 +211,14 @@ void XmaContext::ResetDecoderState() {
+   current_frame_remaining_subframes_ = 0;
+   loop_frame_output_limit_ = 0;
+   loop_start_skip_pending_ = false;
++  input_starved_ = false;
++  produced_output_this_input_ = false;
++  ClearStarvedEosState();
++}
++
++void XmaContext::ClearStarvedEosState() {
++  starve_read_offset_ = 0;
++  starve_kicks_ = 0;
+ }
+ 
+ void XmaContext::Disable() {
+@@ -234,6 +244,7 @@ void XmaContext::SwapInputBuffer(XMA_CONTEXT_DATA* data) {
+   }
+   data->current_buffer ^= 1;
+   data->input_buffer_read_offset = kBitsPerPacketHeader;
++  produced_output_this_input_ = false;
+ }
+ 
+ void XmaContext::UpdateLoopStatus(XMA_CONTEXT_DATA* data) {
+@@ -459,6 +470,7 @@ void XmaContext::Consume(memory::RingBuffer* output_rb, const XMA_CONTEXT_DATA*
+ 
+   output_rb->Write(raw_frame_.data() + (kOutputBytesPerBlock * raw_frame_read_offset),
+                    subframes_to_write * kOutputBytesPerBlock);
++  produced_output_this_input_ = true;
+ 
+   const int8_t headroom = (current_frame_remaining_subframes_ - subframes_to_write == 0)
+                               ? data->output_buffer_padding
+@@ -605,6 +617,11 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+   if (packet_info.current_frame_size_ == 0) {
+     const uint8_t* next_packet = GetNextPacket(data, next_packet_index, current_input_packet_count);
+     if (!next_packet) {
++      REXAPU_WARN(
++          "XmaContext {}: split header, next packet {} unavailable "
++          "(end of buffer); treating as EOS (valid0={} valid1={} read={})",
++          id(), next_packet_index, uint32_t(data->input_buffer_0_valid),
++          uint32_t(data->input_buffer_1_valid), uint32_t(data->input_buffer_read_offset));
+       SwapInputBuffer(data);
+       return;
+     }
+@@ -617,6 +634,11 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+ 
+     uint64_t frame_size = combined.Peek(kBitsPerFrameHeader);
+     if (frame_size == xma::kMaxFrameLength) {
++      REXAPU_WARN(
++          "XmaContext {}: split header is kMaxFrameLength; error_status=4 "
++          "(valid0={} valid1={} read={})",
++          id(), uint32_t(data->input_buffer_0_valid), uint32_t(data->input_buffer_1_valid),
++          uint32_t(data->input_buffer_read_offset));
+       data->error_status = 4;
+       return;
+     }
+@@ -640,15 +662,57 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+       const uint8_t* next_packet =
+           GetNextPacket(data, next_packet_index, current_input_packet_count);
+       if (!next_packet) {
+-        data->error_status = 4;
+-        return;
++        // Hardware stalls until more input arrives or this buffer is done.
++        // We decode a 2KB packet in one kick, so "no next packet" is usually a
++        // ping-pong gap, not EOS. Invalidating here (immediate or after N kicks)
++        // drops the spanning frame and chops voices (run-mnk-010 / 012).
++        // error_status=4 makes this title wait forever for voice-done.
++        // Real EOS: this input already produced samples, the guest drained the
++        // output ring, and the other buffer still is not valid. Then decode the
++        // remaining bits (second packet half is already zero from fill) and let
++        // the end-of-buffer SwapInputBuffer run.
++        const uint32_t read_offset = data->input_buffer_read_offset;
++        if (starve_read_offset_ == read_offset) {
++          ++starve_kicks_;
++        } else {
++          starve_read_offset_ = read_offset;
++          starve_kicks_ = 1;
++        }
++        const bool output_drained =
++            current_frame_remaining_subframes_ == 0 &&
++            remaining_subframe_blocks_in_output_buffer_ >=
++                static_cast<int32_t>(data->output_buffer_block_count);
++        if (!produced_output_this_input_ || !output_drained) {
++          if (starve_kicks_ == 1 || (starve_kicks_ % 8192) == 0) {
++            REXAPU_DEBUG(
++                "XmaContext {}: last frame in packet {} needs next packet {} "
++                "(waiting; valid0={} valid1={} read={} kicks={} produced={} "
++                "free_blocks={} cap={} out_r={} out_w={})",
++                id(), packet_index, next_packet_index, uint32_t(data->input_buffer_0_valid),
++                uint32_t(data->input_buffer_1_valid), read_offset, starve_kicks_,
++                uint32_t(produced_output_this_input_), remaining_subframe_blocks_in_output_buffer_,
++                uint32_t(data->output_buffer_block_count), uint32_t(data->output_buffer_read_offset),
++                uint32_t(data->output_buffer_write_offset));
++          }
++          input_starved_ = true;
++          return;
++        }
++        REXAPU_WARN(
++            "XmaContext {}: last frame in packet {} needs next packet {} "
++            "(drained EOS, truncated tail; valid0={} valid1={} read={} kicks={})",
++            id(), packet_index, next_packet_index, uint32_t(data->input_buffer_0_valid),
++            uint32_t(data->input_buffer_1_valid), read_offset, starve_kicks_);
++        ClearStarvedEosState();
++      } else {
++        ClearStarvedEosState();
++        std::memcpy(input_buffer_.data() + kBytesPerPacketData, next_packet + kBytesPerPacketHeader,
++                    kBytesPerPacketData);
+       }
+-      std::memcpy(input_buffer_.data() + kBytesPerPacketData, next_packet + kBytesPerPacketHeader,
+-                  kBytesPerPacketData);
+     }
+   }
+ 
+   std::memcpy(input_buffer_.data(), packet + kBytesPerPacketHeader, kBytesPerPacketData);
++  ClearStarvedEosState();
+ 
+   stream = BitStream(input_buffer_.data(), (kBitsPerPacket - kBitsPerPacketHeader) * 2);
+   stream.SetOffset(relative_offset - kBitsPerPacketHeader);

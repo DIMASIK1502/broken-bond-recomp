@@ -18,9 +18,11 @@ Playable work-in-progress on Windows / D3D12 with the Xenos GPU plugin:
 - Saves go to `%USERPROFILE%\Documents\broken_bond\`
 - NVIDIA needs **D3D12 ROV** (`render_target_path_d3d12=rov`) or the 3D world
   goes black while UI still draws (EDRAM aliasing)
-- Japanese cutscene voice hang is an XMA end-of-stream issue in ReXGlue; English
-  voices are reliable. A local SDK patch (drained EOS) is required for JP lines
-  to finish — it is not upstream in stock `v0.10.0`
+- Japanese cutscene voices need the bundled XMA **drained EOS** SDK patch
+  (stock `v0.10.0` hangs; English voices are fine without it). `setup.ps1`
+  applies `patches/sdk/rexglue-sdk-v0.10.0.patch` automatically. Rebuild
+  `rexruntime` from that tree (`-DREXSDK_DIR=thirdparty\rexglue-sdk`); do not
+  link an installed unpatched SDK package.
 
 Iteration notes live in [`docs/PORTING_LOG.md`](docs/PORTING_LOG.md).
 
@@ -63,9 +65,12 @@ not by the assistant.
 ├── game/                          # Extracted Xbox 360 files (gitignored)
 │   └── default.xex                #   <- entrypoint XEX goes here
 ├── tools/                         # Optional launcher sources
+├── patches/
+│   ├── apply_sdk_patches.ps1      # git apply against the cloned SDK
+│   └── sdk/rexglue-sdk-v0.10.0.patch  # XMA drained-EOS (JP cutscenes)
 ├── docs/
 │   └── PORTING_LOG.md             # Evidence-driven porting notes
-├── setup.ps1                      # Clone SDK + init submodules
+├── setup.ps1                      # Clone SDK, submodules, apply patches
 └── .gitignore
 ```
 
@@ -86,8 +91,9 @@ not by the assistant.
 .\setup.ps1
 ```
 
-This clones the ReXGlue SDK (pinned to `v0.10.0`) into `thirdparty/rexglue-sdk`
-and initializes its submodules.
+This clones the ReXGlue SDK (pinned to `v0.10.0`) into `thirdparty/rexglue-sdk`,
+initializes its submodules, and applies `patches/sdk/rexglue-sdk-v0.10.0.patch`
+(XMA drained EOS so Japanese dialogue can finish). Safe to re-run.
 
 ### 2. Provide the game files
 

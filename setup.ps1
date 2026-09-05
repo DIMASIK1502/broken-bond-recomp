@@ -32,10 +32,17 @@ Write-Host "Initializing SDK submodules (this can take a while) ..."
 git -C $sdkDir submodule update --init --recursive --depth 1
 if ($LASTEXITCODE -ne 0) { throw "submodule init failed" }
 
+$applySdkPatches = Join-Path $root "patches\apply_sdk_patches.ps1"
+if (Test-Path $applySdkPatches) {
+    Write-Host "Applying local SDK patches ..."
+    & $applySdkPatches
+    if ($LASTEXITCODE -ne 0) { throw "SDK patch application failed" }
+}
+
 Write-Host ""
 Write-Host "Setup complete." -ForegroundColor Green
 Write-Host "Next steps:"
-Write-Host " 1. Extract your Xbox 360 ISO into .\game\ (entrypoint at game\default.xex)"
+Write-Host " 1. Extract the Xbox 360 disc into .\game\ (entrypoint at game\default.xex)"
 Write-Host " 2. Build the SDK CLI: cmake --preset win-amd64-release -DREXSDK_DIR=thirdparty\rexglue-sdk ; cmake --build out\build\win-amd64-release --target rexglue"
 Write-Host " 3. Configure & build the port: cmake --preset win-amd64-relwithdebinfo -DREXSDK_DIR=thirdparty\rexglue-sdk ; cmake --build out\build\win-amd64-relwithdebinfo"
 Write-Host " 4. Run broken_bond.exe with --game_data_root=game --gpu_plugin=xenos --mnk_mode --render_target_path_d3d12=rov"
