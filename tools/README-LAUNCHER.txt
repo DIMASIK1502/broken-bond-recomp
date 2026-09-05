@@ -1,8 +1,7 @@
 Naruto: The Broken Bond (PC / ReXGlue)
 ======================================
 
-Launch: Launcher.exe (or Start.bat / Запуск.bat). Python is not required
-for the Win32 launcher.
+Launch: Launcher.exe (or Start.bat / Запуск.bat).
 
 Build Launcher.exe:
 
@@ -24,5 +23,3 @@ Logs:  logs\run.log
 
 ROV is always forced on NVIDIA (otherwise the 3D world goes black).
 Do not rename the game\ folder.
-
-launcher.py is an optional PySide6 prototype (see requirements.txt).

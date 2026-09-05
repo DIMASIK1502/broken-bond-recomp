@@ -36,7 +36,7 @@ in the loop, under human direction.
 - Title-side C++ (Vision Camera stubs, path/save logging, CMake wiring)
 - Runtime diagnosis: missing PPC function-table entries, GPU black screens,
   shader hitching, XMA cutscene hangs
-- Optional Windows launcher (Qt / native Win32 sources under `tools/`)
+- Optional Windows launcher (Win32 sources under `tools/`)
 - Repository hygiene, setup scripts, and this README
 
 **A human owned:**
@@ -153,9 +153,8 @@ drop required settings such as ROV.
 
 ## Optional launcher
 
-`tools/` contains a small Windows launcher (Win32 `launcher_win.cpp`, or the
-PySide6 prototype `launcher.py`) that writes `broken_bond.toml` and starts the
-exe with the required flags.
+`tools/` contains a small Windows launcher (`launcher_win.cpp`) that writes
+`broken_bond.toml` and starts the exe with the required flags.
 
 ```bat
 cd tools
