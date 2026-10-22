@@ -497,5 +497,14 @@ still Xenos.
 
 Xenos tiling for a later host path is `Untile` in
 `rex/graphics/pipeline/texture/conversion.h`, with the tile sizes in
-`rex/graphics/xenos.h`.
+`rex/graphics/xenos.h`. `shader_db` compiles those sources and checks them
+against `GetTiledOffset2D`. For every format whose block size is a power of
+two (61 of 64), both a full rectangle and an unaligned window were untilled
+at pitches 32, 64, 96 and 128. All 1366400 block addresses matched, and none
+were repeated. The three skipped formats are the two 1-bit formats, whose
+block size is zero bytes in the table, and `k_32_32_32_FLOAT`, which is 12
+bytes per block and is not tiled. A 64×48 `k_8_8_8_8` image tiled with
+`GetTiledOffset2D` and passed through `Untile` came back unchanged.
+`CopySwapBlock` matched the four 32-bit endian modes. There is no 3D untile
+in this check. This is still not `src/gfx/`.
 

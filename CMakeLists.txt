@@ -65,7 +65,10 @@ if(EXISTS "${BROKEN_BOND_REXGLUE_SOURCE}/src/graphics/pipeline/shader/spirv_tran
         "${BROKEN_BOND_REXGLUE_SOURCE}/src/graphics/pipeline/shader/spirv_translator_alu.cpp"
         "${BROKEN_BOND_REXGLUE_SOURCE}/src/graphics/pipeline/shader/spirv_translator_fetch.cpp"
         "${BROKEN_BOND_REXGLUE_SOURCE}/src/graphics/pipeline/shader/spirv_translator_memexport.cpp"
-        "${BROKEN_BOND_REXGLUE_SOURCE}/src/graphics/pipeline/shader/spirv_translator_rb.cpp")
+        "${BROKEN_BOND_REXGLUE_SOURCE}/src/graphics/pipeline/shader/spirv_translator_rb.cpp"
+        "${BROKEN_BOND_REXGLUE_SOURCE}/src/graphics/pipeline/texture/conversion.cpp"
+        "${BROKEN_BOND_REXGLUE_SOURCE}/src/graphics/pipeline/texture/info_formats.cpp"
+        "${BROKEN_BOND_REXGLUE_SOURCE}/src/graphics/pipeline/texture/util.cpp")
     target_compile_definitions(shader_db PRIVATE SHADER_DB_TRANSLATE)
     target_include_directories(shader_db BEFORE PRIVATE
         "${BROKEN_BOND_REXGLUE_SOURCE}/include"

@@ -36,8 +36,12 @@
 #include <map>
 #include <utility>
 
+#include <cstring>
+
 #include <rex/cvar.h>
 #include <rex/graphics/pipeline/shader/spirv.h>
+#include <rex/graphics/pipeline/texture/conversion.h>
+#include <rex/graphics/pipeline/texture/util.h>
 #include <rex/string/buffer.h>
 
 #if defined(SHADER_DB_VULKAN_SDK)
@@ -1396,10 +1400,183 @@ std::string ReadName(const uint8_t* bytes) {
   return std::string(reinterpret_cast<const char*>(bytes), length);
 }
 
+#if defined(SHADER_DB_TRANSLATE)
+struct TileResult {
+  uint32_t formats = 0;
+  uint32_t checked = 0;
+  uint32_t skipped = 0;
+  uint32_t blocks = 0;
+  uint32_t address_failed = 0;
+  uint32_t duplicate = 0;
+  uint32_t roundtrip_failed = 0;
+  bool endian_ok = false;
+  std::string skipped_names;
+  std::string example;
+};
+
+uint32_t BlockLog2(uint32_t bytes) {
+  uint32_t log2 = 0;
+  for (uint32_t n = bytes; n > 1; n >>= 1) {
+    ++log2;
+  }
+  return log2;
+}
+
+bool CheckTileWindow(const rex::graphics::FormatInfo* format, uint32_t pitch, uint32_t offset_x,
+                     uint32_t offset_y, uint32_t width, uint32_t height, TileResult& result) {
+  const uint32_t bytes = format->bytes_per_block();
+  const uint32_t log2 = BlockLog2(bytes);
+  const uint32_t untile_log2 = (bytes / 4) + ((bytes / 2) >> (bytes / 4));
+  if (bytes == 0 || (uint32_t(1) << log2) != bytes || untile_log2 != log2) {
+    return false;
+  }
+  const uint32_t bound = rex::graphics::texture_util::GetTiledAddressUpperBound2D(
+      offset_x + width, offset_y + height, pitch, log2);
+  std::vector<uint8_t> tiled(static_cast<size_t>(bound) + bytes);
+  std::vector<uint8_t> output(static_cast<size_t>(width) * height * bytes);
+  std::vector<uint32_t> addresses;
+  addresses.reserve(static_cast<size_t>(width) * height);
+  rex::graphics::texture_conversion::UntileInfo info{};
+  info.offset_x = offset_x;
+  info.offset_y = offset_y;
+  info.width = width;
+  info.height = height;
+  info.input_pitch = pitch;
+  info.output_pitch = width;
+  info.input_format_info = format;
+  info.output_format_info = format;
+  info.copy_callback = [&](void* output, const void* input, size_t length) {
+    addresses.push_back(static_cast<uint32_t>(static_cast<const uint8_t*>(input) - tiled.data()));
+    if (output != nullptr && length != 0) {
+      std::memset(output, 0, length);
+    }
+  };
+  rex::graphics::texture_conversion::Untile(output.data(), tiled.data(), &info);
+  std::set<uint32_t> seen;
+  bool ok = addresses.size() == static_cast<size_t>(width) * height;
+  for (uint32_t y = 0; y < height && ok; ++y) {
+    for (uint32_t x = 0; x < width; ++x) {
+      const uint32_t got = addresses[static_cast<size_t>(y) * width + x];
+      const uint32_t expected = static_cast<uint32_t>(rex::graphics::texture_util::GetTiledOffset2D(
+          int32_t(offset_x + x), int32_t(offset_y + y), pitch, log2));
+      if (!seen.insert(got).second) {
+        ++result.duplicate;
+        ok = false;
+      }
+      if (got != expected || got + bytes > tiled.size()) {
+        ++result.address_failed;
+        if (result.example.empty()) {
+          result.example = std::string(format->name) + " pitch " + std::to_string(pitch) + " x " +
+                           std::to_string(offset_x + x) + " y " + std::to_string(offset_y + y) +
+                           " untile " + std::to_string(got) + " address " + std::to_string(expected);
+        }
+        ok = false;
+        break;
+      }
+    }
+  }
+  result.blocks += static_cast<uint32_t>(addresses.size());
+  ++result.checked;
+  return ok;
+}
+
+TileResult CheckTiling() {
+  TileResult result;
+  uint8_t endian_in[4] = {0x11, 0x22, 0x33, 0x44};
+  uint8_t endian_out[4] = {};
+  auto swapped = [&](rex::graphics::xenos::Endian endian, uint8_t a, uint8_t b, uint8_t c,
+                     uint8_t d) {
+    rex::graphics::texture_conversion::CopySwapBlock(endian, endian_out, endian_in, 4);
+    return endian_out[0] == a && endian_out[1] == b && endian_out[2] == c && endian_out[3] == d;
+  };
+  result.endian_ok = swapped(rex::graphics::xenos::Endian::kNone, 0x11, 0x22, 0x33, 0x44) &&
+                     swapped(rex::graphics::xenos::Endian::k8in16, 0x22, 0x11, 0x44, 0x33) &&
+                     swapped(rex::graphics::xenos::Endian::k8in32, 0x44, 0x33, 0x22, 0x11) &&
+                     swapped(rex::graphics::xenos::Endian::k16in32, 0x33, 0x44, 0x11, 0x22);
+
+  for (uint32_t format_index = 0; format_index < 64; ++format_index) {
+    const rex::graphics::FormatInfo* format = rex::graphics::FormatInfo::Get(format_index);
+    ++result.formats;
+    const uint32_t bytes = format->bytes_per_block();
+    const uint32_t log2 = BlockLog2(bytes);
+    if (bytes == 0 || (uint32_t(1) << log2) != bytes) {
+      ++result.skipped;
+      if (!result.skipped_names.empty()) {
+        result.skipped_names += " ";
+      }
+      result.skipped_names += format->name;
+      continue;
+    }
+    const uint32_t pitches[] = {32, 64, 96, 128};
+    for (uint32_t pitch : pitches) {
+      CheckTileWindow(format, pitch, 0, 0, pitch, 64, result);
+      CheckTileWindow(format, pitch, 8, 4, 24, 20, result);
+    }
+  }
+
+  const rex::graphics::FormatInfo* rgba = rex::graphics::FormatInfo::Get(
+      static_cast<uint32_t>(rex::graphics::xenos::TextureFormat::k_8_8_8_8));
+  constexpr uint32_t kPitch = 64;
+  constexpr uint32_t kHeight = 48;
+  const uint32_t bytes = rgba->bytes_per_block();
+  const uint32_t log2 = BlockLog2(bytes);
+  const uint32_t bound =
+      rex::graphics::texture_util::GetTiledAddressUpperBound2D(kPitch, kHeight, kPitch, log2);
+  std::vector<uint8_t> linear(static_cast<size_t>(kPitch) * kHeight * bytes);
+  std::vector<uint8_t> tiled(static_cast<size_t>(bound) + bytes);
+  std::vector<uint8_t> restored(linear.size());
+  for (size_t i = 0; i < linear.size(); ++i) {
+    linear[i] = static_cast<uint8_t>(i * 17u + 3u);
+  }
+  for (uint32_t y = 0; y < kHeight; ++y) {
+    for (uint32_t x = 0; x < kPitch; ++x) {
+      const uint32_t address = static_cast<uint32_t>(
+          rex::graphics::texture_util::GetTiledOffset2D(int32_t(x), int32_t(y), kPitch, log2));
+      std::memcpy(tiled.data() + address, linear.data() + (static_cast<size_t>(y) * kPitch + x) * bytes,
+                  bytes);
+    }
+  }
+  rex::graphics::texture_conversion::UntileInfo info{};
+  info.width = kPitch;
+  info.height = kHeight;
+  info.input_pitch = kPitch;
+  info.output_pitch = kPitch;
+  info.input_format_info = rgba;
+  info.output_format_info = rgba;
+  info.copy_callback = [](void* output, const void* input, size_t length) {
+    std::memcpy(output, input, length);
+  };
+  rex::graphics::texture_conversion::Untile(restored.data(), tiled.data(), &info);
+  result.roundtrip_failed = restored == linear ? 0 : 1;
+  return result;
+}
+#endif
+
 }  // namespace
 
 int main(int argc, char** argv) {
   try {
+    int tiling_failed = 0;
+#if defined(SHADER_DB_TRANSLATE)
+    const TileResult tiling = CheckTiling();
+    tiling_failed = (tiling.address_failed != 0 || tiling.duplicate != 0 ||
+                     tiling.roundtrip_failed != 0 || !tiling.endian_ok)
+                        ? 1
+                        : 0;
+    std::cout << "tiling\n";
+    std::cout << "  formats " << tiling.formats << "\n";
+    std::cout << "  checked " << tiling.checked << "\n";
+    std::cout << "  skipped " << tiling.skipped << " " << tiling.skipped_names << "\n";
+    std::cout << "  blocks " << tiling.blocks << "\n";
+    std::cout << "  address_failed " << tiling.address_failed << "\n";
+    std::cout << "  duplicate " << tiling.duplicate << "\n";
+    std::cout << "  roundtrip_failed " << tiling.roundtrip_failed << "\n";
+    std::cout << "  endian_ok " << (tiling.endian_ok ? 1 : 0) << "\n";
+    if (!tiling.example.empty()) {
+      std::cout << "  example " << tiling.example << "\n";
+    }
+    std::cout.flush();
+#endif
     if (argc != 2) {
       std::cerr << "usage: shader_db <xeshader.sdb>\n";
       return 2;
@@ -1649,6 +1826,9 @@ int main(int argc, char** argv) {
       std::cout << "  fatal " << ranked[i].first << " " << ranked[i].second << "\n";
     }
 #endif
+    if (tiling_failed != 0) {
+      return 1;
+    }
     return 0;
   } catch (const std::exception& error) {
     std::cerr << error.what() << "\n";
