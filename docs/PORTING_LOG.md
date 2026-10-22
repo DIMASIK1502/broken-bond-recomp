@@ -422,7 +422,17 @@ version token. This dump inflates to 9788660 bytes: 4648 `vs_3_0`
 records, 2 for 3508, and 0 for one; both 1 and 2 contain vertex and pixel
 shaders, so the stage is the version token.
 
-`shader_db` does not translate those objects. Xenos tiling for a later host
-path is `Untile` in `rex/graphics/pipeline/texture/conversion.h`, with the tile
-sizes in `rex/graphics/xenos.h`. The running renderer is still Xenos.
+Each inflated object is big-endian. The first dword is `0x102A1101` for every
+`vs_3_0` and `0x102A1100` for every `ps_3_0`. The next two dwords are the byte
+offset and size of the second section, and those two sections add up to the
+object. Dword 6 is the offset of a descriptor `{u32 offset, u32 bytes}` whose
+offset is relative to that second section. On this dump that microcode is
+4339980 bytes, every size a multiple of 12. The first three dwords unpack as
+two Xenos control-flow instructions, and the first exec address is a slot
+index inside that microcode. `shader_db` checks this and still does not
+translate it.
+
+Xenos tiling for a later host path is `Untile` in
+`rex/graphics/pipeline/texture/conversion.h`, with the tile sizes in
+`rex/graphics/xenos.h`. The running renderer is still Xenos.
 

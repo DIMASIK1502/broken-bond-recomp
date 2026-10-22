@@ -8,8 +8,15 @@
 //     zlib payload of compressed_size bytes
 //   32-byte preamble, then shader_count records of 11 big-endian words:
 //     payload offset, compressed size, raw size, tag, aux, id, key, 4 unused
-//   each payload is zlib. Dword at offset 48 of the inflated object is the
-//   D3D9 shader version: 0xFFFE0300 is vs_3_0, 0xFFFF0300 is ps_3_0.
+//   each payload is zlib. The inflated object is big-endian:
+//     u32 magic              0x102A1101 vertex, 0x102A1100 pixel
+//     u32 code_section       byte offset of the second section
+//     u32 code_section_bytes the two sections add up to the object
+//     u32 zero, info_offset, another offset
+//     u32 ucode_desc         byte offset of {u32 offset, u32 bytes}
+//   ucode offset is relative to code_section. Dword at object offset 48 is
+//   the D3D9 version: 0xFFFE0300 vs_3_0, 0xFFFF0300 ps_3_0. The microcode is
+//   Xenos control flow packed as two instructions per three dwords.
 
 #include <cstdint>
 #include <fstream>
@@ -313,6 +320,56 @@ struct ShaderRecord {
   uint32_t tag = 0;
 };
 
+// First control-flow triple must contain an exec whose address is a slot
+// index inside this microcode. Slot 0 is the triple itself.
+uint32_t CheckUcode(const uint8_t* object, size_t size, uint32_t token) {
+  if (size < 28 || size % 4 != 0) {
+    Fail("shader object is truncated");
+  }
+  const uint32_t magic = ReadBe32(object);
+  if (token == 0xFFFE0300u && magic != 0x102A1101u) {
+    Fail("vertex shader magic does not match vs_3_0");
+  }
+  if (token == 0xFFFF0300u && magic != 0x102A1100u) {
+    Fail("pixel shader magic does not match ps_3_0");
+  }
+  const uint32_t section = ReadBe32(object + 4);
+  const uint32_t section_bytes = ReadBe32(object + 8);
+  const uint32_t desc = ReadBe32(object + 24);
+  if (section + section_bytes != size || desc + 8 > size) {
+    Fail("shader sections do not cover the object");
+  }
+  const uint32_t ucode_offset = ReadBe32(object + desc);
+  const uint32_t ucode_bytes = ReadBe32(object + desc + 4);
+  const uint32_t ucode_at = section + ucode_offset;
+  if (ucode_bytes < 12 || ucode_bytes % 12 != 0 || ucode_at + ucode_bytes > size) {
+    Fail("shader microcode is outside the object");
+  }
+  const uint32_t dword_0 = ReadBe32(object + ucode_at);
+  const uint32_t dword_1 = ReadBe32(object + ucode_at + 4);
+  const uint32_t dword_2 = ReadBe32(object + ucode_at + 8);
+  const uint32_t slots = ucode_bytes / 12;
+  auto ExecAddress = [slots](uint32_t word0, uint32_t word1) -> uint32_t {
+    const uint32_t opcode = (word1 >> 12) & 0xF;
+    const bool exec = opcode == 1 || opcode == 2 || opcode == 3 || opcode == 4 || opcode == 5 ||
+                      opcode == 6 || opcode == 13 || opcode == 14;
+    if (!exec) {
+      return 0;
+    }
+    const uint32_t address = word0 & 0xFFF;
+    if (address == 0 || address > slots) {
+      Fail("shader control flow points outside the microcode");
+    }
+    return address;
+  };
+  const uint32_t first = ExecAddress(dword_0, dword_1 & 0xFFFF);
+  const uint32_t second = ExecAddress((dword_1 >> 16) | (dword_2 << 16), dword_2 >> 16);
+  if (first == 0 && second == 0) {
+    Fail("shader microcode does not start with control flow");
+  }
+  return ucode_bytes;
+}
+
 std::string ReadName(const uint8_t* bytes) {
   size_t length = 0;
   while (length < 64 && bytes[length] != 0) {
@@ -402,6 +459,7 @@ int main(int argc, char** argv) {
     uint32_t pixel = 0;
     uint32_t other = 0;
     uint64_t raw_bytes = 0;
+    uint64_t ucode_bytes = 0;
     uint32_t tag_count[3] = {};
     for (const ShaderRecord& shader : shaders) {
       const std::vector<uint8_t> object =
@@ -411,6 +469,7 @@ int main(int argc, char** argv) {
         Fail("shader object is shorter than its version token");
       }
       const uint32_t token = ReadBe32(object.data() + 48);
+      ucode_bytes += CheckUcode(object.data(), object.size(), token);
       if (token == 0xFFFE0300u) {
         ++vertex;
       } else if (token == 0xFFFF0300u) {
@@ -435,6 +494,7 @@ int main(int argc, char** argv) {
     std::cout << "  tag0 " << tag_count[0] << " tag1 " << tag_count[1] << " tag2 " << tag_count[2]
               << "\n";
     std::cout << "inflated " << raw_bytes << "\n";
+    std::cout << "ucode " << ucode_bytes << "\n";
     return 0;
   } catch (const std::exception& error) {
     std::cerr << error.what() << "\n";
