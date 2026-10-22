@@ -320,13 +320,58 @@ Evidence, windowed, `resolution_scale=1`, vsync left on, ROV:
   first second, swap is 30 Hz: 150 presents / 5 s, last dt ~33 ms, 24 Hz
   bucket empty. Not a 24 fps Bink clock and not 60.
 - `logs/guest-present-003-skip.log`: flag on, `Ubisoft.bik` refused twice,
-  no fatal, swap stays ~30 Hz. `AttractMode*` was not opened in that window.
+  no fatal, swap stays ~30 Hz.
+- `logs/guest-present-004-after-boot.log`: ~60 s later `AttractMode_US.bik`
+  is refused twice. Swap stays 30 Hz through that wait and for ~25 s after.
+  That tail was not confirmed as the title menu, world, or a fight.
 
-Menu, world, and fight intervals are not measured yet.
+World and fight intervals are not measured yet.
+
+## Orochimaru line frozen, music still playing
+
+Evidence (`logs/guest-present-005-play.log`, English subtitle on screen):
+- Guest swap stays 30 Hz. BGM continues. Space does not advance the line.
+- `drained EOS` fires at `kicks=1..3` on every spanning packet
+  (`valid0` / `valid1` still a ping-pong pair), then XMA logs stop while
+  present continues. Same hang as run-mnk-010: the worker declares the
+  voice finished before the game submits the next 2KB buffer.
+
+`logs/guest-present-006-voice.log` after a 300 ms wait still shows
+`drained EOS` on every packet (`waited_ms=300`, `skip -9 bits`). The other
+buffer becomes valid only after `SwapInputBuffer`. Zero-padding that gap
+desyncs ffmpeg, so the line never reaches voice-done. Language toggle
+resets the context and hides it.
+
+`logs/guest-present-009-no-zeropad.log`: splits stitch, then context 2
+hits `split hold released` and XMA goes silent while present stays 30 Hz.
+The voice object counts consumed PCM (`+436`, countdown `+276`) and sets
+done (`+416`) only after the last buffer is freed. Dropping that last
+frame leaves the counter short, so the pose stays up.
+
+`logs/guest-present-010-tail.log`: 943 real stitches, then 71
+`split tail emitted` at 800 ms. After each tail ffmpeg logs `skip -9 bits`
+or a spectral RLE overflow, and context 0 (the line) stops receiving a
+second buffer inside that window. The tail is a false end: stitches resume
+about 60 ms later from a dirty codec, and the subtitle stays up.
+
+Do not zero-pad a spanning frame. Keep the saved half until the real second
+buffer arrives. If that wait passes 1 s, write silence into the output ring
+so the title's 2400-byte refill lead can move, and still do not feed those
+zeros to ffmpeg.
+
+`logs/guest-present-011-nudge.log`: the user played the same line on English,
+returned to the title menu, started a new game, and played it again on
+Japanese. Both advanced with no language toggle. The log has real stitches
+and silence nudges, and no `skip -9` / `split tail emitted`.
 
 Graphics imports in `generated/default/broken_bond_init.cpp` are `Vd*`, not
 `IDirect3D` / `D3DDevice`. Present is `__imp__VdSwap` at `0x82C0A9BC`.
 Also imported: ring-buffer init, command buffer, display mode/gamma, scaler,
 `VdRetrainEDRAM` / `VdRetrainEDRAMWorker`. Draw and shader setup are inside
 the XEX. No Bink import; movies go through the file open.
+
+The only `VdSwap` call is `sub_821B1DD0`. It takes the guest device in `r3`,
+reads `VdGetSystemCommandBuffer`, then swaps. Callers: `sub_821B8740`,
+`sub_821A15B0`, `sub_821B2578`, `sub_821610F0`. These are not hooked. Xenos
+still draws.
 
