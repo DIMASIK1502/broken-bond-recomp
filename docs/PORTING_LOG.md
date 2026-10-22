@@ -326,6 +326,20 @@ Evidence, windowed, `resolution_scale=1`, vsync left on, ROV:
   That tail was not confirmed as the title menu, world, or a fight.
 
 World and fight intervals are not measured yet.
+`logs/guest-present-011-nudge.log` stays at 30 Hz through the Orochimaru
+line. Two bursts hit 60 Hz (about 19:29:58 and 19:31:33, a few seconds
+each) while XMA was still stitching. The log does not name the screen.
+The four `VdSwap` sites return to `821612D4` (`sub_821610F0`),
+`821B26A8` (`sub_821B2578`), `821A1750` (`sub_821A15B0`), and
+`821B8848` (`sub_821B8740`). `guest swap callers 5s` counts those.
+`logs/guest-present-012-callers.log`: the 30 Hz boot and the first 60 Hz
+window are both `sub_821610F0` (one call per present). The other three
+callers stay at 0 through that window. Inside `821610F0`, offset +500
+selects `VdSwap` directly versus `sub_821B2578`; the boot took the direct
+side. The player was in a fight by 19:46. From 19:46:29 through 19:46:49
+the buckets are ~290–295 frames at 60 Hz and ~300 calls of `821610F0`.
+`821B2578`, `821A15B0`, and `821B8740` stay 0 for the whole run. Fight
+present is 60 Hz on the same function as the post-boot 60 Hz stretch.
 
 ## Orochimaru line frozen, music still playing
 
@@ -372,6 +386,43 @@ the XEX. No Bink import; movies go through the file open.
 
 The only `VdSwap` call is `sub_821B1DD0`. It takes the guest device in `r3`,
 reads `VdGetSystemCommandBuffer`, then swaps. Callers: `sub_821B8740`,
-`sub_821A15B0`, `sub_821B2578`, `sub_821610F0`. These are not hooked. Xenos
-still draws.
+`sub_821A15B0`, `sub_821B2578`, `sub_821610F0`. The title counts which of
+those return addresses ran; it does not change the swap. Xenos still draws.
+
+Draws are PM4 `DRAW_INDX_2` (opcode `0x36`), stored with `stwu` into a
+walking command pointer. `sub_821A1348` picks `sub_821A0E70` or
+`sub_821A0D18`. `sub_821BEB30` calls `sub_821BDFD8`, which emits one of
+these packets and then calls `sub_821A1348`. The same opcode is also written
+by `sub_821A5498`, `sub_821BD728`, and by `sub_821AD328`. That last one is
+the flush: `sub_821610F0` calls it immediately before `VdSwap`.
+
+`sub_821BD3D0` writes `SET_CONSTANT` (`0x2D`). `sub_8257A2A0` and
+`sub_8257A480` write `SET_STATE` (`0x25`) and `IM_LOAD` (`0x27`);
+`sub_8257A0C8` writes `SET_STATE`. None of those three has a direct call.
+`sub_821B6CE0` writes `IM_LOAD` and is called from three sites. No draw,
+state, or shader hook is installed.
+
+## Shader database (this dump)
+
+`game/xeshader.sdb` is a big-endian `3BDS` container, version 4.1.
+`shader_db` (`tools/shader_db.cpp`, CMake target `shader_db`, not linked into
+the game) reads it and writes nothing.
+
+The file header is six big-endian words: magic, version `0x00040001`, source
+count, shader count, source offset `0x18`, shader-table offset. Each source is
+a 64-byte name, checksum, compressed size, raw size, index, then a zlib blob.
+On this dump that section is 85 files (`dx9featuredefinitions.h` and the
+`vs*` / `ps*` HLSL). It ends exactly where the shader table starts.
+
+The table is a 32-byte preamble plus 8156 records of 11 big-endian words:
+payload offset, compressed size, raw size, a tag, then seven more words. Each
+payload is zlib. The dword at offset 48 of the inflated object is the D3D9
+version token. This dump inflates to 9788660 bytes: 4648 `vs_3_0`
+(`0xFFFE0300`) and 3508 `ps_3_0` (`0xFFFF0300`). The tag word is 1 for 4647
+records, 2 for 3508, and 0 for one; both 1 and 2 contain vertex and pixel
+shaders, so the stage is the version token.
+
+`shader_db` does not translate those objects. Xenos tiling for a later host
+path is `Untile` in `rex/graphics/pipeline/texture/conversion.h`, with the tile
+sizes in `rex/graphics/xenos.h`. The running renderer is still Xenos.
 

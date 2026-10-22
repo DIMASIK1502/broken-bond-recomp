@@ -26,3 +26,6 @@ else()
 endif()
 
 rexglue_setup_target(broken_bond GPU_PLUGINS xenos)
+
+# Reads game/xeshader.sdb. Not part of the game link and writes no cache.
+add_executable(shader_db tools/shader_db.cpp)
