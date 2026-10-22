@@ -73,4 +73,5 @@ void BrokenBondApp::OnPostSetup() {
       "auto-accepted; saves are STFS packages under this folder, not next to "
       "the game dump.");
   LogExistingSaves(root);
+  LogBootPolicy();
 }

@@ -15,6 +15,8 @@ set(BROKENBOND_SOURCES
     src/main.cpp
     src/broken_bond_app.cpp
     src/compat/xusbcam.cpp
+    src/host/boot_flags.cpp
+    src/host/guest_present.cpp
 )
 
 if(WIN32)

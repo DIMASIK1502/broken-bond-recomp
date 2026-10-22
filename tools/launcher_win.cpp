@@ -4,6 +4,7 @@
 #define NOMINMAX
 #include <windows.h>
 #include <commctrl.h>
+#include <dxgi.h>
 #include <shellapi.h>
 
 #include <sstream>
@@ -14,6 +15,7 @@
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "dxgi.lib")
 #pragma comment(linker, \
     "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' " \
     "version='6.0.0.0' processorArchitecture='*' " \
@@ -76,6 +78,10 @@ enum Id : int {
     IDC_BIND_CLEAR,
     IDC_BIND_RESET,
     IDC_ABOUT,
+    IDC_LANG,
+    IDC_SKIP_BOOT,
+    IDC_ADAPTER,
+    IDC_READBACK,
     IDC_SAVE,
     IDC_PLAY,
 };
@@ -242,6 +248,10 @@ struct Settings {
     int d3d12_pipeline_creation_threads = 8;
     int tex_soft = 1024;
     int tex_hard = 2048;
+    int user_language = 1;
+    int d3d12_adapter = -1;
+    bool skip_boot_logos = false;
+    bool d3d12_readback_resolve = false;
     wstring binds[kBindCount];
 };
 
@@ -374,6 +384,10 @@ Settings load_settings(const wstring& dir) {
         json_int(j, "d3d12_pipeline_creation_threads", s.d3d12_pipeline_creation_threads);
     s.tex_soft = json_int(j, "texture_cache_memory_limit_soft", s.tex_soft);
     s.tex_hard = json_int(j, "texture_cache_memory_limit_hard", s.tex_hard);
+    s.user_language = json_int(j, "user_language", s.user_language);
+    s.d3d12_adapter = json_int(j, "d3d12_adapter", s.d3d12_adapter);
+    s.skip_boot_logos = json_bool(j, "skip_boot_logos", s.skip_boot_logos);
+    s.d3d12_readback_resolve = json_bool(j, "d3d12_readback_resolve", s.d3d12_readback_resolve);
     for (int i = 0; i < kBindCount; i++) {
         string id = wide_to_u8(kKeyIds[i]);
         string v;
@@ -404,7 +418,11 @@ bool save_all(const wstring& dir, const Settings& s) {
     json << "  \"async_shader_compilation\": " << toml_bool(s.async_shader_compilation) << ",\n";
     json << "  \"d3d12_pipeline_creation_threads\": " << s.d3d12_pipeline_creation_threads << ",\n";
     json << "  \"texture_cache_memory_limit_soft\": " << s.tex_soft << ",\n";
-    json << "  \"texture_cache_memory_limit_hard\": " << s.tex_hard;
+    json << "  \"texture_cache_memory_limit_hard\": " << s.tex_hard << ",\n";
+    json << "  \"user_language\": " << s.user_language << ",\n";
+    json << "  \"d3d12_adapter\": " << s.d3d12_adapter << ",\n";
+    json << "  \"skip_boot_logos\": " << toml_bool(s.skip_boot_logos) << ",\n";
+    json << "  \"d3d12_readback_resolve\": " << toml_bool(s.d3d12_readback_resolve);
     for (int i = 0; i < kBindCount; i++) {
         json << ",\n  \"" << wide_to_u8(kKeyIds[i]) << "\": \"" << json_escape(wide_to_u8(s.binds[i]))
              << "\"";
@@ -433,7 +451,11 @@ bool save_all(const wstring& dir, const Settings& s) {
     t << "async_shader_compilation = " << toml_bool(s.async_shader_compilation) << "\n";
     t << "d3d12_pipeline_creation_threads = " << s.d3d12_pipeline_creation_threads << "\n";
     t << "texture_cache_memory_limit_soft = " << s.tex_soft << "\n";
-    t << "texture_cache_memory_limit_hard = " << s.tex_hard << "\n\n";
+    t << "texture_cache_memory_limit_hard = " << s.tex_hard << "\n";
+    t << "user_language = " << s.user_language << "\n";
+    t << "d3d12_adapter = " << s.d3d12_adapter << "\n";
+    t << "skip_boot_logos = " << toml_bool(s.skip_boot_logos) << "\n";
+    t << "d3d12_readback_resolve = " << toml_bool(s.d3d12_readback_resolve) << "\n\n";
     for (int i = 0; i < kBindCount; i++) {
         t << wide_to_u8(kKeyIds[i]) << " = " << toml_str(wide_to_u8(s.binds[i])) << "\n";
     }
@@ -492,6 +514,7 @@ const char* kBackendVals[] = {"sdl", "xinput"};
 
 std::vector<HWND> g_gfx;
 std::vector<HWND> g_ctl;
+std::vector<HWND> g_game;
 HWND g_about = nullptr;
 
 void update_scale_hint() {
@@ -518,6 +541,25 @@ void show_tab(int idx) {
     for (HWND h : g_gfx) ShowWindow(h, idx == 0 ? SW_SHOW : SW_HIDE);
     for (HWND h : g_ctl) ShowWindow(h, idx == 1 ? SW_SHOW : SW_HIDE);
     if (g_about) ShowWindow(g_about, idx == 2 ? SW_SHOW : SW_HIDE);
+    for (HWND h : g_game) ShowWindow(h, idx == 2 ? SW_SHOW : SW_HIDE);
+}
+
+void fill_adapter_combo(HWND cb) {
+    SendMessageW(cb, CB_RESETCONTENT, 0, 0);
+    combo_add(cb, L"Авто (−1)", -1);
+    IDXGIFactory1* factory = nullptr;
+    if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)&factory)) || !factory) return;
+    IDXGIAdapter1* adapter = nullptr;
+    for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; ++i) {
+        DXGI_ADAPTER_DESC1 desc{};
+        adapter->GetDesc1(&desc);
+        adapter->Release();
+        if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;
+        wchar_t label[192];
+        swprintf_s(label, L"%u: %s", i, desc.Description);
+        combo_add(cb, label, (LPARAM)i);
+    }
+    factory->Release();
 }
 
 wstring get_text(HWND h) {
@@ -597,6 +639,10 @@ void ui_from_settings(const Settings& s) {
     combo_sel_str(GetDlgItem(g_main, IDC_BACKEND), s.input_backend, kBackendVals, 2);
     CheckDlgButton(g_main, IDC_GUIDE, s.guide_button ? BST_CHECKED : BST_UNCHECKED);
     CheckDlgButton(g_main, IDC_MNK_MOUSE, s.mnk_mouse ? BST_CHECKED : BST_UNCHECKED);
+    combo_sel_data(GetDlgItem(g_main, IDC_LANG), s.user_language);
+    combo_sel_data(GetDlgItem(g_main, IDC_ADAPTER), s.d3d12_adapter);
+    CheckDlgButton(g_main, IDC_SKIP_BOOT, s.skip_boot_logos ? BST_CHECKED : BST_UNCHECKED);
+    CheckDlgButton(g_main, IDC_READBACK, s.d3d12_readback_resolve ? BST_CHECKED : BST_UNCHECKED);
     wchar_t buf[32];
     swprintf_s(buf, L"%.2f", s.mnk_sensitivity);
     SetWindowTextW(GetDlgItem(g_main, IDC_SENS), buf);
@@ -631,6 +677,11 @@ Settings collect() {
     s.input_backend = combo_str(GetDlgItem(g_main, IDC_BACKEND), kBackendVals, 2);
     s.guide_button = IsDlgButtonChecked(g_main, IDC_GUIDE) == BST_CHECKED;
     s.mnk_mouse = IsDlgButtonChecked(g_main, IDC_MNK_MOUSE) == BST_CHECKED;
+    s.user_language = (int)combo_data(GetDlgItem(g_main, IDC_LANG));
+    if (s.user_language < 1) s.user_language = 1;
+    s.d3d12_adapter = (int)combo_data(GetDlgItem(g_main, IDC_ADAPTER));
+    s.skip_boot_logos = IsDlgButtonChecked(g_main, IDC_SKIP_BOOT) == BST_CHECKED;
+    s.d3d12_readback_resolve = IsDlgButtonChecked(g_main, IDC_READBACK) == BST_CHECKED;
     try {
         s.mnk_sensitivity = std::stod(wide_to_u8(get_text(GetDlgItem(g_main, IDC_SENS))));
     } catch (...) {
@@ -897,14 +948,17 @@ bool launch_game(const Settings& s) {
     wstring game = dir + L"\\game";
     wstring log = dir + L"\\logs\\run.log";
     wchar_t cmd[4096];
-    swprintf_s(cmd,
-               L"\"%s\" --game_data_root=\"%s\" --gpu_plugin=xenos --render_target_path_d3d12=rov "
-               L"--resolution_scale=%d --present_effect=%S --swap_post_effect=%S --log_file=\"%s\" "
-               L"--log_level=info --input_backend=%S %s %s",
-               exe.c_str(), game.c_str(), s.resolution_scale, s.present_effect.c_str(),
-               s.swap_post_effect.c_str(), log.c_str(), s.input_backend.c_str(),
-               s.mnk_mode ? L"--mnk_mode" : L"--no-mnk_mode",
-               s.guide_button ? L"--guide_button" : L"--no-guide_button");
+    swprintf_s(
+        cmd,
+        L"\"%s\" --game_data_root=\"%s\" --gpu_plugin=xenos --render_target_path_d3d12=rov "
+        L"--resolution_scale=%d --present_effect=%S --swap_post_effect=%S --log_file=\"%s\" "
+        L"--log_level=info --input_backend=%S --user_language=%d --d3d12_adapter=%d %s %s %s %s",
+        exe.c_str(), game.c_str(), s.resolution_scale, s.present_effect.c_str(),
+        s.swap_post_effect.c_str(), log.c_str(), s.input_backend.c_str(), s.user_language,
+        s.d3d12_adapter, s.mnk_mode ? L"--mnk_mode" : L"--no-mnk_mode",
+        s.guide_button ? L"--guide_button" : L"--no-guide_button",
+        s.skip_boot_logos ? L"--skip_boot_logos" : L"--no-skip_boot_logos",
+        s.d3d12_readback_resolve ? L"--d3d12_readback_resolve" : L"--no-d3d12_readback_resolve");
 
     STARTUPINFOW si{};
     si.cb = sizeof(si);
@@ -952,7 +1006,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_tabs = Mk(WC_TABCONTROLW, L"", WS_CLIPSIBLINGS, 16, 190, 748, 28, IDC_TABS);
             add_tab(g_tabs, 0, L"Графика");
             add_tab(g_tabs, 1, L"Управление");
-            add_tab(g_tabs, 2, L"Справка");
+            add_tab(g_tabs, 2, L"Игра / справка");
 
             auto gfx = [&](HWND h) {
                 g_gfx.push_back(h);
@@ -1062,14 +1116,35 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
             g_about = Mk(
                 L"STATIC",
-                L"Порт на PC через ReXGlue.\r\n\r\n"
+                L"Порт на PC через ReXGlue (Xenos).\r\n"
                 L"• Сохранения: Документы\\broken_bond\\\r\n"
-                L"• Не нажимай F4 «Save to config» в игре — собьёт конфиг лаунчера.\r\n"
-                L"• Первый запуск и новые приёмы компилируют шейдеры (короткий фриз).\r\n"
-                L"• Геймпад: раскладка Xbox 360. DualSense/Switch — драйвер SDL.\r\n"
-                L"• A = Space / точка с запятой, Start = Enter / X.\r\n"
-                L"• Японская и английская озвучка должны проходить катсцены.",
-                0, 28, 230, 720, 200, IDC_ABOUT);
+                L"• F3 — оверлей SDK. F4 — настройки (не жать Save to config).\r\n"
+                L"• ` — консоль. Первый бой компилирует шейдеры.\r\n"
+                L"• JP/EN озвучка должна проходить катсцены.",
+                0, 28, 226, 720, 88, IDC_ABOUT);
+
+            auto game = [&](HWND h) {
+                g_game.push_back(h);
+                return h;
+            };
+            game(Mk(L"STATIC", L"Язык игры", 0, 28, 326, 160, 20, 0));
+            HWND lang = game(Mk(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL, 200, 322, 360, 200,
+                                IDC_LANG));
+            combo_add(lang, L"English", 1);
+            combo_add(lang, L"日本語", 2);
+            combo_add(lang, L"Deutsch", 3);
+            combo_add(lang, L"Français", 4);
+            combo_add(lang, L"Español", 5);
+            combo_add(lang, L"Italiano", 6);
+            game(Mk(L"STATIC", L"Видеокарта", 0, 28, 358, 160, 20, 0));
+            HWND adapter = game(Mk(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL, 200, 354, 520,
+                                   200, IDC_ADAPTER));
+            fill_adapter_combo(adapter);
+            game(Mk(L"BUTTON", L"Пропускать загрузочные ролики (логотип / attract). Сюжет не трогаем — хук ещё нет.",
+                    BS_AUTOCHECKBOX, 28, 390, 720, 22, IDC_SKIP_BOOT));
+            game(Mk(L"BUTTON",
+                    L"d3d12_readback_resolve (эксперимент против мерцания; ROV и так включён)",
+                    BS_AUTOCHECKBOX, 28, 416, 720, 22, IDC_READBACK));
 
             Mk(L"BUTTON", L"Сохранить", 0, 16, 575, 140, 32, IDC_SAVE);
             Mk(L"BUTTON", L"Сохранить и запустить", BS_DEFPUSHBUTTON, 560, 575, 204, 32, IDC_PLAY);

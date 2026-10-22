@@ -18,6 +18,9 @@ generated/*/*.hpp
 !generated/rexglue.cmake
 !generated/.gitkeep
 
+# --- Third-party reference checkouts (do not commit, do not copy into src) ---
+.references/
+
 # --- ReXGlue SDK (cloned via setup script, not tracked here) ---
 thirdparty/rexglue-sdk/
 

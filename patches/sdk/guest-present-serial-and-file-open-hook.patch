@@ -1,0 +1,158 @@
+diff --git a/cmake/rexglueConfig.cmake.in b/cmake/rexglueConfig.cmake.in
+index ff7f132..b84c012 100644
+--- a/cmake/rexglueConfig.cmake.in
++++ b/cmake/rexglueConfig.cmake.in
+@@ -44,6 +44,13 @@ if(TARGET rex::rexglue)
+         MAP_IMPORTED_CONFIG_DEBUG Release
+         MAP_IMPORTED_CONFIG_RELWITHDEBINFO Release
+         MAP_IMPORTED_CONFIG_MINSIZEREL Release)
++    # A RelWithDebInfo install replaces the export set and drops the Release
++    # tool location. The CLI binary stays at bin/rexglue.exe.
++    if(EXISTS "${PACKAGE_PREFIX_DIR}/bin/rexglue.exe")
++        set_property(TARGET rex::rexglue APPEND PROPERTY IMPORTED_CONFIGURATIONS RELEASE)
++        set_target_properties(rex::rexglue PROPERTIES
++            IMPORTED_LOCATION_RELEASE "${PACKAGE_PREFIX_DIR}/bin/rexglue.exe")
++    endif()
+ endif()
+ 
+ if(TARGET rex::runtime AND NOT TARGET rex::system)
+diff --git a/include/rex/filesystem/vfs.h b/include/rex/filesystem/vfs.h
+index 96f86fe..bd7e4bd 100644
+--- a/include/rex/filesystem/vfs.h
++++ b/include/rex/filesystem/vfs.h
+@@ -11,8 +11,10 @@
+ 
+ #pragma once
+ 
++#include <atomic>
+ #include <memory>
+ #include <string>
++#include <string_view>
+ #include <unordered_map>
+ #include <vector>
+ 
+@@ -26,6 +28,11 @@ REXCVAR_DECLARE(bool, allow_game_relative_writes);
+ 
+ namespace rex::filesystem {
+ 
++// Return true to refuse the open (caller sees X_STATUS_NO_SUCH_FILE).
++// Used by titles to skip boot movies without replacing NtCreateFile.
++using FileOpenHook = bool (*)(std::string_view path);
++void SetFileOpenHook(FileOpenHook hook);
++
+ class VirtualFileSystem {
+  public:
+   VirtualFileSystem();
+diff --git a/include/rex/perf/counter.h b/include/rex/perf/counter.h
+index b3947e0..3eb66df 100644
+--- a/include/rex/perf/counter.h
++++ b/include/rex/perf/counter.h
+@@ -74,6 +74,12 @@ int64_t GetSnapshotCounter(CounterId id);
+ // Initialize the counter system (zeroes everything). Safe to call multiple times.
+ void Init();
+ 
++// One guest XE_SWAP. Serial increments even when dt repeats, so a host thread
++// can tell a new present from a reread of the last interval.
++void NotePresentedFrame(int64_t dt_us);
++int64_t GetPresentedFrameDtUs();
++uint64_t GetPresentedFrameSerial();
++
+ // CSV logging
+ void SetCsvLogPath(const std::string& path);
+ void WriteCsvFrame();
+diff --git a/src/core/perf/counter.cpp b/src/core/perf/counter.cpp
+index 536009e..eadde85 100644
+--- a/src/core/perf/counter.cpp
++++ b/src/core/perf/counter.cpp
+@@ -179,4 +179,20 @@ void FlushCsv() {
+   g_csv_path.clear();
+ }
+ 
++std::atomic<int64_t> g_presented_dt_us{0};
++std::atomic<uint64_t> g_presented_serial{0};
++
++void NotePresentedFrame(int64_t dt_us) {
++  g_presented_dt_us.store(dt_us, std::memory_order_relaxed);
++  g_presented_serial.fetch_add(1, std::memory_order_release);
++}
++
++int64_t GetPresentedFrameDtUs() {
++  return g_presented_dt_us.load(std::memory_order_relaxed);
++}
++
++uint64_t GetPresentedFrameSerial() {
++  return g_presented_serial.load(std::memory_order_acquire);
++}
++
+ }  // namespace rex::perf
+diff --git a/src/filesystem/virtual_file_system.cpp b/src/filesystem/virtual_file_system.cpp
+index a1b4dad..90f99bb 100644
+--- a/src/filesystem/virtual_file_system.cpp
++++ b/src/filesystem/virtual_file_system.cpp
+@@ -9,6 +9,8 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <atomic>
++
+ #include <rex/filesystem/vfs.h>
+ #include <rex/logging.h>
+ #include <rex/string.h>
+@@ -22,6 +24,14 @@ REXCVAR_DEFINE_BOOL(allow_game_relative_writes, false, "Filesystem",
+ 
+ namespace rex::filesystem {
+ 
++namespace {
++std::atomic<FileOpenHook> g_file_open_hook{nullptr};
++}
++
++void SetFileOpenHook(FileOpenHook hook) {
++  g_file_open_hook.store(hook, std::memory_order_release);
++}
++
+ VirtualFileSystem::VirtualFileSystem() {}
+ 
+ VirtualFileSystem::~VirtualFileSystem() {
+@@ -196,6 +206,13 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
+                                      FileDisposition creation_disposition, uint32_t desired_access,
+                                      bool is_directory, bool is_non_directory, File** out_file,
+                                      FileAction* out_action) {
++  if (FileOpenHook hook = g_file_open_hook.load(std::memory_order_acquire)) {
++    if (hook(path)) {
++      *out_file = nullptr;
++      *out_action = FileAction::kDoesNotExist;
++      return X_STATUS_NO_SUCH_FILE;
++    }
++  }
+   // TODO(gibbed): should 'is_directory' remain as a bool or should it be
+   // flipped to a generic FileAttributeFlags?
+ 
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index a744375..f0e1d0a 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -930,19 +930,22 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
+                                                   uint32_t count) {
+   SCOPE_profile_cpu_f("gpu");
+ 
+-#ifdef REXGLUE_ENABLE_PERF_COUNTERS
+   {
+     static uint64_t last_frame_tick = 0;
+     uint64_t now = rex::chrono::Clock::QueryHostTickCount();
+     if (last_frame_tick) {
+       uint64_t freq = rex::chrono::Clock::QueryHostTickFrequency();
+       int64_t dt_us = static_cast<int64_t>((now - last_frame_tick) * 1000000 / freq);
++      rex::perf::NotePresentedFrame(dt_us);
++#ifdef REXGLUE_ENABLE_PERF_COUNTERS
+       PROFILE_FRAME_TIME_US(dt_us);
+       PROFILE_FPS(freq / (now - last_frame_tick));
++#endif
++    } else {
++      rex::perf::NotePresentedFrame(0);
+     }
+     last_frame_tick = now;
+   }
+-#endif
+   rex::perf::Profiler::Flip();
+ 
+   // Xenia-specific VdSwap hook.

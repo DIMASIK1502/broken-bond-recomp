@@ -17,6 +17,9 @@ class BrokenBondApp : public rex::ReXApp {
   }
 
   void OnPostSetup() override;
+  void OnPostLaunchModule(rex::system::XThread* thread) override;
+  void OnShutdown() override;
+  void LogBootPolicy();
   std::optional<rex::PathConfig> OnFinalizePaths(
       const rex::PathConfig& defaults,
       std::function<void(rex::PathConfig)> resume) override;

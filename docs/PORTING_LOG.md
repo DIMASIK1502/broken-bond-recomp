@@ -297,3 +297,36 @@ chopped because it swapped and **returned without decoding**. This path
 decodes the remaining bits first, then the normal end-of-buffer swap.
 Keep ROV. Refresh `G:\BrokenBond-Test` when sending another build.
 
+## Guest swap rate and boot movies (release/v0.10.0)
+
+SDK branch for this port is `release/v0.10.0` (`ce7e73e` plus local commits).
+An experimental branch had been checked out; the title is rebuilt against
+the release runtime.
+
+`patches/sdk/rexglue-sdk-v0.10.0.patch` did not apply: HEAD already had the
+forever-starve from `60cfb2c`. The drained-EOS behavior (produce samples,
+wait until the guest drains the output ring, then decode the truncated tail
+and take the normal end-of-buffer swap) is merged onto that tree. The patch
+file is regenerated so it applies on this HEAD.
+
+Guest present is `PM4 XE_SWAP` in `command_processor.cpp`, counted by
+`rex::perf::NotePresentedFrame`. The title samples it every 5 seconds
+(`src/host/guest_present.cpp`). Boot movie names are refused only when
+`skip_boot_logos` is set (`src/host/boot_flags.cpp`, `SetFileOpenHook`).
+
+Evidence, windowed, `resolution_scale=1`, vsync left on, ROV:
+
+- `logs/guest-present-002.log`: `Ubisoft.bik` opened (skip off). After the
+  first second, swap is 30 Hz: 150 presents / 5 s, last dt ~33 ms, 24 Hz
+  bucket empty. Not a 24 fps Bink clock and not 60.
+- `logs/guest-present-003-skip.log`: flag on, `Ubisoft.bik` refused twice,
+  no fatal, swap stays ~30 Hz. `AttractMode*` was not opened in that window.
+
+Menu, world, and fight intervals are not measured yet.
+
+Graphics imports in `generated/default/broken_bond_init.cpp` are `Vd*`, not
+`IDirect3D` / `D3DDevice`. Present is `__imp__VdSwap` at `0x82C0A9BC`.
+Also imported: ring-buffer init, command buffer, display mode/gamma, scaler,
+`VdRetrainEDRAM` / `VdRetrainEDRAMWorker`. Draw and shader setup are inside
+the XEX. No Bink import; movies go through the file open.
+
