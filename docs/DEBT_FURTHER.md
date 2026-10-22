@@ -85,8 +85,15 @@ Rise лежит только в `.references/naruto-rise-recomp` (GPL-3.0). От
   sample rate и demote; denorm flush-to-zero выключен, этой возможности
   нет. Scalar block layout и standard layout есть. Драйвер принял все
   8156 `vkCreateShaderModule`. `spirv-val` для Vulkan 1.2 с scalar block
-  layout, как у Vulkan-устройства SDK, пропустил все 8156. Это ещё не путь
-  `src/gfx/`. Артефакт кэша не коммитить (как `generated/`).
+  layout, как у Vulkan-устройства SDK, пропустил все 8156. Графический
+  пайплайн с пустым fragment stage собрался для всех 4648 вершинных
+  шейдеров. Пиксельные собрались все 3508: у каждого свой set 3 (N image,
+  затем M sampler; 9 разных layout), вершинная стадия пишет только
+  `gl_Position`, color attachment — по маске render target, depth — у трёх
+  шейдеров, которые его пишут. Маска интерполяторов в этой пробе нулевая,
+  поэтому входы пиксельного шейдера ещё не стыкуются с выходами вершинного.
+  Это ещё не путь `src/gfx/`. Артефакт кэша не коммитить
+  (как `generated/`).
 
 ### F4. Кадры между тиками
 

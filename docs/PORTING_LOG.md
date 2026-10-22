@@ -475,8 +475,22 @@ supported. Float32 denorm flush-to-zero is not, and the translation leaves
 that execution mode off. Sample-rate shading, demote-to-helper,
 `scalarBlockLayout`, and `uniformBufferStandardLayout` are supported.
 `vkCreateShaderModule` accepted all 8156 modules and each module was
-destroyed immediately. `spirv-val` for Vulkan 1.2 with scalar block layout,
-which the SDK Vulkan device enables for GPU emulation, passed all 8156.
+destroyed immediately. With dynamic rendering, scalar block layout, and one
+pipeline layout (set 0 binding 0 storage buffer, set 1 uniform bindings
+0/1/3/4, set 2 two sampled images and one sampler), `vkCreateGraphicsPipelines`
+accepted all 4648 vertex shaders paired with an empty fragment stage.
+Pixel shaders use a layout of their own: set 0 binding 0 is the shared-memory
+storage buffer, set 1 is uniform bindings 0/2/3/4, set 2 is empty, and set 3
+is that shader's sampled images followed by its samplers. Nine such layouts
+cover the dump. The vertex stage only writes `gl_Position`, because the
+default pixel modification declares no interpolators. Color attachments
+follow the written render-target mask (`R8G8B8A8_UNORM`), and a depth
+attachment is present only when the shader writes depth. With that,
+`vkCreateGraphicsPipelines` accepted all 3508 pixel shaders. A draw still
+has to pair a vertex shader's interpolator outputs with the pixel shader's
+inputs; this probe does not. `spirv-val` for
+Vulkan 1.2 with scalar block layout, which the SDK Vulkan device enables
+for GPU emulation, passed all 8156.
 Without that option the same modules fail because `XeSystemConstants`
 member 7, `user_clip_planes`, is at offset 28. The running renderer is
 still Xenos.

@@ -522,6 +522,19 @@ struct HostProbe {
   PFN_vkDestroyDevice destroy_device = nullptr;
   PFN_vkCreateShaderModule create_module = nullptr;
   PFN_vkDestroyShaderModule destroy_module = nullptr;
+  PFN_vkCreateGraphicsPipelines create_pipelines = nullptr;
+  PFN_vkDestroyPipeline destroy_pipeline = nullptr;
+  PFN_vkCreatePipelineLayout create_pipeline_layout = nullptr;
+  PFN_vkDestroyPipelineLayout destroy_pipeline_layout = nullptr;
+  PFN_vkCreateDescriptorSetLayout create_set_layout = nullptr;
+  PFN_vkDestroyDescriptorSetLayout destroy_set_layout = nullptr;
+  VkDescriptorSetLayout set_layouts[3] = {};
+  VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
+  VkShaderModule empty_fragment = VK_NULL_HANDLE;
+  VkDescriptorSetLayout pixel_sets[3] = {};
+  VkShaderModule position_vertex = VK_NULL_HANDLE;
+  std::map<uint32_t, VkPipelineLayout> pixel_layouts;
+  std::vector<VkDescriptorSetLayout> pixel_texture_sets;
 #if defined(SHADER_DB_VULKAN_SDK)
   spv_context context = nullptr;
   using ContextCreate = spv_context (*)(spv_target_env);
@@ -551,6 +564,21 @@ struct HostProbe {
   bool demote = false;
   bool scalar_block = false;
   bool standard_layout = false;
+  bool dynamic_rendering = false;
+  uint32_t pipeline_ok = 0;
+  uint32_t pipeline_failed = 0;
+  std::map<int32_t, uint32_t> pipeline_results;
+  uint32_t pixel_ok = 0;
+  uint32_t pixel_failed = 0;
+  std::map<int32_t, uint32_t> pixel_results;
+
+  struct ShaderStage {
+    bool vertex = false;
+    uint32_t images = 0;
+    uint32_t samplers = 0;
+    uint32_t color_mask = 0;
+    bool depth = false;
+  };
   uint32_t val_ok = 0;
   uint32_t val_failed = 0;
   uint32_t module_ok = 0;
@@ -563,6 +591,37 @@ struct HostProbe {
   HostProbe& operator=(const HostProbe&) = delete;
 
   ~HostProbe() {
+    if (device != VK_NULL_HANDLE) {
+      if (destroy_module != nullptr && empty_fragment != VK_NULL_HANDLE) {
+        destroy_module(device, empty_fragment, nullptr);
+      }
+      if (destroy_module != nullptr && position_vertex != VK_NULL_HANDLE) {
+        destroy_module(device, position_vertex, nullptr);
+      }
+      if (destroy_pipeline_layout != nullptr && pipeline_layout != VK_NULL_HANDLE) {
+        destroy_pipeline_layout(device, pipeline_layout, nullptr);
+      }
+      if (destroy_pipeline_layout != nullptr) {
+        for (const auto& layout : pixel_layouts) {
+          destroy_pipeline_layout(device, layout.second, nullptr);
+        }
+      }
+      if (destroy_set_layout != nullptr) {
+        for (VkDescriptorSetLayout layout : set_layouts) {
+          if (layout != VK_NULL_HANDLE) {
+            destroy_set_layout(device, layout, nullptr);
+          }
+        }
+        for (VkDescriptorSetLayout layout : pixel_sets) {
+          if (layout != VK_NULL_HANDLE) {
+            destroy_set_layout(device, layout, nullptr);
+          }
+        }
+        for (VkDescriptorSetLayout layout : pixel_texture_sets) {
+          destroy_set_layout(device, layout, nullptr);
+        }
+      }
+    }
     if (destroy_device != nullptr && device != VK_NULL_HANDLE) {
       destroy_device(device, nullptr);
     }
@@ -586,7 +645,13 @@ struct HostProbe {
   }
 
   void Open();
-  void Check(const std::vector<uint8_t>& binary);
+  void PrepareVertexPipelines();
+  void PreparePixelPipelines();
+  VkPipelineLayout PixelLayout(uint32_t images, uint32_t samplers);
+  void LinkGraphics(VkShaderModule vertex_module, VkShaderModule fragment_module,
+                    VkPipelineLayout layout, uint32_t color_count, bool depth, uint32_t& ok,
+                    uint32_t& failed, std::map<int32_t, uint32_t>& results);
+  void Check(const std::vector<uint8_t>& binary, const ShaderStage& stage);
 };
 
 void HostProbe::Open() {
@@ -772,16 +837,25 @@ void HostProbe::Open() {
   queue.pQueuePriorities = &priority;
   VkPhysicalDeviceFeatures enabled{};
   enabled.sampleRateShading = sample_rate ? VK_TRUE : VK_FALSE;
+  VkPhysicalDeviceVulkan12Features enabled12{};
+  enabled12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+  enabled12.scalarBlockLayout = scalar_block ? VK_TRUE : VK_FALSE;
+  enabled12.uniformBufferStandardLayout = standard_layout ? VK_TRUE : VK_FALSE;
   VkPhysicalDeviceVulkan13Features enabled13{};
   enabled13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
   enabled13.shaderDemoteToHelperInvocation = demote ? VK_TRUE : VK_FALSE;
+  dynamic_rendering = api >= VK_API_VERSION_1_3 && features13.dynamicRendering == VK_TRUE;
+  enabled13.dynamicRendering = dynamic_rendering ? VK_TRUE : VK_FALSE;
+  if (api >= VK_API_VERSION_1_3) {
+    enabled12.pNext = &enabled13;
+  }
   VkDeviceCreateInfo device_info{};
   device_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
   device_info.queueCreateInfoCount = 1;
   device_info.pQueueCreateInfos = &queue;
   device_info.pEnabledFeatures = &enabled;
-  if (demote) {
-    device_info.pNext = &enabled13;
+  if (api >= VK_API_VERSION_1_2) {
+    device_info.pNext = &enabled12;
   }
   const VkResult device_result = create_device(physical, &device_info, nullptr, &device);
   if (device_result != VK_SUCCESS) {
@@ -793,12 +867,272 @@ void HostProbe::Open() {
       reinterpret_cast<PFN_vkCreateShaderModule>(get_device(device, "vkCreateShaderModule"));
   destroy_module =
       reinterpret_cast<PFN_vkDestroyShaderModule>(get_device(device, "vkDestroyShaderModule"));
+  create_pipelines =
+      reinterpret_cast<PFN_vkCreateGraphicsPipelines>(get_device(device, "vkCreateGraphicsPipelines"));
+  destroy_pipeline = reinterpret_cast<PFN_vkDestroyPipeline>(get_device(device, "vkDestroyPipeline"));
+  create_pipeline_layout =
+      reinterpret_cast<PFN_vkCreatePipelineLayout>(get_device(device, "vkCreatePipelineLayout"));
+  destroy_pipeline_layout =
+      reinterpret_cast<PFN_vkDestroyPipelineLayout>(get_device(device, "vkDestroyPipelineLayout"));
+  create_set_layout =
+      reinterpret_cast<PFN_vkCreateDescriptorSetLayout>(get_device(device, "vkCreateDescriptorSetLayout"));
+  destroy_set_layout = reinterpret_cast<PFN_vkDestroyDescriptorSetLayout>(
+      get_device(device, "vkDestroyDescriptorSetLayout"));
   if (destroy_device == nullptr || create_module == nullptr || destroy_module == nullptr) {
     vulkan_reason = "device exports are missing";
+    return;
+  }
+  if (dynamic_rendering && create_pipelines != nullptr && destroy_pipeline != nullptr &&
+      create_pipeline_layout != nullptr && destroy_pipeline_layout != nullptr &&
+      create_set_layout != nullptr && destroy_set_layout != nullptr) {
+    PrepareVertexPipelines();
+    PreparePixelPipelines();
   }
 }
 
-void HostProbe::Check(const std::vector<uint8_t>& binary) {
+void HostProbe::PrepareVertexPipelines() {
+  VkDescriptorSetLayoutBinding shared{};
+  shared.binding = 0;
+  shared.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  shared.descriptorCount = 1;
+  shared.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+  VkDescriptorSetLayoutCreateInfo shared_info{};
+  shared_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+  shared_info.bindingCount = 1;
+  shared_info.pBindings = &shared;
+
+  VkDescriptorSetLayoutBinding constants[4]{};
+  const uint32_t constant_bindings[4] = {0, 1, 3, 4};
+  for (int i = 0; i < 4; ++i) {
+    constants[i].binding = constant_bindings[i];
+    constants[i].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    constants[i].descriptorCount = 1;
+    constants[i].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+  }
+  VkDescriptorSetLayoutCreateInfo constant_info{};
+  constant_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+  constant_info.bindingCount = 4;
+  constant_info.pBindings = constants;
+
+  VkDescriptorSetLayoutBinding textures[3]{};
+  textures[0].binding = 0;
+  textures[1].binding = 1;
+  textures[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+  textures[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+  textures[2].binding = 2;
+  textures[2].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+  for (VkDescriptorSetLayoutBinding& binding : textures) {
+    binding.descriptorCount = 1;
+    binding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+  }
+  VkDescriptorSetLayoutCreateInfo texture_info{};
+  texture_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+  texture_info.bindingCount = 3;
+  texture_info.pBindings = textures;
+
+  const VkDescriptorSetLayoutCreateInfo infos[3] = {shared_info, constant_info, texture_info};
+  for (int i = 0; i < 3; ++i) {
+    if (create_set_layout(device, &infos[i], nullptr, &set_layouts[i]) != VK_SUCCESS) {
+      vulkan_reason = "descriptor set layout was rejected";
+      return;
+    }
+  }
+  VkPipelineLayoutCreateInfo layout_info{};
+  layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+  layout_info.setLayoutCount = 3;
+  layout_info.pSetLayouts = set_layouts;
+  if (create_pipeline_layout(device, &layout_info, nullptr, &pipeline_layout) != VK_SUCCESS) {
+    vulkan_reason = "pipeline layout was rejected";
+    return;
+  }
+
+  // Fragment stage with no inputs, so a vertex shader can link without a paired pixel shader.
+  static constexpr uint32_t kEmptyFragment[] = {
+      0x07230203, 0x00010500, 0x00070000, 0x00000005, 0x00000000, 0x00020011, 0x00000001,
+      0x0003000e, 0x00000000, 0x00000001, 0x0005000f, 0x00000004, 0x00000001, 0x6e69616d,
+      0x00000000, 0x00030010, 0x00000001, 0x00000007, 0x00020013, 0x00000002, 0x00030021,
+      0x00000003, 0x00000002, 0x00050036, 0x00000002, 0x00000001, 0x00000000, 0x00000003,
+      0x000200f8, 0x00000004, 0x000100fd, 0x00010038};
+  VkShaderModuleCreateInfo module_info{};
+  module_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+  module_info.codeSize = sizeof(kEmptyFragment);
+  module_info.pCode = kEmptyFragment;
+  if (create_module(device, &module_info, nullptr, &empty_fragment) != VK_SUCCESS) {
+    vulkan_reason = "empty fragment shader was rejected";
+  }
+}
+
+void HostProbe::PreparePixelPipelines() {
+  VkDescriptorSetLayoutBinding shared{};
+  shared.binding = 0;
+  shared.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  shared.descriptorCount = 1;
+  shared.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+  VkDescriptorSetLayoutBinding constants[4]{};
+  const uint32_t constant_bindings[4] = {0, 2, 3, 4};
+  for (int i = 0; i < 4; ++i) {
+    constants[i].binding = constant_bindings[i];
+    constants[i].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    constants[i].descriptorCount = 1;
+    constants[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+  }
+  VkDescriptorSetLayoutCreateInfo shared_info{};
+  shared_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+  shared_info.bindingCount = 1;
+  shared_info.pBindings = &shared;
+  VkDescriptorSetLayoutCreateInfo constant_info{};
+  constant_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+  constant_info.bindingCount = 4;
+  constant_info.pBindings = constants;
+  VkDescriptorSetLayoutCreateInfo empty_info{};
+  empty_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+  const VkDescriptorSetLayoutCreateInfo infos[3] = {shared_info, constant_info, empty_info};
+  for (int i = 0; i < 3; ++i) {
+    if (create_set_layout(device, &infos[i], nullptr, &pixel_sets[i]) != VK_SUCCESS) {
+      vulkan_reason = "pixel descriptor set layout was rejected";
+      return;
+    }
+  }
+
+  // Vertex stage that only writes gl_Position. Default pixel modifications declare no
+  // interpolator inputs, so this stage matches them.
+  static constexpr uint32_t kPositionVertex[] = {
+      0x07230203, 0x00010500, 0x00070000, 0x0000000b, 0x00000000, 0x00020011, 0x00000001,
+      0x0003000e, 0x00000000, 0x00000001, 0x0006000f, 0x00000000, 0x00000001, 0x6e69616d,
+      0x00000000, 0x00000002, 0x00040047, 0x00000002, 0x0000000b, 0x00000000, 0x00020013,
+      0x00000003, 0x00030021, 0x00000004, 0x00000003, 0x00030016, 0x00000005, 0x00000020,
+      0x00040017, 0x00000006, 0x00000005, 0x00000004, 0x00040020, 0x00000007, 0x00000003,
+      0x00000006, 0x0004002b, 0x00000005, 0x00000008, 0x00000000, 0x0007002c, 0x00000006,
+      0x00000009, 0x00000008, 0x00000008, 0x00000008, 0x00000008, 0x0004003b, 0x00000007,
+      0x00000002, 0x00000003, 0x00050036, 0x00000003, 0x00000001, 0x00000000, 0x00000004,
+      0x000200f8, 0x0000000a, 0x0003003e, 0x00000002, 0x00000009, 0x000100fd, 0x00010038};
+  VkShaderModuleCreateInfo module_info{};
+  module_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+  module_info.codeSize = sizeof(kPositionVertex);
+  module_info.pCode = kPositionVertex;
+  if (create_module(device, &module_info, nullptr, &position_vertex) != VK_SUCCESS) {
+    vulkan_reason = "position vertex shader was rejected";
+  }
+}
+
+VkPipelineLayout HostProbe::PixelLayout(uint32_t images, uint32_t samplers) {
+  if (pixel_sets[0] == VK_NULL_HANDLE || images > 32 || samplers > 32) {
+    return VK_NULL_HANDLE;
+  }
+  const uint32_t key = images | (samplers << 8);
+  const auto found = pixel_layouts.find(key);
+  if (found != pixel_layouts.end()) {
+    return found->second;
+  }
+  std::vector<VkDescriptorSetLayoutBinding> bindings(static_cast<size_t>(images) + samplers);
+  for (uint32_t i = 0; i < images; ++i) {
+    bindings[i].binding = i;
+    bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    bindings[i].descriptorCount = 1;
+    bindings[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+  }
+  for (uint32_t i = 0; i < samplers; ++i) {
+    bindings[static_cast<size_t>(images) + i].binding = images + i;
+    bindings[static_cast<size_t>(images) + i].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+    bindings[static_cast<size_t>(images) + i].descriptorCount = 1;
+    bindings[static_cast<size_t>(images) + i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+  }
+  VkDescriptorSetLayoutCreateInfo texture_info{};
+  texture_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+  texture_info.bindingCount = static_cast<uint32_t>(bindings.size());
+  texture_info.pBindings = bindings.empty() ? nullptr : bindings.data();
+  VkDescriptorSetLayout textures = VK_NULL_HANDLE;
+  if (create_set_layout(device, &texture_info, nullptr, &textures) != VK_SUCCESS) {
+    return VK_NULL_HANDLE;
+  }
+  pixel_texture_sets.push_back(textures);
+  const VkDescriptorSetLayout sets[4] = {pixel_sets[0], pixel_sets[1], pixel_sets[2], textures};
+  VkPipelineLayoutCreateInfo layout_info{};
+  layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+  layout_info.setLayoutCount = 4;
+  layout_info.pSetLayouts = sets;
+  VkPipelineLayout layout = VK_NULL_HANDLE;
+  if (create_pipeline_layout(device, &layout_info, nullptr, &layout) != VK_SUCCESS) {
+    return VK_NULL_HANDLE;
+  }
+  pixel_layouts.emplace(key, layout);
+  return layout;
+}
+
+void HostProbe::LinkGraphics(VkShaderModule vertex_module, VkShaderModule fragment_module,
+                             VkPipelineLayout layout, uint32_t color_count, bool depth,
+                             uint32_t& ok, uint32_t& failed, std::map<int32_t, uint32_t>& results) {
+  VkPipelineShaderStageCreateInfo stages[2]{};
+  stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+  stages[0].module = vertex_module;
+  stages[0].pName = "main";
+  stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+  stages[1].module = fragment_module;
+  stages[1].pName = "main";
+  VkPipelineVertexInputStateCreateInfo vertex_input{};
+  vertex_input.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+  VkPipelineInputAssemblyStateCreateInfo input_assembly{};
+  input_assembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+  input_assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+  VkViewport viewport{0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f};
+  VkRect2D scissor{{0, 0}, {1, 1}};
+  VkPipelineViewportStateCreateInfo viewport_state{};
+  viewport_state.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+  viewport_state.viewportCount = 1;
+  viewport_state.pViewports = &viewport;
+  viewport_state.scissorCount = 1;
+  viewport_state.pScissors = &scissor;
+  VkPipelineRasterizationStateCreateInfo raster{};
+  raster.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+  raster.polygonMode = VK_POLYGON_MODE_FILL;
+  raster.cullMode = VK_CULL_MODE_NONE;
+  raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+  raster.lineWidth = 1.0f;
+  VkPipelineMultisampleStateCreateInfo multisample{};
+  multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+  multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+  VkPipelineColorBlendAttachmentState attachments[4]{};
+  VkPipelineColorBlendStateCreateInfo blend{};
+  blend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+  blend.attachmentCount = color_count;
+  blend.pAttachments = color_count == 0 ? nullptr : attachments;
+  VkPipelineDepthStencilStateCreateInfo depth_state{};
+  depth_state.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+  VkFormat color_formats[4] = {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM,
+                               VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM};
+  VkPipelineRenderingCreateInfo rendering{};
+  rendering.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+  rendering.colorAttachmentCount = color_count;
+  rendering.pColorAttachmentFormats = color_count == 0 ? nullptr : color_formats;
+  rendering.depthAttachmentFormat = depth ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_UNDEFINED;
+  VkGraphicsPipelineCreateInfo pipeline_info{};
+  pipeline_info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+  pipeline_info.pNext = &rendering;
+  pipeline_info.stageCount = 2;
+  pipeline_info.pStages = stages;
+  pipeline_info.pVertexInputState = &vertex_input;
+  pipeline_info.pInputAssemblyState = &input_assembly;
+  pipeline_info.pViewportState = &viewport_state;
+  pipeline_info.pRasterizationState = &raster;
+  pipeline_info.pMultisampleState = &multisample;
+  pipeline_info.pDepthStencilState = depth ? &depth_state : nullptr;
+  pipeline_info.pColorBlendState = &blend;
+  pipeline_info.layout = layout;
+  VkPipeline pipeline = VK_NULL_HANDLE;
+  const VkResult pipeline_result =
+      create_pipelines(device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &pipeline);
+  if (pipeline_result == VK_SUCCESS) {
+    ++ok;
+    destroy_pipeline(device, pipeline, nullptr);
+  } else {
+    ++failed;
+    ++results[int32_t(pipeline_result)];
+  }
+}
+
+void HostProbe::Check(const std::vector<uint8_t>& binary, const ShaderStage& stage) {
   const auto* words = reinterpret_cast<const uint32_t*>(binary.data());
   const size_t word_count = binary.size() / 4;
 #if defined(SHADER_DB_VULKAN_SDK)
@@ -835,6 +1169,26 @@ void HostProbe::Check(const std::vector<uint8_t>& binary) {
   const VkResult result = create_module(device, &info, nullptr, &module);
   if (result == VK_SUCCESS) {
     ++module_ok;
+    if (create_pipelines != nullptr && stage.vertex && pipeline_layout != VK_NULL_HANDLE &&
+        empty_fragment != VK_NULL_HANDLE) {
+      LinkGraphics(module, empty_fragment, pipeline_layout, 0, false, pipeline_ok, pipeline_failed,
+                   pipeline_results);
+    } else if (create_pipelines != nullptr && !stage.vertex &&
+               position_vertex != VK_NULL_HANDLE) {
+      const VkPipelineLayout layout = PixelLayout(stage.images, stage.samplers);
+      uint32_t color_count = 0;
+      for (uint32_t target = 0; target < 4; ++target) {
+        if ((stage.color_mask & (uint32_t(1) << target)) != 0) {
+          color_count = target + 1;
+        }
+      }
+      if (layout == VK_NULL_HANDLE || color_count > 4) {
+        ++pixel_failed;
+      } else {
+        LinkGraphics(position_vertex, module, layout, color_count, stage.depth, pixel_ok,
+                     pixel_failed, pixel_results);
+      }
+    }
     destroy_module(device, module, nullptr);
   } else {
     ++module_failed;
@@ -1004,7 +1358,13 @@ void TranslateShader(rex::graphics::SpirvShaderTranslator& translator, uint32_t 
                        binary[2] == 0x23 && binary[3] == 0x07;
     if (spirv) {
       NoteModule(binary, type == rex::graphics::xenos::ShaderType::kVertex, shader, stats);
-      probe.Check(binary);
+      HostProbe::ShaderStage stage;
+      stage.vertex = type == rex::graphics::xenos::ShaderType::kVertex;
+      stage.images = static_cast<uint32_t>(shader.GetTextureBindingsAfterTranslation().size());
+      stage.samplers = static_cast<uint32_t>(shader.GetSamplerBindingsAfterTranslation().size());
+      stage.color_mask = shader.writes_color_targets();
+      stage.depth = shader.writes_depth();
+      probe.Check(binary, stage);
       ++stats.ok;
       stats.spirv_bytes += binary.size();
       return;
@@ -1258,6 +1618,21 @@ int main(int argc, char** argv) {
       std::cout << "  modules " << (probe.module_ok + probe.module_failed) << "\n";
       std::cout << "  ok " << probe.module_ok << "\n";
       std::cout << "  failed " << probe.module_failed << "\n";
+      std::cout << "  vertex_pipelines " << (probe.pipeline_ok + probe.pipeline_failed) << "\n";
+      std::cout << "  vertex_pipeline_ok " << probe.pipeline_ok << "\n";
+      std::cout << "  vertex_pipeline_failed " << probe.pipeline_failed << "\n";
+      for (const auto& pipeline_result : probe.pipeline_results) {
+        std::cout << "  vertex_pipeline_result " << pipeline_result.first << " "
+                  << pipeline_result.second << "\n";
+      }
+      std::cout << "  pixel_pipelines " << (probe.pixel_ok + probe.pixel_failed) << "\n";
+      std::cout << "  pixel_pipeline_ok " << probe.pixel_ok << "\n";
+      std::cout << "  pixel_pipeline_failed " << probe.pixel_failed << "\n";
+      std::cout << "  pixel_layouts " << probe.pixel_layouts.size() << "\n";
+      for (const auto& pipeline_result : probe.pixel_results) {
+        std::cout << "  pixel_pipeline_result " << pipeline_result.first << " "
+                  << pipeline_result.second << "\n";
+      }
       for (const auto& result : probe.module_results) {
         std::cout << "  result " << result.first << " " << result.second << "\n";
       }
