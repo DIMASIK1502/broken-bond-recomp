@@ -19,6 +19,8 @@
 //   Xenos control flow packed as two instructions per three dwords.
 //   At offset 0x28 there is a big-endian D3DX constant table: float4 and sampler
 //   records, 20 bytes each, names relative to that table.
+//   When SHADER_DB_TRANSLATE is set, each microcode is translated to SPIR-V in
+//   memory. Nothing is written.
 
 #include <cstdint>
 #include <fstream>
@@ -28,6 +30,29 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#if defined(SHADER_DB_TRANSLATE)
+#include <algorithm>
+#include <map>
+#include <utility>
+
+#include <rex/cvar.h>
+#include <rex/graphics/pipeline/shader/spirv.h>
+#include <rex/string/buffer.h>
+
+#if defined(SHADER_DB_VULKAN_SDK)
+#include <spirv-tools/libspirv.h>
+#endif
+
+REXCVAR_DEFINE_STRING(dump_shaders, "", "GPU", "Unused here. AnalyzeUcode reads it.");
+
+// The depth-stencil path in the translator names these tables. They live in
+// the GPU plugin's draw helper, which this tool does not link.
+namespace rex::graphics::draw_util {
+extern const int8_t kD3D10StandardSamplePositions2x[2][2] = {{4, 4}, {-4, -4}};
+extern const int8_t kD3D10StandardSamplePositions4x[4][2] = {{-2, -6}, {6, -2}, {-6, 2}, {2, 6}};
+}  // namespace rex::graphics::draw_util
+#endif
 
 namespace {
 
@@ -462,6 +487,513 @@ void ReadConstants(const uint8_t* object, size_t size, uint32_t token, ConstantS
   }
 }
 
+#if defined(SHADER_DB_TRANSLATE)
+struct TranslateStats {
+  uint32_t ok = 0;
+  uint32_t failed = 0;
+  uint32_t dynamic_registers = 0;
+  uint32_t memexport = 0;
+  uint32_t depth = 0;
+  uint32_t texture_shaders = 0;
+  uint32_t texture_max = 0;
+  uint32_t sampler_shaders = 0;
+  uint32_t sampler_max = 0;
+  uint32_t vertex_texture_shaders = 0;
+  uint32_t vertex_texture_max = 0;
+  uint32_t vertex_sampler_max = 0;
+  uint32_t pixel_texture_max = 0;
+  uint32_t pixel_sampler_max = 0;
+  uint32_t float_shaders = 0;
+  uint32_t float_max = 0;
+  uint64_t spirv_bytes = 0;
+  std::map<uint32_t, uint32_t> versions;
+  std::map<uint32_t, uint32_t> capabilities;
+  std::map<std::string, uint32_t> extensions;
+  std::map<uint64_t, uint32_t> descriptors;
+  std::map<std::string, uint32_t> fatals;
+};
+
+struct HostProbe {
+  HMODULE tools = nullptr;
+  HMODULE vulkan = nullptr;
+  VkInstance instance = VK_NULL_HANDLE;
+  VkDevice device = VK_NULL_HANDLE;
+  PFN_vkDestroyInstance destroy_instance = nullptr;
+  PFN_vkDestroyDevice destroy_device = nullptr;
+  PFN_vkCreateShaderModule create_module = nullptr;
+  PFN_vkDestroyShaderModule destroy_module = nullptr;
+#if defined(SHADER_DB_VULKAN_SDK)
+  spv_context context = nullptr;
+  using ContextCreate = spv_context (*)(spv_target_env);
+  using ContextDestroy = void (*)(spv_context);
+  using ValidateBinary = spv_result_t (*)(const spv_const_context, const uint32_t*, size_t,
+                                         spv_diagnostic*);
+  using DiagnosticDestroy = void (*)(spv_diagnostic);
+  ContextDestroy destroy_context = nullptr;
+  ValidateBinary validate = nullptr;
+  DiagnosticDestroy destroy_diagnostic = nullptr;
+#endif
+  std::string device_name;
+  std::string driver_name;
+  std::string vulkan_reason;
+  std::string validator_reason;
+  uint32_t api = 0;
+  uint32_t storage_range = 0;
+  bool preserve = false;
+  bool flush = false;
+  bool rte = false;
+  bool sample_rate = false;
+  bool demote = false;
+  uint32_t val_ok = 0;
+  uint32_t val_failed = 0;
+  uint32_t module_ok = 0;
+  uint32_t module_failed = 0;
+  std::map<std::string, uint32_t> val_messages;
+  std::map<int32_t, uint32_t> module_results;
+
+  HostProbe() = default;
+  HostProbe(const HostProbe&) = delete;
+  HostProbe& operator=(const HostProbe&) = delete;
+
+  ~HostProbe() {
+    if (destroy_device != nullptr && device != VK_NULL_HANDLE) {
+      destroy_device(device, nullptr);
+    }
+    if (destroy_instance != nullptr && instance != VK_NULL_HANDLE) {
+      destroy_instance(instance, nullptr);
+    }
+#if defined(SHADER_DB_VULKAN_SDK)
+    if (destroy_context != nullptr && context != nullptr) {
+      destroy_context(context);
+    }
+    if (tools != nullptr) {
+      FreeLibrary(tools);
+    }
+#endif
+    if (vulkan != nullptr) {
+      FreeLibrary(vulkan);
+    }
+  }
+
+  void Open();
+  void Check(const std::vector<uint8_t>& binary);
+};
+
+void HostProbe::Open() {
+#if defined(SHADER_DB_VULKAN_SDK)
+  const std::string tools_path = std::string(SHADER_DB_VULKAN_SDK) + "\\Bin\\SPIRV-Tools-shared.dll";
+  tools = LoadLibraryExA(tools_path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+  if (tools == nullptr) {
+    validator_reason = "cannot load SPIRV-Tools-shared.dll";
+  } else {
+    auto create_context = reinterpret_cast<ContextCreate>(GetProcAddress(tools, "spvContextCreate"));
+    destroy_context = reinterpret_cast<ContextDestroy>(GetProcAddress(tools, "spvContextDestroy"));
+    validate = reinterpret_cast<ValidateBinary>(GetProcAddress(tools, "spvValidateBinary"));
+    destroy_diagnostic =
+        reinterpret_cast<DiagnosticDestroy>(GetProcAddress(tools, "spvDiagnosticDestroy"));
+    if (create_context == nullptr || destroy_context == nullptr || validate == nullptr ||
+        destroy_diagnostic == nullptr) {
+      validator_reason = "SPIRV-Tools exports are missing";
+    } else {
+      context = create_context(SPV_ENV_VULKAN_1_2);
+      if (context == nullptr) {
+        validator_reason = "spvContextCreate failed";
+      }
+    }
+  }
+#else
+  validator_reason = "Vulkan SDK path is not set";
+#endif
+
+  vulkan = LoadLibraryA("vulkan-1.dll");
+  if (vulkan == nullptr) {
+    vulkan_reason = "vulkan-1.dll is not installed";
+    return;
+  }
+  auto get_instance = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
+      GetProcAddress(vulkan, "vkGetInstanceProcAddr"));
+  if (get_instance == nullptr) {
+    vulkan_reason = "vkGetInstanceProcAddr is missing";
+    return;
+  }
+  auto enumerate_version = reinterpret_cast<PFN_vkEnumerateInstanceVersion>(
+      get_instance(nullptr, "vkEnumerateInstanceVersion"));
+  uint32_t loader_version = VK_API_VERSION_1_0;
+  if (enumerate_version != nullptr) {
+    enumerate_version(&loader_version);
+  }
+  const uint32_t requested = loader_version >= VK_API_VERSION_1_3   ? VK_API_VERSION_1_3
+                             : loader_version >= VK_API_VERSION_1_2 ? VK_API_VERSION_1_2
+                                                                    : VK_API_VERSION_1_1;
+  auto create_instance =
+      reinterpret_cast<PFN_vkCreateInstance>(get_instance(nullptr, "vkCreateInstance"));
+  if (create_instance == nullptr) {
+    vulkan_reason = "vkCreateInstance is missing";
+    return;
+  }
+  VkApplicationInfo application{};
+  application.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+  application.apiVersion = requested;
+  VkInstanceCreateInfo instance_info{};
+  instance_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+  instance_info.pApplicationInfo = &application;
+  const VkResult created = create_instance(&instance_info, nullptr, &instance);
+  if (created != VK_SUCCESS) {
+    vulkan_reason = "vkCreateInstance returned " + std::to_string(int(created));
+    return;
+  }
+  destroy_instance =
+      reinterpret_cast<PFN_vkDestroyInstance>(get_instance(instance, "vkDestroyInstance"));
+  auto enumerate_devices = reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(
+      get_instance(instance, "vkEnumeratePhysicalDevices"));
+  auto get_properties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
+      get_instance(instance, "vkGetPhysicalDeviceProperties2"));
+  auto get_features = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(
+      get_instance(instance, "vkGetPhysicalDeviceFeatures2"));
+  auto get_queues = reinterpret_cast<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(
+      get_instance(instance, "vkGetPhysicalDeviceQueueFamilyProperties"));
+  auto create_device =
+      reinterpret_cast<PFN_vkCreateDevice>(get_instance(instance, "vkCreateDevice"));
+  auto get_device = reinterpret_cast<PFN_vkGetDeviceProcAddr>(get_instance(instance, "vkGetDeviceProcAddr"));
+  if (destroy_instance == nullptr || enumerate_devices == nullptr || get_properties == nullptr ||
+      get_features == nullptr || get_queues == nullptr || create_device == nullptr ||
+      get_device == nullptr) {
+    vulkan_reason = "instance exports are missing";
+    return;
+  }
+
+  uint32_t device_count = 0;
+  enumerate_devices(instance, &device_count, nullptr);
+  std::vector<VkPhysicalDevice> devices(device_count);
+  if (device_count == 0 ||
+      enumerate_devices(instance, &device_count, devices.data()) != VK_SUCCESS) {
+    vulkan_reason = "no physical device";
+    return;
+  }
+  VkPhysicalDevice physical = devices[0];
+  int best_rank = -1;
+  for (VkPhysicalDevice candidate : devices) {
+    VkPhysicalDeviceProperties2 properties{};
+    properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+    get_properties(candidate, &properties);
+    const int rank = properties.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 2
+                     : properties.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU
+                         ? 1
+                         : 0;
+    if (rank > best_rank) {
+      best_rank = rank;
+      physical = candidate;
+      api = properties.properties.apiVersion;
+      device_name = properties.properties.deviceName;
+      storage_range = properties.properties.limits.maxStorageBufferRange;
+    }
+  }
+
+  VkPhysicalDeviceFloatControlsProperties float_controls{};
+  float_controls.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES;
+  VkPhysicalDeviceVulkan12Properties properties12{};
+  properties12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES;
+  float_controls.pNext = &properties12;
+  VkPhysicalDeviceProperties2 properties{};
+  properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+  if (api >= VK_API_VERSION_1_2) {
+    properties.pNext = &float_controls;
+  }
+  get_properties(physical, &properties);
+  api = properties.properties.apiVersion;
+  device_name = properties.properties.deviceName;
+  storage_range = properties.properties.limits.maxStorageBufferRange;
+  if (api >= VK_API_VERSION_1_2) {
+    preserve = float_controls.shaderSignedZeroInfNanPreserveFloat32 == VK_TRUE;
+    flush = float_controls.shaderDenormFlushToZeroFloat32 == VK_TRUE;
+    rte = float_controls.shaderRoundingModeRTEFloat32 == VK_TRUE;
+    driver_name = properties12.driverName;
+  }
+
+  VkPhysicalDeviceVulkan13Features features13{};
+  features13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+  VkPhysicalDeviceFeatures2 features{};
+  features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+  if (api >= VK_API_VERSION_1_3) {
+    features.pNext = &features13;
+  }
+  get_features(physical, &features);
+  sample_rate = features.features.sampleRateShading == VK_TRUE;
+  demote = api >= VK_API_VERSION_1_3 && features13.shaderDemoteToHelperInvocation == VK_TRUE;
+
+  uint32_t family_count = 0;
+  get_queues(physical, &family_count, nullptr);
+  std::vector<VkQueueFamilyProperties> families(family_count);
+  get_queues(physical, &family_count, families.data());
+  uint32_t graphics_family = UINT32_MAX;
+  for (uint32_t i = 0; i < family_count; ++i) {
+    if ((families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) != 0) {
+      graphics_family = i;
+      break;
+    }
+  }
+  if (graphics_family == UINT32_MAX) {
+    vulkan_reason = "no graphics queue";
+    return;
+  }
+
+  const float priority = 1.0f;
+  VkDeviceQueueCreateInfo queue{};
+  queue.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+  queue.queueFamilyIndex = graphics_family;
+  queue.queueCount = 1;
+  queue.pQueuePriorities = &priority;
+  VkPhysicalDeviceFeatures enabled{};
+  enabled.sampleRateShading = sample_rate ? VK_TRUE : VK_FALSE;
+  VkPhysicalDeviceVulkan13Features enabled13{};
+  enabled13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+  enabled13.shaderDemoteToHelperInvocation = demote ? VK_TRUE : VK_FALSE;
+  VkDeviceCreateInfo device_info{};
+  device_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+  device_info.queueCreateInfoCount = 1;
+  device_info.pQueueCreateInfos = &queue;
+  device_info.pEnabledFeatures = &enabled;
+  if (demote) {
+    device_info.pNext = &enabled13;
+  }
+  const VkResult device_result = create_device(physical, &device_info, nullptr, &device);
+  if (device_result != VK_SUCCESS) {
+    vulkan_reason = "vkCreateDevice returned " + std::to_string(int(device_result));
+    return;
+  }
+  destroy_device = reinterpret_cast<PFN_vkDestroyDevice>(get_device(device, "vkDestroyDevice"));
+  create_module =
+      reinterpret_cast<PFN_vkCreateShaderModule>(get_device(device, "vkCreateShaderModule"));
+  destroy_module =
+      reinterpret_cast<PFN_vkDestroyShaderModule>(get_device(device, "vkDestroyShaderModule"));
+  if (destroy_device == nullptr || create_module == nullptr || destroy_module == nullptr) {
+    vulkan_reason = "device exports are missing";
+  }
+}
+
+void HostProbe::Check(const std::vector<uint8_t>& binary) {
+  const auto* words = reinterpret_cast<const uint32_t*>(binary.data());
+  const size_t word_count = binary.size() / 4;
+#if defined(SHADER_DB_VULKAN_SDK)
+  if (context != nullptr && validate != nullptr) {
+    spv_diagnostic diagnostic = nullptr;
+    const spv_result_t result = validate(context, words, word_count, &diagnostic);
+    if (result == SPV_SUCCESS) {
+      ++val_ok;
+    } else {
+      ++val_failed;
+      if (diagnostic != nullptr && diagnostic->error != nullptr) {
+        ++val_messages[diagnostic->error];
+      } else {
+        ++val_messages["validation failed without a message"];
+      }
+    }
+    if (destroy_diagnostic != nullptr && diagnostic != nullptr) {
+      destroy_diagnostic(diagnostic);
+    }
+  }
+#else
+  (void)words;
+  (void)word_count;
+#endif
+  if (create_module == nullptr) {
+    return;
+  }
+  VkShaderModuleCreateInfo info{};
+  info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+  info.codeSize = binary.size();
+  info.pCode = words;
+  VkShaderModule module = VK_NULL_HANDLE;
+  const VkResult result = create_module(device, &info, nullptr, &module);
+  if (result == VK_SUCCESS) {
+    ++module_ok;
+    destroy_module(device, module, nullptr);
+  } else {
+    ++module_failed;
+    ++module_results[int32_t(result)];
+  }
+}
+
+const char* CapabilityName(uint32_t capability) {
+  switch (capability) {
+    case 1:
+      return "Shader";
+    case 32:
+      return "ClipDistance";
+    case 33:
+      return "CullDistance";
+    case 35:
+      return "SampleRateShading";
+    case 51:
+      return "DerivativeControl";
+    case 4464:
+      return "DenormPreserve";
+    case 4465:
+      return "DenormFlushToZero";
+    case 4466:
+      return "SignedZeroInfNanPreserve";
+    case 4467:
+      return "RoundingModeRTE";
+    case 5363:
+      return "FragmentShaderSampleInterlockEXT";
+    case 5379:
+      return "DemoteToHelperInvocationEXT";
+    default:
+      return nullptr;
+  }
+}
+
+// Walks one module. A broken instruction stream is a tool failure: the
+// translator said the shader was valid.
+void NoteModule(const std::vector<uint8_t>& binary, bool vertex,
+                const rex::graphics::SpirvShader& shader, TranslateStats& stats) {
+  if (binary.size() % 4 != 0 || binary.size() < 20) {
+    Fail("spirv module is shorter than its header");
+  }
+  const auto* words = reinterpret_cast<const uint32_t*>(binary.data());
+  const size_t word_count = binary.size() / 4;
+  ++stats.versions[words[1]];
+
+  std::map<uint32_t, uint32_t> set_by_id;
+  std::map<uint32_t, uint32_t> binding_by_id;
+  std::set<uint32_t> seen_capabilities;
+  std::set<std::string> seen_extensions;
+  std::set<uint64_t> seen_descriptors;
+  uint32_t entries = 0;
+  size_t cursor = 5;
+  while (cursor < word_count) {
+    const uint32_t instruction = words[cursor];
+    const uint32_t count = instruction >> 16;
+    const uint32_t opcode = instruction & 0xFFFFu;
+    if (count == 0 || cursor + count > word_count) {
+      Fail("spirv instruction runs past the module");
+    }
+    if (opcode == 17 && count >= 2) {
+      seen_capabilities.insert(words[cursor + 1]);
+    } else if (opcode == 10 && count >= 2) {
+      std::string name;
+      for (uint32_t i = 1; i < count && name.find('\0') == std::string::npos; ++i) {
+        uint32_t packed = words[cursor + i];
+        for (int byte = 0; byte < 4; ++byte) {
+          const char character = char(packed & 0xFFu);
+          packed >>= 8;
+          if (character == 0) {
+            i = count;
+            break;
+          }
+          name.push_back(character);
+        }
+      }
+      seen_extensions.insert(name);
+    } else if (opcode == 15 && count >= 2) {
+      const uint32_t model = words[cursor + 1];
+      const uint32_t expected = vertex ? 0u : 4u;
+      if (model != expected) {
+        Fail("spirv entry point stage does not match the shader");
+      }
+      ++entries;
+    } else if (opcode == 71 && count >= 4) {
+      const uint32_t id = words[cursor + 1];
+      const uint32_t decoration = words[cursor + 2];
+      if (decoration == 34) {
+        set_by_id[id] = words[cursor + 3];
+      } else if (decoration == 33) {
+        binding_by_id[id] = words[cursor + 3];
+      }
+    }
+    cursor += count;
+  }
+  if (entries != 1) {
+    Fail("spirv module does not have one entry point");
+  }
+  for (uint32_t capability : seen_capabilities) {
+    ++stats.capabilities[capability];
+  }
+  for (const std::string& extension : seen_extensions) {
+    ++stats.extensions[extension];
+  }
+  for (const auto& set : set_by_id) {
+    const auto binding = binding_by_id.find(set.first);
+    if (binding == binding_by_id.end()) {
+      continue;
+    }
+    seen_descriptors.insert((uint64_t(set.second) << 32) | binding->second);
+  }
+  for (uint64_t descriptor : seen_descriptors) {
+    ++stats.descriptors[descriptor];
+  }
+
+  if (shader.memexport_eM_written() != 0) {
+    ++stats.memexport;
+  }
+  if (shader.writes_depth()) {
+    ++stats.depth;
+  }
+  const uint32_t textures = uint32_t(shader.GetTextureBindingsAfterTranslation().size());
+  const uint32_t samplers = uint32_t(shader.GetSamplerBindingsAfterTranslation().size());
+  const uint32_t floats = shader.constant_register_map().float_count;
+  if (textures != 0) {
+    ++stats.texture_shaders;
+    stats.texture_max = std::max(stats.texture_max, textures);
+  }
+  if (samplers != 0) {
+    ++stats.sampler_shaders;
+    stats.sampler_max = std::max(stats.sampler_max, samplers);
+  }
+  if (vertex) {
+    if (textures != 0) {
+      ++stats.vertex_texture_shaders;
+    }
+    stats.vertex_texture_max = std::max(stats.vertex_texture_max, textures);
+    stats.vertex_sampler_max = std::max(stats.vertex_sampler_max, samplers);
+  } else {
+    stats.pixel_texture_max = std::max(stats.pixel_texture_max, textures);
+    stats.pixel_sampler_max = std::max(stats.pixel_sampler_max, samplers);
+  }
+  if (floats != 0) {
+    ++stats.float_shaders;
+    stats.float_max = std::max(stats.float_max, floats);
+  }
+}
+
+void TranslateShader(rex::graphics::SpirvShaderTranslator& translator, uint32_t token,
+                     const UcodeSpan& ucode, TranslateStats& stats, HostProbe& probe) {
+  const auto type = token == 0xFFFE0300u ? rex::graphics::xenos::ShaderType::kVertex
+                                         : rex::graphics::xenos::ShaderType::kPixel;
+  rex::graphics::SpirvShader shader(type, 0, ucode.dwords, ucode.dword_count, std::endian::big);
+  rex::string::StringBuffer disassembly;
+  shader.AnalyzeUcode(disassembly);
+  if (shader.uses_register_dynamic_addressing()) {
+    ++stats.dynamic_registers;
+  }
+  const uint64_t modification = type == rex::graphics::xenos::ShaderType::kVertex
+                                    ? translator.GetDefaultVertexShaderModification(0)
+                                    : translator.GetDefaultPixelShaderModification(0);
+  rex::graphics::Shader::Translation& translation = *shader.GetOrCreateTranslation(modification);
+  if (translator.TranslateAnalyzedShader(translation)) {
+    const std::vector<uint8_t>& binary = translation.translated_binary();
+    const bool spirv = binary.size() >= 4 && binary[0] == 0x03 && binary[1] == 0x02 &&
+                       binary[2] == 0x23 && binary[3] == 0x07;
+    if (spirv) {
+      NoteModule(binary, type == rex::graphics::xenos::ShaderType::kVertex, shader, stats);
+      probe.Check(binary);
+      ++stats.ok;
+      stats.spirv_bytes += binary.size();
+      return;
+    }
+    ++stats.failed;
+    ++stats.fatals["translated module is not SPIR-V"];
+    return;
+  }
+  ++stats.failed;
+  for (const rex::graphics::Shader::Error& error : translation.errors()) {
+    if (error.is_fatal) {
+      ++stats.fatals[error.message];
+    }
+  }
+}
+#endif
+
 std::string ReadName(const uint8_t* bytes) {
   size_t length = 0;
   while (length < 64 && bytes[length] != 0) {
@@ -555,6 +1087,13 @@ int main(int argc, char** argv) {
     uint64_t ucode_bytes = 0;
     uint32_t tag_count[3] = {};
     ConstantStats constants;
+#if defined(SHADER_DB_TRANSLATE)
+    rex::graphics::SpirvShaderTranslator::Features features(true);
+    rex::graphics::SpirvShaderTranslator translator(features, false, false, false);
+    TranslateStats translated;
+    HostProbe probe;
+    probe.Open();
+#endif
     for (const ShaderRecord& shader : shaders) {
       const std::vector<uint8_t> object =
           InflateZlib(file.data() + shader.offset, shader.compressed_size, shader.raw_size);
@@ -566,6 +1105,9 @@ int main(int argc, char** argv) {
       const UcodeSpan ucode = LocateUcode(object.data(), object.size(), token);
       ucode_bytes += uint64_t(ucode.dword_count) * 4;
       ReadConstants(object.data(), object.size(), token, constants);
+#if defined(SHADER_DB_TRANSLATE)
+      TranslateShader(translator, token, ucode, translated, probe);
+#endif
       if (token == 0xFFFE0300u) {
         ++vertex;
       } else if (token == 0xFFFF0300u) {
@@ -595,6 +1137,97 @@ int main(int argc, char** argv) {
     std::cout << "  float4 " << constants.float4 << "\n";
     std::cout << "  sampler " << constants.sampler << "\n";
     std::cout << "  names " << constants.names.size() << "\n";
+#if defined(SHADER_DB_TRANSLATE)
+    std::cout << "spirv " << (translated.ok + translated.failed) << "\n";
+    std::cout << "  ok " << translated.ok << "\n";
+    std::cout << "  failed " << translated.failed << "\n";
+    std::cout << "  bytes " << translated.spirv_bytes << "\n";
+    std::cout << "  dynamic_registers " << translated.dynamic_registers << "\n";
+    std::cout << "  memexport " << translated.memexport << "\n";
+    std::cout << "  depth " << translated.depth << "\n";
+    std::cout << "  textures " << translated.texture_shaders << " max " << translated.texture_max
+              << "\n";
+    std::cout << "  samplers " << translated.sampler_shaders << " max " << translated.sampler_max
+              << "\n";
+    std::cout << "  vertex_textures " << translated.vertex_texture_shaders << " max "
+              << translated.vertex_texture_max << " samplers " << translated.vertex_sampler_max
+              << "\n";
+    std::cout << "  pixel_textures max " << translated.pixel_texture_max << " samplers "
+              << translated.pixel_sampler_max << "\n";
+    std::cout << "  float_constants " << translated.float_shaders << " max "
+              << translated.float_max << "\n";
+    for (const auto& version : translated.versions) {
+      const uint32_t major = (version.first >> 16) & 0xFFu;
+      const uint32_t minor = (version.first >> 8) & 0xFFu;
+      std::cout << "  version " << major << "." << minor << " " << version.second << "\n";
+    }
+    for (const auto& capability : translated.capabilities) {
+      const char* name = CapabilityName(capability.first);
+      std::cout << "  cap " << (name != nullptr ? name : std::to_string(capability.first)) << " "
+                << capability.second << "\n";
+    }
+    for (const auto& extension : translated.extensions) {
+      std::cout << "  ext " << extension.first << " " << extension.second << "\n";
+    }
+    for (const auto& descriptor : translated.descriptors) {
+      std::cout << "  set " << (descriptor.first >> 32) << " binding "
+                << uint32_t(descriptor.first) << " " << descriptor.second << "\n";
+    }
+#if defined(SHADER_DB_VULKAN_SDK)
+    if (probe.context == nullptr) {
+      std::cout << "validator closed " << probe.validator_reason << "\n";
+    } else {
+      std::cout << "validator vulkan-1.2\n";
+      std::cout << "  ok " << probe.val_ok << "\n";
+      std::cout << "  failed " << probe.val_failed << "\n";
+      std::vector<std::pair<uint32_t, std::string>> validation;
+      validation.reserve(probe.val_messages.size());
+      for (const auto& entry : probe.val_messages) {
+        validation.emplace_back(entry.second, entry.first);
+      }
+      std::sort(validation.begin(), validation.end(),
+                [](const auto& a, const auto& b) { return a.first > b.first; });
+      const size_t validation_shown = std::min<size_t>(validation.size(), 8);
+      for (size_t i = 0; i < validation_shown; ++i) {
+        std::cout << "  message " << validation[i].first << " " << validation[i].second << "\n";
+      }
+    }
+#endif
+    if (probe.create_module == nullptr) {
+      std::cout << "vulkan closed " << probe.vulkan_reason << "\n";
+    } else {
+      std::cout << "vulkan " << probe.device_name << "\n";
+      std::cout << "  api " << VK_API_VERSION_MAJOR(probe.api) << "."
+                << VK_API_VERSION_MINOR(probe.api) << "." << VK_API_VERSION_PATCH(probe.api)
+                << "\n";
+      if (!probe.driver_name.empty()) {
+        std::cout << "  driver " << probe.driver_name << "\n";
+      }
+      std::cout << "  storage_range " << probe.storage_range << "\n";
+      std::cout << "  float32_preserve " << (probe.preserve ? 1 : 0) << "\n";
+      std::cout << "  float32_flush " << (probe.flush ? 1 : 0) << "\n";
+      std::cout << "  float32_rte " << (probe.rte ? 1 : 0) << "\n";
+      std::cout << "  sample_rate " << (probe.sample_rate ? 1 : 0) << "\n";
+      std::cout << "  demote " << (probe.demote ? 1 : 0) << "\n";
+      std::cout << "  modules " << (probe.module_ok + probe.module_failed) << "\n";
+      std::cout << "  ok " << probe.module_ok << "\n";
+      std::cout << "  failed " << probe.module_failed << "\n";
+      for (const auto& result : probe.module_results) {
+        std::cout << "  result " << result.first << " " << result.second << "\n";
+      }
+    }
+    std::vector<std::pair<uint32_t, std::string>> ranked;
+    ranked.reserve(translated.fatals.size());
+    for (const auto& entry : translated.fatals) {
+      ranked.emplace_back(entry.second, entry.first);
+    }
+    std::sort(ranked.begin(), ranked.end(),
+              [](const auto& a, const auto& b) { return a.first > b.first; });
+    const size_t shown = std::min<size_t>(ranked.size(), 8);
+    for (size_t i = 0; i < shown; ++i) {
+      std::cout << "  fatal " << ranked[i].first << " " << ranked[i].second << "\n";
+    }
+#endif
     return 0;
   } catch (const std::exception& error) {
     std::cerr << error.what() << "\n";

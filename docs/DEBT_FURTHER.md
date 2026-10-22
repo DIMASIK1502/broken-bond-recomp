@@ -71,9 +71,21 @@ Rise лежит только в `.references/naruto-rise-recomp` (GPL-3.0). От
   (4648 `vs_3_0`, 3508 `ps_3_0`). Микрокод Xenos внутри объекта найден,
   control flow всех 8156 шейдеров сходится (4339980 байт). Таблица констант
   D3DX на смещении `0x28`: 70214 привязки (61033 float4, 9181 sampler),
-  127 имён. Эта сборка SDK собрана с `REXGLUE_USE_VULKAN=OFF`: в
-  `rexgpu-xenos` есть переводчик DXBC, SPIR-V там нет, вызова из утилиты нет.
-  Артефакт кэша не коммитить (как `generated/`).
+  127 имён. Установленный `rexgpu-xenos` собран с `REXGLUE_USE_VULKAN=OFF`,
+  поэтому утилита компилирует переводчик SPIR-V из соседнего дерева SDK и
+  гоняет его в памяти: 8156 из 8156 дают модуль SPIR-V 1.5 (302683608 байт),
+  у каждого одна точка входа своей стадии. Set 0 binding 0 — shared memory
+  у всех, EDRAM-буфера нет. Set 1: system, bool/loop и fetch у всех,
+  float-константы у 8138 (максимум 256). Текстуры у 271 вершинного шейдера
+  (ровно 2 image + 1 sampler, set 2) и у 3444 пиксельных (set 3, до 16 image
+  и 8 sampler).   Depth пишут 3, memexport eM — ни один. Файл кэша не пишется.
+  Проба этой машины: NVIDIA GeForce RTX 4070, Vulkan 1.4.341, драйвер
+  NVIDIA. `maxStorageBufferRange` — 4 ГБ. Float32 preserve и RTE есть,
+  denorm flush-to-zero нет; sample rate и demote есть. Драйвер принял все
+  8156 `vkCreateShaderModule`. `spirv-val` для Vulkan 1.2 отверг все 8156
+  одной ошибкой: `user_clip_planes` в `XeSystemConstants` лежит на смещении
+  28 и не выровнен на 16. Это ещё не путь `src/gfx/`. Артефакт кэша не
+  коммитить (как `generated/`).
 
 ### F4. Кадры между тиками
 

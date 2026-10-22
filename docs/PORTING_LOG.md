@@ -440,12 +440,44 @@ table, a register set, and a register count. This dump has 70214 constants,
 bool or int constants. `shader_db` checks the table and writes nothing.
 
 The installed SDK build has `REXGLUE_USE_VULKAN=OFF` and `REXGLUE_USE_D3D12=ON`.
-`rexgpu-xenosrd.dll` contains the DXBC translator (`xe_vertex_index_endian`)
-and `AnalyzeUcode`, and does not contain the SPIR-V translator
-(`SPV_KHR_float_controls` is absent). The tool does not call either
-translator and does not write a cache.
+`rexgpu-xenosrd.dll` contains the DXBC translator and does not contain the
+SPIR-V translator. `shader_db` therefore compiles that translator from the
+sibling `rexglue-sdk` checkout (glslang plus the SPIR-V translator sources)
+and does not rebuild the game plugin. It translates every shader in memory
+with all translator feature bits enabled, 2x MSAA off, and EDRAM interlock
+off. The default modification asks for no dynamically addressable registers;
+this dump has none. All 8156 modules are SPIR-V 1.5, each instruction stays
+inside the module, and each has one entry point of its own stage. None
+reported a fatal error. The in-memory total is 302683608 bytes.
+
+Descriptor sets on that translation, counted from `OpDecorate`: set 0
+binding 0 is shared memory on every shader, and the EDRAM buffer is absent.
+Set 1 carries system constants, bool/loop constants, and fetch constants on
+every shader. Vertex float constants are on 4647 shaders and pixel float
+constants on 3491, 8138 in total, with at most 256 registers. Set 2 is used
+by 271 vertex shaders, each with exactly two images and one sampler. Set 3
+is used by 3444 pixel shaders, up to 16 images and 8 samplers. Three shaders
+write depth. No shader writes a memexport element. `DerivativeControl` is on
+the 3444 pixel shaders that sample, and `DemoteToHelperInvocationEXT` plus
+`SPV_EXT_demote_to_helper_invocation` is on the 36 shaders that kill pixels.
+`DenormFlushToZero`, `SignedZeroInfNanPreserve`, `RoundingModeRTE`, and
+`SampleRateShading` (every pixel shader) are present because those feature
+bits were enabled for the run. The tool writes no cache.
+
+On this machine `shader_db` also loads `SPIRV-Tools-shared.dll` from
+`H:\Tools\VulkanSDK` and `vulkan-1.dll`. The device is an NVIDIA GeForce
+RTX 4070, API 1.4.341, driver name NVIDIA. `maxStorageBufferRange` is
+4294967295, so one shared-memory binding covers the guest address space.
+Float32 signed-zero/inf/nan preserve and round-to-nearest-even are
+supported. Float32 denorm flush-to-zero is not, while the all-features
+translation still emits that execution mode. Sample-rate shading and
+demote-to-helper are supported. `vkCreateShaderModule` accepted all 8156
+modules and each module was destroyed immediately. `spirv-val` for Vulkan
+1.2 rejected all 8156 with one message: the uniform `XeSystemConstants`
+block has member 7, `user_clip_planes`, at offset 28, which is not aligned
+to 16. The running renderer is still Xenos.
 
 Xenos tiling for a later host path is `Untile` in
 `rex/graphics/pipeline/texture/conversion.h`, with the tile sizes in
-`rex/graphics/xenos.h`. The running renderer is still Xenos.
+`rex/graphics/xenos.h`.
 

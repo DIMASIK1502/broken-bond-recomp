@@ -28,4 +28,67 @@ endif()
 rexglue_setup_target(broken_bond GPU_PLUGINS xenos)
 
 # Reads game/xeshader.sdb. Not part of the game link and writes no cache.
+# The installed GPU plugin is D3D12-only, so SPIR-V is compiled from the SDK
+# checkout when that tree sits next to this repo. The game plugin is not rebuilt.
 add_executable(shader_db tools/shader_db.cpp)
+
+set(BROKEN_BOND_REXGLUE_SOURCE "" CACHE PATH
+    "rexglue-sdk checkout used to compile the SPIR-V translator into shader_db")
+if(BROKEN_BOND_REXGLUE_SOURCE STREQUAL "")
+    get_filename_component(_rexglue_sibling
+        "${CMAKE_CURRENT_SOURCE_DIR}/../rexglue-sdk" ABSOLUTE)
+    if(EXISTS "${_rexglue_sibling}/src/graphics/pipeline/shader/spirv_translator.cpp")
+        set(BROKEN_BOND_REXGLUE_SOURCE "${_rexglue_sibling}")
+    endif()
+endif()
+
+if(EXISTS "${BROKEN_BOND_REXGLUE_SOURCE}/src/graphics/pipeline/shader/spirv_translator.cpp")
+    set(ENABLE_GLSLANG_BINARIES OFF CACHE BOOL "" FORCE)
+    set(ENABLE_SPVREMAPPER OFF CACHE BOOL "" FORCE)
+    set(ENABLE_HLSL OFF CACHE BOOL "" FORCE)
+    set(ENABLE_OPT OFF CACHE BOOL "" FORCE)
+    set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+    set(SKIP_GLSLANG_INSTALL ON CACHE BOOL "" FORCE)
+    set(ENABLE_RTTI ON CACHE BOOL "" FORCE)
+    set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "" FORCE)
+    add_subdirectory("${BROKEN_BOND_REXGLUE_SOURCE}/thirdparty/glslang"
+        "${CMAKE_CURRENT_BINARY_DIR}/glslang" EXCLUDE_FROM_ALL)
+
+    target_sources(shader_db PRIVATE
+        "${BROKEN_BOND_REXGLUE_SOURCE}/src/graphics/format/ucode.cpp"
+        "${BROKEN_BOND_REXGLUE_SOURCE}/src/graphics/pipeline/shader/shader.cpp"
+        "${BROKEN_BOND_REXGLUE_SOURCE}/src/graphics/pipeline/shader/translator.cpp"
+        "${BROKEN_BOND_REXGLUE_SOURCE}/src/graphics/pipeline/shader/translator_disasm.cpp"
+        "${BROKEN_BOND_REXGLUE_SOURCE}/src/graphics/pipeline/shader/spirv.cpp"
+        "${BROKEN_BOND_REXGLUE_SOURCE}/src/graphics/pipeline/shader/spirv_builder.cpp"
+        "${BROKEN_BOND_REXGLUE_SOURCE}/src/graphics/pipeline/shader/spirv_translator.cpp"
+        "${BROKEN_BOND_REXGLUE_SOURCE}/src/graphics/pipeline/shader/spirv_translator_alu.cpp"
+        "${BROKEN_BOND_REXGLUE_SOURCE}/src/graphics/pipeline/shader/spirv_translator_fetch.cpp"
+        "${BROKEN_BOND_REXGLUE_SOURCE}/src/graphics/pipeline/shader/spirv_translator_memexport.cpp"
+        "${BROKEN_BOND_REXGLUE_SOURCE}/src/graphics/pipeline/shader/spirv_translator_rb.cpp")
+    target_compile_definitions(shader_db PRIVATE SHADER_DB_TRANSLATE)
+    target_include_directories(shader_db BEFORE PRIVATE
+        "${BROKEN_BOND_REXGLUE_SOURCE}/include"
+        "${BROKEN_BOND_REXGLUE_SOURCE}/thirdparty/vulkan-headers/include"
+        "${BROKEN_BOND_REXGLUE_SOURCE}/thirdparty/renderdoc")
+    target_link_libraries(shader_db PRIVATE
+        rex::runtime
+        SPIRV
+        glslang
+        MachineIndependent
+        GenericCodeGen
+        OSDependent
+        OGLCompiler)
+    target_compile_options(shader_db PRIVATE -Wno-unused-variable -Wno-unused-function)
+endif()
+
+set(BROKEN_BOND_VULKAN_SDK "" CACHE PATH "Vulkan SDK used to validate shader_db SPIR-V")
+if(BROKEN_BOND_VULKAN_SDK STREQUAL "" AND
+   EXISTS "H:/Tools/VulkanSDK/Include/spirv-tools/libspirv.h")
+    set(BROKEN_BOND_VULKAN_SDK "H:/Tools/VulkanSDK")
+endif()
+if(EXISTS "${BROKEN_BOND_VULKAN_SDK}/Include/spirv-tools/libspirv.h")
+    target_include_directories(shader_db PRIVATE "${BROKEN_BOND_VULKAN_SDK}/Include")
+    target_compile_definitions(shader_db PRIVATE
+        "SHADER_DB_VULKAN_SDK=\"${BROKEN_BOND_VULKAN_SDK}\"")
+endif()
