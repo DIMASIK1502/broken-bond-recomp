@@ -1409,6 +1409,14 @@ struct TileResult {
   uint32_t address_failed = 0;
   uint32_t duplicate = 0;
   uint32_t roundtrip_failed = 0;
+  uint32_t volume_blocks = 0;
+  uint32_t volume_failed = 0;
+  uint32_t below_origin = 0;
+  uint32_t below_origin_max = 0;
+  uint32_t span_exceeded = 0;
+  uint32_t lower_bound_mismatch = 0;
+  uint32_t lower_bound_above = 0;
+  uint32_t texel_lower_above = 0;
   bool endian_ok = false;
   std::string skipped_names;
   std::string example;
@@ -1480,6 +1488,8 @@ bool CheckTileWindow(const rex::graphics::FormatInfo* format, uint32_t pitch, ui
   return ok;
 }
 
+void CheckTiling3D(TileResult& result);
+
 TileResult CheckTiling() {
   TileResult result;
   uint8_t endian_in[4] = {0x11, 0x22, 0x33, 0x44};
@@ -1548,7 +1558,180 @@ TileResult CheckTiling() {
   };
   rex::graphics::texture_conversion::Untile(restored.data(), tiled.data(), &info);
   result.roundtrip_failed = restored == linear ? 0 : 1;
+  CheckTiling3D(result);
   return result;
+}
+
+uint32_t Address3D(uint32_t x, uint32_t y, uint32_t z, uint32_t pitch, uint32_t height,
+                   uint32_t log2) {
+  return static_cast<uint32_t>(rex::graphics::texture_util::GetTiledOffset3D(
+      int32_t(x), int32_t(y), int32_t(z), pitch, height, log2));
+}
+
+uint32_t TileOriginInRow3D(uint32_t x, uint32_t log2) {
+  if (log2 == 0) {
+    return ((x >> 6) << 12) | (((x >> 5) & 1u) << 10);
+  }
+  return (x / 32u) * 0x1000u * ((1u << log2) / 2u);
+}
+
+uint32_t TileSpan3D(uint32_t pitch, uint32_t log2) {
+  if (log2 == 0) {
+    return ((pitch >> 6) << 12) + 0xC00u + ((pitch & 32u) << 5);
+  }
+  return ((pitch / 32u) * 0x1000u + 0x1000u) * ((1u << log2) / 2u);
+}
+
+void FailVolume(TileResult& result, const std::string& text) {
+  ++result.volume_failed;
+  if (result.example.empty()) {
+    result.example = text;
+  }
+}
+
+void CheckLinearRun3D(uint32_t pitch, uint32_t height, uint32_t log2, TileResult& result) {
+  const uint32_t bytes = 1u << log2;
+  const uint32_t run = log2 == 0 || log2 == 1 ? 8u : log2 == 2 ? 4u : log2 == 3 ? 2u : 1u;
+  const uint32_t gap = log2 <= 1 ? 64u : 32u;
+  const uint32_t base = Address3D(0, 0, 0, pitch, height, log2);
+  if (base != 0) {
+    FailVolume(result, "3d origin " + std::to_string(log2) + " is " + std::to_string(base));
+  }
+  for (uint32_t i = 1; i < run; ++i) {
+    const uint32_t got = Address3D(i, 0, 0, pitch, height, log2);
+    if (got != base + i * bytes) {
+      FailVolume(result, "3d run log2 " + std::to_string(log2) + " x " + std::to_string(i));
+      return;
+    }
+  }
+  const uint32_t odd = Address3D(run, 0, 0, pitch, height, log2);
+  if (odd != base + gap) {
+    FailVolume(result, "3d gap log2 " + std::to_string(log2) + " got " + std::to_string(odd));
+  }
+}
+
+void CheckVolume3D(uint32_t pitch, uint32_t height, uint32_t depth, uint32_t log2,
+                   TileResult& result) {
+  const uint32_t bytes = 1u << log2;
+  const uint32_t span = TileSpan3D(pitch, log2);
+  const uint32_t upper = rex::graphics::texture_util::GetTiledAddressUpperBound3D(
+      pitch, height, depth, pitch, height, log2);
+  const uint32_t step_z = Address3D(0, 0, 8, pitch, height, log2);
+  struct TileExtent {
+    uint32_t origin = 0;
+    uint32_t x = 0;
+    uint32_t y = 0;
+    uint32_t z = 0;
+    uint32_t low = 0xffffffffu;
+    uint32_t high = 0;
+  };
+  std::map<uint32_t, TileExtent> tiles;
+  std::vector<uint32_t> seen;
+  seen.reserve(static_cast<size_t>(pitch) * height * depth);
+  for (uint32_t z = 0; z < depth; ++z) {
+    for (uint32_t y = 0; y < height; ++y) {
+      for (uint32_t x = 0; x < pitch; ++x) {
+        const uint32_t address = Address3D(x, y, z, pitch, height, log2);
+        const uint32_t origin = Address3D(x & ~31u, y & ~31u, z & ~3u, pitch, height, log2);
+        seen.push_back(address);
+        ++result.volume_blocks;
+        if (address < origin) {
+          ++result.below_origin;
+          result.below_origin_max = std::max(result.below_origin_max, origin - address);
+        }
+        const uint32_t sdk_texel = rex::graphics::texture_util::GetTiledAddressLowerBound3D(
+            x, y, z, pitch, height, log2);
+        if (sdk_texel > address) {
+          ++result.texel_lower_above;
+        }
+        if (address + bytes > upper) {
+          FailVolume(result, "3d upper log2 " + std::to_string(log2) + " pitch " +
+                                 std::to_string(pitch) + " x " + std::to_string(x) + " y " +
+                                 std::to_string(y) + " z " + std::to_string(z) + " address " +
+                                 std::to_string(address) + " upper " + std::to_string(upper));
+          return;
+        }
+        const uint32_t key = (x >> 5) | ((y >> 5) << 6) | ((z >> 2) << 12);
+        TileExtent& tile = tiles[key];
+        tile.origin = origin;
+        tile.x = x & ~31u;
+        tile.y = y & ~31u;
+        tile.z = z & ~3u;
+        tile.low = std::min(tile.low, address);
+        tile.high = std::max(tile.high, address);
+        if ((x & 31u) == 0 && (y & 31u) == 0 && (z & 3u) == 0) {
+          const uint32_t row = Address3D(0, y, z, pitch, height, log2);
+          if (address - row != TileOriginInRow3D(x, log2) ||
+              (x >= 32 && address <= Address3D(x - 32, y, z, pitch, height, log2))) {
+            FailVolume(result, "3d origin log2 " + std::to_string(log2) + " pitch " +
+                                   std::to_string(pitch) + " x " + std::to_string(x) + " z " +
+                                   std::to_string(z));
+            return;
+          }
+        }
+        if (z < 8) {
+          const uint32_t ahead = Address3D(x, y, z + 8, pitch, height, log2);
+          if (ahead - address != step_z) {
+            FailVolume(result, "3d z-period log2 " + std::to_string(log2) + " x " +
+                                   std::to_string(x) + " y " + std::to_string(y) + " z " +
+                                   std::to_string(z));
+            return;
+          }
+        }
+        if (y < 32 && height >= 64) {
+          const uint32_t step_y =
+              Address3D(0, 32, z & ~3u, pitch, height, log2) - Address3D(0, 0, z & ~3u, pitch, height, log2);
+          if (Address3D(x, y + 32, z, pitch, height, log2) - address != step_y) {
+            FailVolume(result, "3d y-period log2 " + std::to_string(log2) + " pitch " +
+                                   std::to_string(pitch) + " x " + std::to_string(x) + " z " +
+                                   std::to_string(z));
+            return;
+          }
+        }
+      }
+    }
+  }
+  std::sort(seen.begin(), seen.end());
+  if (std::adjacent_find(seen.begin(), seen.end()) != seen.end()) {
+    FailVolume(result, "3d duplicate log2 " + std::to_string(log2) + " pitch " +
+                           std::to_string(pitch) + " height " + std::to_string(height));
+  }
+  for (const auto& entry : tiles) {
+    const TileExtent& tile = entry.second;
+    if (tile.high + bytes > tile.origin + span) {
+      ++result.span_exceeded;
+      if (result.example.empty()) {
+        result.example = "3d span log2 " + std::to_string(log2) + " pitch " + std::to_string(pitch) +
+                         " tile " + std::to_string(tile.x) + " " + std::to_string(tile.y) + " " +
+                         std::to_string(tile.z) + " high " + std::to_string(tile.high) +
+                         " origin " + std::to_string(tile.origin) + " span " + std::to_string(span);
+      }
+    }
+    const uint32_t sdk = rex::graphics::texture_util::GetTiledAddressLowerBound3D(
+        tile.x, tile.y, tile.z, pitch, height, log2);
+    if (sdk != tile.origin) {
+      ++result.lower_bound_mismatch;
+    }
+    if (sdk > tile.low) {
+      ++result.lower_bound_above;
+    }
+  }
+}
+
+void CheckTiling3D(TileResult& result) {
+  const uint32_t pitches[] = {32, 64, 96, 128};
+  const uint32_t heights[] = {32, 64};
+  for (uint32_t log2 = 0; log2 <= 4; ++log2) {
+    for (uint32_t pitch : pitches) {
+      CheckLinearRun3D(pitch, 32, log2, result);
+      for (uint32_t height : heights) {
+        CheckVolume3D(pitch, height, 16, log2, result);
+        if (result.volume_failed != 0) {
+          return;
+        }
+      }
+    }
+  }
 }
 #endif
 
@@ -1560,7 +1743,7 @@ int main(int argc, char** argv) {
 #if defined(SHADER_DB_TRANSLATE)
     const TileResult tiling = CheckTiling();
     tiling_failed = (tiling.address_failed != 0 || tiling.duplicate != 0 ||
-                     tiling.roundtrip_failed != 0 || !tiling.endian_ok)
+                     tiling.roundtrip_failed != 0 || tiling.volume_failed != 0 || !tiling.endian_ok)
                         ? 1
                         : 0;
     std::cout << "tiling\n";
@@ -1571,6 +1754,14 @@ int main(int argc, char** argv) {
     std::cout << "  address_failed " << tiling.address_failed << "\n";
     std::cout << "  duplicate " << tiling.duplicate << "\n";
     std::cout << "  roundtrip_failed " << tiling.roundtrip_failed << "\n";
+    std::cout << "  volume_blocks " << tiling.volume_blocks << "\n";
+    std::cout << "  volume_failed " << tiling.volume_failed << "\n";
+    std::cout << "  below_origin " << tiling.below_origin << "\n";
+    std::cout << "  below_origin_max " << tiling.below_origin_max << "\n";
+    std::cout << "  span_exceeded " << tiling.span_exceeded << "\n";
+    std::cout << "  lower_bound_mismatch " << tiling.lower_bound_mismatch << "\n";
+    std::cout << "  lower_bound_above " << tiling.lower_bound_above << "\n";
+    std::cout << "  texel_lower_above " << tiling.texel_lower_above << "\n";
     std::cout << "  endian_ok " << (tiling.endian_ok ? 1 : 0) << "\n";
     if (!tiling.example.empty()) {
       std::cout << "  example " << tiling.example << "\n";

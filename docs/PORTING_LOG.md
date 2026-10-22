@@ -505,6 +505,19 @@ were repeated. The three skipped formats are the two 1-bit formats, whose
 block size is zero bytes in the table, and `k_32_32_32_FLOAT`, which is 12
 bytes per block and is not tiled. A 64×48 `k_8_8_8_8` image tiled with
 `GetTiledOffset2D` and passed through `Untile` came back unchanged.
-`CopySwapBlock` matched the four 32-bit endian modes. There is no 3D untile
-in this check. This is still not `src/gfx/`.
+`CopySwapBlock` matched the four 32-bit endian modes. There is no 3D
+`Untile`. `GetTiledOffset3D` was checked on 2457600 blocks (1, 2, 4, 8 and
+16 bytes per block, pitches 32/64/96/128, heights 32/64, depth 16). Addresses
+inside each volume are unique. The step for 8 slices along Z and for 32 rows
+along Y is constant, and a tile corner's X offset matches the formula in the
+SDK comment. `GetTiledAddressUpperBound3D` covers every block. 197664 blocks
+are stored below the address of their own 32×32×4 corner, by up to 2176
+bytes, so that corner is not the first byte of the tile. The span measured
+from the corner does not contain 6 tiles; the first is 1 byte per block,
+pitch 96, corner (32, 0, 0), highest address 11263 against a span of 8192.
+`GetTiledAddressLowerBound3D` masks Z with `~kTextureTileDepth` (`~4`) rather
+than `~(kTextureTileDepth - 1)`. On 300 of 600 tile corners, Z = 4 and
+Z = 12, it returns the previous 4 slices. For every block it stayed at or
+below that block's address, and for every tile it stayed at or below the
+lowest address in the tile. This is still not `src/gfx/`.
 
