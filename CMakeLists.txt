@@ -95,3 +95,26 @@ if(EXISTS "${BROKEN_BOND_VULKAN_SDK}/Include/spirv-tools/libspirv.h")
     target_compile_definitions(shader_db PRIVATE
         "SHADER_DB_VULKAN_SDK=\"${BROKEN_BOND_VULKAN_SDK}\"")
 endif()
+
+# Host renderer. Not linked into broken_bond, so the running game stays on Xenos.
+if(EXISTS "${BROKEN_BOND_VULKAN_SDK}/Lib/vulkan-1.lib" AND
+   EXISTS "${BROKEN_BOND_REXGLUE_SOURCE}/src/graphics/pipeline/texture/conversion.cpp")
+    add_library(broken_bond_gfx STATIC
+        src/gfx/device.cpp
+        src/gfx/texture.cpp
+        "${BROKEN_BOND_REXGLUE_SOURCE}/src/graphics/pipeline/texture/conversion.cpp"
+        "${BROKEN_BOND_REXGLUE_SOURCE}/src/graphics/pipeline/texture/info_formats.cpp"
+        "${BROKEN_BOND_REXGLUE_SOURCE}/src/graphics/pipeline/texture/util.cpp")
+    target_include_directories(broken_bond_gfx
+        PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src"
+        PRIVATE
+            "${BROKEN_BOND_REXGLUE_SOURCE}/include"
+            "${BROKEN_BOND_VULKAN_SDK}/Include")
+    target_link_libraries(broken_bond_gfx PUBLIC
+        rex::runtime
+        "${BROKEN_BOND_VULKAN_SDK}/Lib/vulkan-1.lib")
+    target_compile_options(broken_bond_gfx PRIVATE -Wno-unused-variable -Wno-unused-function)
+
+    add_executable(host_gfx tools/host_gfx.cpp)
+    target_link_libraries(host_gfx PRIVATE broken_bond_gfx)
+endif()

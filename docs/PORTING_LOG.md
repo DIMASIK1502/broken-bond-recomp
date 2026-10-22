@@ -515,6 +515,19 @@ are stored below the address of their own 32×32×4 corner, by up to 2176
 bytes, so that corner is not the first byte of the tile. The span measured
 from the corner does not contain 6 tiles; the first is 1 byte per block,
 pitch 96, corner (32, 0, 0), highest address 11263 against a span of 8192.
+The host renderer starts in `src/gfx/` as the static library `broken_bond_gfx`.
+It is not linked into `broken_bond`, so the game still presents through Xenos.
+`host_gfx` opens a Vulkan device with scalar block layout, standard uniform
+layout, and dynamic rendering when the GPU has them. On this machine that
+device is the NVIDIA GeForce RTX 4070, API 1.4.341. The driver accepted one
+SPIR-V 1.5 vertex module. A 64×48 `k_8_8_8_8` image tiled with
+`GetTiledOffset2D` and untilled by the SDK came back unchanged, and the same
+linear bytes copied into a `R8G8B8A8_UNORM` image were read back unchanged.
+The same image was then drawn to an offscreen target. The vertex stage writes
+one interpolator at location 0, the fragment stage reads it and fetches the
+texel, and the rendered bytes matched the source. Guest shaders, fetch
+constants, and EDRAM are not in this path.
+
 `GetTiledAddressLowerBound3D` masks Z with `~kTextureTileDepth` (`~4`) rather
 than `~(kTextureTileDepth - 1)`. On 300 of 600 tile corners, Z = 4 and
 Z = 12, it returns the previous 4 slices. For every block it stayed at or
