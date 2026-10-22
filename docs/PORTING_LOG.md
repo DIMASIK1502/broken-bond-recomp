@@ -427,10 +427,11 @@ Each inflated object is big-endian. The first dword is `0x102A1101` for every
 offset and size of the second section, and those two sections add up to the
 object. Dword 6 is the offset of a descriptor `{u32 offset, u32 bytes}` whose
 offset is relative to that second section. On this dump that microcode is
-4339980 bytes, every size a multiple of 12. The first three dwords unpack as
-two Xenos control-flow instructions, and the first exec address is a slot
-index inside that microcode. `shader_db` checks this and still does not
-translate it.
+4339980 bytes, every size a multiple of 12. Two control-flow instructions
+are packed in each three dwords. The first exec address is the control-flow
+length, and `shader_db` checks every slot up to that length: all 8156 shaders
+pass. The SPIR-V translator is compiled into `rexgpu-xenos` and is not
+exported, so this tool does not call it and does not write a cache.
 
 Xenos tiling for a later host path is `Untile` in
 `rex/graphics/pipeline/texture/conversion.h`, with the tile sizes in

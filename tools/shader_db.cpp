@@ -20,8 +20,8 @@
 
 #include <cstdint>
 #include <fstream>
-#include <iterator>
 #include <iostream>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -320,9 +320,15 @@ struct ShaderRecord {
   uint32_t tag = 0;
 };
 
-// First control-flow triple must contain an exec whose address is a slot
-// index inside this microcode. Slot 0 is the triple itself.
-uint32_t CheckUcode(const uint8_t* object, size_t size, uint32_t token) {
+struct UcodeSpan {
+  const uint32_t* dwords = nullptr;
+  uint32_t dword_count = 0;
+};
+
+// Every control-flow slot up to the first exec address must point inside this
+// microcode. That address is the control-flow length the SDK uses. The dwords
+// are still big-endian in the file.
+UcodeSpan LocateUcode(const uint8_t* object, size_t size, uint32_t token) {
   if (size < 28 || size % 4 != 0) {
     Fail("shader object is truncated");
   }
@@ -345,9 +351,9 @@ uint32_t CheckUcode(const uint8_t* object, size_t size, uint32_t token) {
   if (ucode_bytes < 12 || ucode_bytes % 12 != 0 || ucode_at + ucode_bytes > size) {
     Fail("shader microcode is outside the object");
   }
-  const uint32_t dword_0 = ReadBe32(object + ucode_at);
-  const uint32_t dword_1 = ReadBe32(object + ucode_at + 4);
-  const uint32_t dword_2 = ReadBe32(object + ucode_at + 8);
+  if (ucode_at % 4 != 0) {
+    Fail("shader microcode is not dword aligned");
+  }
   const uint32_t slots = ucode_bytes / 12;
   auto ExecAddress = [slots](uint32_t word0, uint32_t word1) -> uint32_t {
     const uint32_t opcode = (word1 >> 12) & 0xF;
@@ -362,12 +368,33 @@ uint32_t CheckUcode(const uint8_t* object, size_t size, uint32_t token) {
     }
     return address;
   };
-  const uint32_t first = ExecAddress(dword_0, dword_1 & 0xFFFF);
-  const uint32_t second = ExecAddress((dword_1 >> 16) | (dword_2 << 16), dword_2 >> 16);
-  if (first == 0 && second == 0) {
+  // Same bound the SDK uses: the first exec address is the control-flow length.
+  uint32_t bound = slots;
+  bool saw_exec = false;
+  for (uint32_t slot = 0; slot < bound; ++slot) {
+    const uint32_t at = ucode_at + slot * 12;
+    const uint32_t dword_0 = ReadBe32(object + at);
+    const uint32_t dword_1 = ReadBe32(object + at + 4);
+    const uint32_t dword_2 = ReadBe32(object + at + 8);
+    const uint32_t first = ExecAddress(dword_0, dword_1 & 0xFFFF);
+    const uint32_t second = ExecAddress((dword_1 >> 16) | (dword_2 << 16), dword_2 >> 16);
+    if (first != 0) {
+      if (first < bound) {
+        bound = first;
+      }
+      saw_exec = true;
+    }
+    if (second != 0) {
+      if (second < bound) {
+        bound = second;
+      }
+      saw_exec = true;
+    }
+  }
+  if (!saw_exec || bound == 0) {
     Fail("shader microcode does not start with control flow");
   }
-  return ucode_bytes;
+  return {reinterpret_cast<const uint32_t*>(object + ucode_at), ucode_bytes / 4};
 }
 
 std::string ReadName(const uint8_t* bytes) {
@@ -392,9 +419,10 @@ int main(int argc, char** argv) {
       std::cerr << "usage: shader_db <xeshader.sdb>\n";
       return 2;
     }
-    std::ifstream in(argv[1], std::ios::binary);
+    const char* path = argv[1];
+    std::ifstream in(path, std::ios::binary);
     if (!in) {
-      Fail(std::string("cannot open ") + argv[1]);
+      Fail(std::string("cannot open ") + path);
     }
     std::vector<uint8_t> file(std::istreambuf_iterator<char>(in), {});
     if (file.size() < 24 || ReadBe32(file.data()) != 0x33424453u) {
@@ -469,7 +497,8 @@ int main(int argc, char** argv) {
         Fail("shader object is shorter than its version token");
       }
       const uint32_t token = ReadBe32(object.data() + 48);
-      ucode_bytes += CheckUcode(object.data(), object.size(), token);
+      const UcodeSpan ucode = LocateUcode(object.data(), object.size(), token);
+      ucode_bytes += uint64_t(ucode.dword_count) * 4;
       if (token == 0xFFFE0300u) {
         ++vertex;
       } else if (token == 0xFFFF0300u) {
