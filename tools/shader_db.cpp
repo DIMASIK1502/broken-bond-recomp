@@ -1116,11 +1116,22 @@ int main(int argc, char** argv) {
     uint32_t tag_count[3] = {};
     ConstantStats constants;
 #if defined(SHADER_DB_TRANSLATE)
-    rex::graphics::SpirvShaderTranslator::Features features(true);
-    rex::graphics::SpirvShaderTranslator translator(features, false, false, false);
-    TranslateStats translated;
     HostProbe probe;
     probe.Open();
+    rex::graphics::SpirvShaderTranslator::Features features(false);
+    if (probe.create_module != nullptr && probe.api >= VK_API_VERSION_1_2) {
+      features.spirv_version = spv::Spv_1_5;
+      features.max_storage_buffer_range = probe.storage_range;
+      features.signed_zero_inf_nan_preserve_float32 = probe.preserve;
+      features.denorm_flush_to_zero_float32 = probe.flush;
+      features.rounding_mode_rte_float32 = probe.rte;
+      features.demote_to_helper_invocation = probe.demote;
+      features.sample_rate_shading = probe.sample_rate;
+    } else {
+      features = rex::graphics::SpirvShaderTranslator::Features(true);
+    }
+    rex::graphics::SpirvShaderTranslator translator(features, false, false, false);
+    TranslateStats translated;
 #endif
     for (const ShaderRecord& shader : shaders) {
       const std::vector<uint8_t> object =
@@ -1167,6 +1178,11 @@ int main(int argc, char** argv) {
     std::cout << "  names " << constants.names.size() << "\n";
 #if defined(SHADER_DB_TRANSLATE)
     std::cout << "spirv " << (translated.ok + translated.failed) << "\n";
+    std::cout << "  host preserve " << (features.signed_zero_inf_nan_preserve_float32 ? 1 : 0)
+              << " flush " << (features.denorm_flush_to_zero_float32 ? 1 : 0) << " rte "
+              << (features.rounding_mode_rte_float32 ? 1 : 0) << " sample_rate "
+              << (features.sample_rate_shading ? 1 : 0) << " demote "
+              << (features.demote_to_helper_invocation ? 1 : 0) << "\n";
     std::cout << "  ok " << translated.ok << "\n";
     std::cout << "  failed " << translated.failed << "\n";
     std::cout << "  bytes " << translated.spirv_bytes << "\n";

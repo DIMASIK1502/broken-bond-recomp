@@ -73,20 +73,20 @@ Rise лежит только в `.references/naruto-rise-recomp` (GPL-3.0). От
   D3DX на смещении `0x28`: 70214 привязки (61033 float4, 9181 sampler),
   127 имён. Установленный `rexgpu-xenos` собран с `REXGLUE_USE_VULKAN=OFF`,
   поэтому утилита компилирует переводчик SPIR-V из соседнего дерева SDK и
-  гоняет его в памяти: 8156 из 8156 дают модуль SPIR-V 1.5 (302683608 байт),
+  гоняет его в памяти под возможности этой GPU: 8156 из 8156 дают модуль
+  SPIR-V 1.5 (319527540 байт),
   у каждого одна точка входа своей стадии. Set 0 binding 0 — shared memory
   у всех, EDRAM-буфера нет. Set 1: system, bool/loop и fetch у всех,
   float-константы у 8138 (максимум 256). Текстуры у 271 вершинного шейдера
   (ровно 2 image + 1 sampler, set 2) и у 3444 пиксельных (set 3, до 16 image
-  и 8 sampler).   Depth пишут 3, memexport eM — ни один. Файл кэша не пишется.
+  и 8 sampler). Depth пишут 3, memexport eM — ни один. Файл кэша не пишется.
   Проба этой машины: NVIDIA GeForce RTX 4070, Vulkan 1.4.341, драйвер
-  NVIDIA. `maxStorageBufferRange` — 4 ГБ. Float32 preserve и RTE есть,
-  denorm flush-to-zero нет; sample rate, demote, scalar block layout и
-  standard layout есть. Драйвер принял все 8156 `vkCreateShaderModule`.
-  `spirv-val` для Vulkan 1.2 без scalar block layout отвергает
-  `user_clip_planes` на смещении 28; с этой опцией, как у Vulkan-устройства
-  SDK, проходят все 8156. Это ещё не путь `src/gfx/`. Артефакт кэша не
-  коммитить (как `generated/`).
+  NVIDIA. `maxStorageBufferRange` — 4 ГБ. Перевод включает preserve и RTE,
+  sample rate и demote; denorm flush-to-zero выключен, этой возможности
+  нет. Scalar block layout и standard layout есть. Драйвер принял все
+  8156 `vkCreateShaderModule`. `spirv-val` для Vulkan 1.2 с scalar block
+  layout, как у Vulkan-устройства SDK, пропустил все 8156. Это ещё не путь
+  `src/gfx/`. Артефакт кэша не коммитить (как `generated/`).
 
 ### F4. Кадры между тиками
 

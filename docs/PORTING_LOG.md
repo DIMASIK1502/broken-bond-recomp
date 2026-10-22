@@ -448,7 +448,7 @@ with all translator feature bits enabled, 2x MSAA off, and EDRAM interlock
 off. The default modification asks for no dynamically addressable registers;
 this dump has none. All 8156 modules are SPIR-V 1.5, each instruction stays
 inside the module, and each has one entry point of its own stage. None
-reported a fatal error. The in-memory total is 302683608 bytes.
+reported a fatal error. The device-matched in-memory total is 319527540 bytes.
 
 Descriptor sets on that translation, counted from `OpDecorate`: set 0
 binding 0 is shared memory on every shader, and the EDRAM buffer is absent.
@@ -460,24 +460,26 @@ is used by 3444 pixel shaders, up to 16 images and 8 samplers. Three shaders
 write depth. No shader writes a memexport element. `DerivativeControl` is on
 the 3444 pixel shaders that sample, and `DemoteToHelperInvocationEXT` plus
 `SPV_EXT_demote_to_helper_invocation` is on the 36 shaders that kill pixels.
-`DenormFlushToZero`, `SignedZeroInfNanPreserve`, `RoundingModeRTE`, and
-`SampleRateShading` (every pixel shader) are present because those feature
-bits were enabled for the run. The tool writes no cache.
+The translation follows the probed device. `SignedZeroInfNanPreserve` and
+`RoundingModeRTE` are on every module, and `SampleRateShading` is on every
+pixel shader. `DenormFlushToZero` is absent: this GPU does not support it.
+The in-memory total for that feature set is 319527540 bytes. The tool
+writes no cache.
 
 On this machine `shader_db` also loads `SPIRV-Tools-shared.dll` from
 `H:\Tools\VulkanSDK` and `vulkan-1.dll`. The device is an NVIDIA GeForce
 RTX 4070, API 1.4.341, driver name NVIDIA. `maxStorageBufferRange` is
 4294967295, so one shared-memory binding covers the guest address space.
 Float32 signed-zero/inf/nan preserve and round-to-nearest-even are
-supported. Float32 denorm flush-to-zero is not, while the all-features
-translation still emits that execution mode. Sample-rate shading,
-demote-to-helper, `scalarBlockLayout`, and `uniformBufferStandardLayout`
-are supported. `vkCreateShaderModule` accepted all 8156 modules and each
-module was destroyed immediately. `spirv-val` for Vulkan 1.2, without
-scalar block layout, rejected every module because `XeSystemConstants`
-member 7, `user_clip_planes`, is at offset 28. The SDK Vulkan device
-enables `scalarBlockLayout` for GPU emulation, and with that validator
-option all 8156 modules pass. The running renderer is still Xenos.
+supported. Float32 denorm flush-to-zero is not, and the translation leaves
+that execution mode off. Sample-rate shading, demote-to-helper,
+`scalarBlockLayout`, and `uniformBufferStandardLayout` are supported.
+`vkCreateShaderModule` accepted all 8156 modules and each module was
+destroyed immediately. `spirv-val` for Vulkan 1.2 with scalar block layout,
+which the SDK Vulkan device enables for GPU emulation, passed all 8156.
+Without that option the same modules fail because `XeSystemConstants`
+member 7, `user_clip_planes`, is at offset 28. The running renderer is
+still Xenos.
 
 Xenos tiling for a later host path is `Untile` in
 `rex/graphics/pipeline/texture/conversion.h`, with the tile sizes in
