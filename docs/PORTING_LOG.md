@@ -430,8 +430,20 @@ offset is relative to that second section. On this dump that microcode is
 4339980 bytes, every size a multiple of 12. Two control-flow instructions
 are packed in each three dwords. The first exec address is the control-flow
 length, and `shader_db` checks every slot up to that length: all 8156 shaders
-pass. The SPIR-V translator is compiled into `rexgpu-xenos` and is not
-exported, so this tool does not call it and does not write a cache.
+pass.
+
+Offset `0x28` of every object is a big-endian `D3DXSHADER_CONSTANTTABLE`
+(header size `0x1C`, version equal to the token at offset 48, target string
+`vs_3_0` or `ps_3_0`). Each constant is 20 bytes: a name offset from the
+table, a register set, and a register count. This dump has 70214 constants,
+61033 float4 (set 2) and 9181 samplers (set 3), and 127 distinct names. No
+bool or int constants. `shader_db` checks the table and writes nothing.
+
+The installed SDK build has `REXGLUE_USE_VULKAN=OFF` and `REXGLUE_USE_D3D12=ON`.
+`rexgpu-xenosrd.dll` contains the DXBC translator (`xe_vertex_index_endian`)
+and `AnalyzeUcode`, and does not contain the SPIR-V translator
+(`SPV_KHR_float_controls` is absent). The tool does not call either
+translator and does not write a cache.
 
 Xenos tiling for a later host path is `Untile` in
 `rex/graphics/pipeline/texture/conversion.h`, with the tile sizes in

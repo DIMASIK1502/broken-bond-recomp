@@ -17,11 +17,14 @@
 //   ucode offset is relative to code_section. Dword at object offset 48 is
 //   the D3D9 version: 0xFFFE0300 vs_3_0, 0xFFFF0300 ps_3_0. The microcode is
 //   Xenos control flow packed as two instructions per three dwords.
+//   At offset 0x28 there is a big-endian D3DX constant table: float4 and sampler
+//   records, 20 bytes each, names relative to that table.
 
 #include <cstdint>
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -397,6 +400,68 @@ UcodeSpan LocateUcode(const uint8_t* object, size_t size, uint32_t token) {
   return {reinterpret_cast<const uint32_t*>(object + ucode_at), ucode_bytes / 4};
 }
 
+struct ConstantStats {
+  uint32_t float4 = 0;
+  uint32_t sampler = 0;
+  std::set<std::string> names;
+};
+
+// Big-endian D3DXSHADER_CONSTANTTABLE at object offset 0x28.
+void ReadConstants(const uint8_t* object, size_t size, uint32_t token, ConstantStats& stats) {
+  constexpr uint32_t kTable = 0x28;
+  if (size < kTable + 28) {
+    Fail("shader constant table is missing");
+  }
+  const uint32_t table_size = ReadBe32(object + kTable);
+  const uint32_t version = ReadBe32(object + kTable + 8);
+  const uint32_t count = ReadBe32(object + kTable + 12);
+  const uint32_t info = ReadBe32(object + kTable + 16);
+  const uint32_t flags = ReadBe32(object + kTable + 20);
+  const uint32_t target = ReadBe32(object + kTable + 24);
+  if (table_size != 0x1C || version != token || flags != 0 || (count != 0 && info != 0x1C)) {
+    Fail("shader constant table header does not match");
+  }
+  if (kTable + target + 6 > size) {
+    Fail("shader target name is outside the object");
+  }
+  const char* expected = token == 0xFFFE0300u ? "vs_3_0" : "ps_3_0";
+  for (int i = 0; i < 6; ++i) {
+    if (object[kTable + target + i] != static_cast<uint8_t>(expected[i])) {
+      Fail("shader target name does not match the version");
+    }
+  }
+  for (uint32_t i = 0; i < count; ++i) {
+    const uint32_t at = kTable + info + i * 20;
+    if (at + 20 > size) {
+      Fail("shader constant record is outside the object");
+    }
+    const uint32_t name_off = ReadBe32(object + at);
+    const uint32_t reg = ReadBe32(object + at + 4);
+    const uint32_t reg_count = ReadBe32(object + at + 8);
+    const uint32_t set = reg >> 16;
+    if ((set != 2 && set != 3) || (reg_count & 0xFFFF) != 0 || kTable + name_off >= size) {
+      Fail("shader constant record is not a float4 or sampler");
+    }
+    const uint8_t* name_bytes = object + kTable + name_off;
+    size_t length = 0;
+    while (kTable + name_off + length < size && name_bytes[length] != 0) {
+      if (name_bytes[length] < 32 || name_bytes[length] > 126) {
+        Fail("shader constant name is not ascii");
+      }
+      ++length;
+    }
+    if (length == 0) {
+      Fail("shader constant name is empty");
+    }
+    stats.names.emplace(reinterpret_cast<const char*>(name_bytes), length);
+    if (set == 2) {
+      ++stats.float4;
+    } else {
+      ++stats.sampler;
+    }
+  }
+}
+
 std::string ReadName(const uint8_t* bytes) {
   size_t length = 0;
   while (length < 64 && bytes[length] != 0) {
@@ -489,6 +554,7 @@ int main(int argc, char** argv) {
     uint64_t raw_bytes = 0;
     uint64_t ucode_bytes = 0;
     uint32_t tag_count[3] = {};
+    ConstantStats constants;
     for (const ShaderRecord& shader : shaders) {
       const std::vector<uint8_t> object =
           InflateZlib(file.data() + shader.offset, shader.compressed_size, shader.raw_size);
@@ -499,6 +565,7 @@ int main(int argc, char** argv) {
       const uint32_t token = ReadBe32(object.data() + 48);
       const UcodeSpan ucode = LocateUcode(object.data(), object.size(), token);
       ucode_bytes += uint64_t(ucode.dword_count) * 4;
+      ReadConstants(object.data(), object.size(), token, constants);
       if (token == 0xFFFE0300u) {
         ++vertex;
       } else if (token == 0xFFFF0300u) {
@@ -524,6 +591,10 @@ int main(int argc, char** argv) {
               << "\n";
     std::cout << "inflated " << raw_bytes << "\n";
     std::cout << "ucode " << ucode_bytes << "\n";
+    std::cout << "constants " << (constants.float4 + constants.sampler) << "\n";
+    std::cout << "  float4 " << constants.float4 << "\n";
+    std::cout << "  sampler " << constants.sampler << "\n";
+    std::cout << "  names " << constants.names.size() << "\n";
     return 0;
   } catch (const std::exception& error) {
     std::cerr << error.what() << "\n";
