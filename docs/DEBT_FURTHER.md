@@ -81,10 +81,11 @@ Rise лежит только в `.references/naruto-rise-recomp` (GPL-3.0). От
   и 8 sampler).   Depth пишут 3, memexport eM — ни один. Файл кэша не пишется.
   Проба этой машины: NVIDIA GeForce RTX 4070, Vulkan 1.4.341, драйвер
   NVIDIA. `maxStorageBufferRange` — 4 ГБ. Float32 preserve и RTE есть,
-  denorm flush-to-zero нет; sample rate и demote есть. Драйвер принял все
-  8156 `vkCreateShaderModule`. `spirv-val` для Vulkan 1.2 отверг все 8156
-  одной ошибкой: `user_clip_planes` в `XeSystemConstants` лежит на смещении
-  28 и не выровнен на 16. Это ещё не путь `src/gfx/`. Артефакт кэша не
+  denorm flush-to-zero нет; sample rate, demote, scalar block layout и
+  standard layout есть. Драйвер принял все 8156 `vkCreateShaderModule`.
+  `spirv-val` для Vulkan 1.2 без scalar block layout отвергает
+  `user_clip_planes` на смещении 28; с этой опцией, как у Vulkan-устройства
+  SDK, проходят все 8156. Это ещё не путь `src/gfx/`. Артефакт кэша не
   коммитить (как `generated/`).
 
 ### F4. Кадры между тиками

@@ -470,12 +470,14 @@ RTX 4070, API 1.4.341, driver name NVIDIA. `maxStorageBufferRange` is
 4294967295, so one shared-memory binding covers the guest address space.
 Float32 signed-zero/inf/nan preserve and round-to-nearest-even are
 supported. Float32 denorm flush-to-zero is not, while the all-features
-translation still emits that execution mode. Sample-rate shading and
-demote-to-helper are supported. `vkCreateShaderModule` accepted all 8156
-modules and each module was destroyed immediately. `spirv-val` for Vulkan
-1.2 rejected all 8156 with one message: the uniform `XeSystemConstants`
-block has member 7, `user_clip_planes`, at offset 28, which is not aligned
-to 16. The running renderer is still Xenos.
+translation still emits that execution mode. Sample-rate shading,
+demote-to-helper, `scalarBlockLayout`, and `uniformBufferStandardLayout`
+are supported. `vkCreateShaderModule` accepted all 8156 modules and each
+module was destroyed immediately. `spirv-val` for Vulkan 1.2, without
+scalar block layout, rejected every module because `XeSystemConstants`
+member 7, `user_clip_planes`, is at offset 28. The SDK Vulkan device
+enables `scalarBlockLayout` for GPU emulation, and with that validator
+option all 8156 modules pass. The running renderer is still Xenos.
 
 Xenos tiling for a later host path is `Untile` in
 `rex/graphics/pipeline/texture/conversion.h`, with the tile sizes in

@@ -526,12 +526,17 @@ struct HostProbe {
   spv_context context = nullptr;
   using ContextCreate = spv_context (*)(spv_target_env);
   using ContextDestroy = void (*)(spv_context);
-  using ValidateBinary = spv_result_t (*)(const spv_const_context, const uint32_t*, size_t,
-                                         spv_diagnostic*);
+  using OptionsCreate = spv_validator_options (*)();
+  using OptionsDestroy = void (*)(spv_validator_options);
+  using SetScalarBlockLayout = void (*)(spv_validator_options, bool);
+  using ValidateWithOptions = spv_result_t (*)(const spv_const_context, const spv_const_validator_options,
+                                              const spv_const_binary, spv_diagnostic*);
   using DiagnosticDestroy = void (*)(spv_diagnostic);
   ContextDestroy destroy_context = nullptr;
-  ValidateBinary validate = nullptr;
+  OptionsDestroy destroy_options = nullptr;
+  ValidateWithOptions validate = nullptr;
   DiagnosticDestroy destroy_diagnostic = nullptr;
+  spv_validator_options options = nullptr;
 #endif
   std::string device_name;
   std::string driver_name;
@@ -544,6 +549,8 @@ struct HostProbe {
   bool rte = false;
   bool sample_rate = false;
   bool demote = false;
+  bool scalar_block = false;
+  bool standard_layout = false;
   uint32_t val_ok = 0;
   uint32_t val_failed = 0;
   uint32_t module_ok = 0;
@@ -563,6 +570,9 @@ struct HostProbe {
       destroy_instance(instance, nullptr);
     }
 #if defined(SHADER_DB_VULKAN_SDK)
+    if (destroy_options != nullptr && options != nullptr) {
+      destroy_options(options);
+    }
     if (destroy_context != nullptr && context != nullptr) {
       destroy_context(context);
     }
@@ -588,16 +598,24 @@ void HostProbe::Open() {
   } else {
     auto create_context = reinterpret_cast<ContextCreate>(GetProcAddress(tools, "spvContextCreate"));
     destroy_context = reinterpret_cast<ContextDestroy>(GetProcAddress(tools, "spvContextDestroy"));
-    validate = reinterpret_cast<ValidateBinary>(GetProcAddress(tools, "spvValidateBinary"));
+    auto create_options = reinterpret_cast<OptionsCreate>(GetProcAddress(tools, "spvValidatorOptionsCreate"));
+    destroy_options = reinterpret_cast<OptionsDestroy>(GetProcAddress(tools, "spvValidatorOptionsDestroy"));
+    auto set_scalar = reinterpret_cast<SetScalarBlockLayout>(
+        GetProcAddress(tools, "spvValidatorOptionsSetScalarBlockLayout"));
+    validate = reinterpret_cast<ValidateWithOptions>(GetProcAddress(tools, "spvValidateWithOptions"));
     destroy_diagnostic =
         reinterpret_cast<DiagnosticDestroy>(GetProcAddress(tools, "spvDiagnosticDestroy"));
-    if (create_context == nullptr || destroy_context == nullptr || validate == nullptr ||
+    if (create_context == nullptr || destroy_context == nullptr || create_options == nullptr ||
+        destroy_options == nullptr || set_scalar == nullptr || validate == nullptr ||
         destroy_diagnostic == nullptr) {
       validator_reason = "SPIRV-Tools exports are missing";
     } else {
       context = create_context(SPV_ENV_VULKAN_1_2);
-      if (context == nullptr) {
+      options = create_options();
+      if (context == nullptr || options == nullptr) {
         validator_reason = "spvContextCreate failed";
+      } else {
+        set_scalar(options, true);
       }
     }
   }
@@ -710,16 +728,25 @@ void HostProbe::Open() {
     driver_name = properties12.driverName;
   }
 
+  VkPhysicalDeviceVulkan12Features features12{};
+  features12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
   VkPhysicalDeviceVulkan13Features features13{};
   features13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
   VkPhysicalDeviceFeatures2 features{};
   features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-  if (api >= VK_API_VERSION_1_3) {
-    features.pNext = &features13;
+  if (api >= VK_API_VERSION_1_2) {
+    features.pNext = &features12;
+    if (api >= VK_API_VERSION_1_3) {
+      features12.pNext = &features13;
+    }
   }
   get_features(physical, &features);
   sample_rate = features.features.sampleRateShading == VK_TRUE;
   demote = api >= VK_API_VERSION_1_3 && features13.shaderDemoteToHelperInvocation == VK_TRUE;
+  if (api >= VK_API_VERSION_1_2) {
+    scalar_block = features12.scalarBlockLayout == VK_TRUE;
+    standard_layout = features12.uniformBufferStandardLayout == VK_TRUE;
+  }
 
   uint32_t family_count = 0;
   get_queues(physical, &family_count, nullptr);
@@ -775,9 +802,10 @@ void HostProbe::Check(const std::vector<uint8_t>& binary) {
   const auto* words = reinterpret_cast<const uint32_t*>(binary.data());
   const size_t word_count = binary.size() / 4;
 #if defined(SHADER_DB_VULKAN_SDK)
-  if (context != nullptr && validate != nullptr) {
+  if (context != nullptr && options != nullptr && validate != nullptr) {
+    spv_const_binary_t view{words, word_count};
     spv_diagnostic diagnostic = nullptr;
-    const spv_result_t result = validate(context, words, word_count, &diagnostic);
+    const spv_result_t result = validate(context, options, &view, &diagnostic);
     if (result == SPV_SUCCESS) {
       ++val_ok;
     } else {
@@ -1177,7 +1205,7 @@ int main(int argc, char** argv) {
     if (probe.context == nullptr) {
       std::cout << "validator closed " << probe.validator_reason << "\n";
     } else {
-      std::cout << "validator vulkan-1.2\n";
+      std::cout << "validator vulkan-1.2 scalar-block\n";
       std::cout << "  ok " << probe.val_ok << "\n";
       std::cout << "  failed " << probe.val_failed << "\n";
       std::vector<std::pair<uint32_t, std::string>> validation;
@@ -1209,6 +1237,8 @@ int main(int argc, char** argv) {
       std::cout << "  float32_rte " << (probe.rte ? 1 : 0) << "\n";
       std::cout << "  sample_rate " << (probe.sample_rate ? 1 : 0) << "\n";
       std::cout << "  demote " << (probe.demote ? 1 : 0) << "\n";
+      std::cout << "  scalar_block " << (probe.scalar_block ? 1 : 0) << "\n";
+      std::cout << "  standard_layout " << (probe.standard_layout ? 1 : 0) << "\n";
       std::cout << "  modules " << (probe.module_ok + probe.module_failed) << "\n";
       std::cout << "  ok " << probe.module_ok << "\n";
       std::cout << "  failed " << probe.module_failed << "\n";
