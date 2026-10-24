@@ -65,10 +65,7 @@ if(EXISTS "${BROKEN_BOND_REXGLUE_SOURCE}/src/graphics/pipeline/shader/spirv_tran
         "${BROKEN_BOND_REXGLUE_SOURCE}/src/graphics/pipeline/shader/spirv_translator_alu.cpp"
         "${BROKEN_BOND_REXGLUE_SOURCE}/src/graphics/pipeline/shader/spirv_translator_fetch.cpp"
         "${BROKEN_BOND_REXGLUE_SOURCE}/src/graphics/pipeline/shader/spirv_translator_memexport.cpp"
-        "${BROKEN_BOND_REXGLUE_SOURCE}/src/graphics/pipeline/shader/spirv_translator_rb.cpp"
-        "${BROKEN_BOND_REXGLUE_SOURCE}/src/graphics/pipeline/texture/conversion.cpp"
-        "${BROKEN_BOND_REXGLUE_SOURCE}/src/graphics/pipeline/texture/info_formats.cpp"
-        "${BROKEN_BOND_REXGLUE_SOURCE}/src/graphics/pipeline/texture/util.cpp")
+        "${BROKEN_BOND_REXGLUE_SOURCE}/src/graphics/pipeline/shader/spirv_translator_rb.cpp")
     target_compile_definitions(shader_db PRIVATE SHADER_DB_TRANSLATE)
     target_include_directories(shader_db BEFORE PRIVATE
         "${BROKEN_BOND_REXGLUE_SOURCE}/include"
@@ -117,4 +114,14 @@ if(EXISTS "${BROKEN_BOND_VULKAN_SDK}/Lib/vulkan-1.lib" AND
 
     add_executable(host_gfx tools/host_gfx.cpp)
     target_link_libraries(host_gfx PRIVATE broken_bond_gfx)
+endif()
+
+if(TARGET broken_bond_gfx AND TARGET shader_db)
+    target_link_libraries(shader_db PRIVATE broken_bond_gfx)
+    target_compile_definitions(shader_db PRIVATE BROKEN_BOND_HOST_GFX)
+elseif(TARGET shader_db)
+    target_sources(shader_db PRIVATE
+        "${BROKEN_BOND_REXGLUE_SOURCE}/src/graphics/pipeline/texture/conversion.cpp"
+        "${BROKEN_BOND_REXGLUE_SOURCE}/src/graphics/pipeline/texture/info_formats.cpp"
+        "${BROKEN_BOND_REXGLUE_SOURCE}/src/graphics/pipeline/texture/util.cpp")
 endif()

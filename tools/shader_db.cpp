@@ -47,6 +47,9 @@
 #if defined(SHADER_DB_VULKAN_SDK)
 #include <spirv-tools/libspirv.h>
 #endif
+#if defined(BROKEN_BOND_HOST_GFX)
+#include "gfx/device.h"
+#endif
 
 REXCVAR_DEFINE_STRING(dump_shaders, "", "GPU", "Unused here. AnalyzeUcode reads it.");
 
@@ -515,6 +518,14 @@ struct TranslateStats {
   std::map<std::string, uint32_t> extensions;
   std::map<uint64_t, uint32_t> descriptors;
   std::map<std::string, uint32_t> fatals;
+  struct GuestDraw {
+    std::vector<uint32_t> words;
+    uint32_t images = 0;
+    uint32_t samplers = 0;
+  };
+  std::vector<GuestDraw> guest_alu;
+  std::vector<GuestDraw> guest_textured;
+  uint32_t guest_textured_seen = 0;
 };
 
 struct HostProbe {
@@ -1369,6 +1380,33 @@ void TranslateShader(rex::graphics::SpirvShaderTranslator& translator, uint32_t 
       stage.color_mask = shader.writes_color_targets();
       stage.depth = shader.writes_depth();
       probe.Check(binary, stage);
+      const bool guest_color = !stage.vertex && stage.color_mask == 1u && !stage.depth &&
+                               !shader.kills_pixels() && binary.size() % 4 == 0;
+      if (guest_color && stage.images == 0 && stage.samplers == 0 && stats.guest_alu.size() < 8) {
+        TranslateStats::GuestDraw draw;
+        draw.words.assign(reinterpret_cast<const uint32_t*>(binary.data()),
+                          reinterpret_cast<const uint32_t*>(binary.data() + binary.size()));
+        stats.guest_alu.push_back(std::move(draw));
+      }
+      bool only_2d = stage.images != 0;
+      for (const rex::graphics::SpirvShader::TextureBinding& binding :
+           shader.GetTextureBindingsAfterTranslation()) {
+        if (binding.dimension != rex::graphics::xenos::FetchOpDimension::k2D) {
+          only_2d = false;
+        }
+      }
+      if (guest_color && only_2d && stage.images <= 8 && stage.samplers >= 1 &&
+          stage.samplers <= 4) {
+        ++stats.guest_textured_seen;
+        if (stats.guest_textured.size() < 32) {
+          TranslateStats::GuestDraw draw;
+          draw.images = stage.images;
+          draw.samplers = stage.samplers;
+          draw.words.assign(reinterpret_cast<const uint32_t*>(binary.data()),
+                            reinterpret_cast<const uint32_t*>(binary.data() + binary.size()));
+          stats.guest_textured.push_back(std::move(draw));
+        }
+      }
       ++stats.ok;
       stats.spirv_bytes += binary.size();
       return;
@@ -1740,6 +1778,7 @@ void CheckTiling3D(TileResult& result) {
 int main(int argc, char** argv) {
   try {
     int tiling_failed = 0;
+    int guest_draw_failed = 0;
 #if defined(SHADER_DB_TRANSLATE)
     const TileResult tiling = CheckTiling();
     tiling_failed = (tiling.address_failed != 0 || tiling.duplicate != 0 ||
@@ -2016,8 +2055,70 @@ int main(int argc, char** argv) {
     for (size_t i = 0; i < shown; ++i) {
       std::cout << "  fatal " << ranked[i].first << " " << ranked[i].second << "\n";
     }
+#if defined(BROKEN_BOND_HOST_GFX)
+    std::string guest_reason = "host device did not open";
+    broken_bond::gfx::Device device;
+    const bool guest_open = device.Open(guest_reason);
+    uint32_t guest_draws = 0;
+    constexpr uint32_t kGuestSize = 8;
+    const auto draw_batch = [&](const std::vector<TranslateStats::GuestDraw>& batch,
+                                const char* kind) {
+      for (const TranslateStats::GuestDraw& fragment : batch) {
+        if (!guest_open) {
+          std::cout << kind << " failed " << guest_reason << "\n";
+          continue;
+        }
+        std::vector<uint8_t> drawn;
+        std::vector<uint8_t> other;
+        if (!device.DrawGuestFragment(fragment.words.data(), fragment.words.size(), kGuestSize,
+                                      kGuestSize, fragment.images, fragment.samplers, 0, drawn,
+                                      guest_reason)) {
+          std::cout << kind << " failed images " << fragment.images << " samplers "
+                    << fragment.samplers << " " << guest_reason << "\n";
+          continue;
+        }
+        uint32_t changed = 0;
+        uint32_t texture_diff = 0;
+        const bool second =
+            fragment.images != 0 &&
+            device.DrawGuestFragment(fragment.words.data(), fragment.words.size(), kGuestSize,
+                                     kGuestSize, fragment.images, fragment.samplers, 1, other,
+                                     guest_reason);
+        for (size_t i = 0; i + 3 < drawn.size(); i += 4) {
+          if (drawn[i] != 255 || drawn[i + 1] != 0 || drawn[i + 2] != 255 || drawn[i + 3] != 255) {
+            ++changed;
+          }
+          if (second && i + 3 < other.size() &&
+              (drawn[i] != other[i] || drawn[i + 1] != other[i + 1] || drawn[i + 2] != other[i + 2] ||
+               drawn[i + 3] != other[i + 3])) {
+            ++texture_diff;
+          }
+        }
+        std::cout << kind << " ok images " << fragment.images << " samplers " << fragment.samplers
+                  << " changed " << changed << " texture_diff " << texture_diff;
+        if (drawn.size() >= 4) {
+          std::cout << " first " << int(drawn[0]) << " " << int(drawn[1]) << " " << int(drawn[2])
+                    << " " << int(drawn[3]);
+        }
+        if (second && other.size() >= 4) {
+          std::cout << " second " << int(other[0]) << " " << int(other[1]) << " " << int(other[2])
+                    << " " << int(other[3]);
+        }
+        std::cout << "\n";
+        if (changed != 0) {
+          ++guest_draws;
+        }
+      }
+    };
+    std::cout << "guest_textured_seen " << translated.guest_textured_seen << "\n";
+    draw_batch(translated.guest_alu, "guest_alu");
+    draw_batch(translated.guest_textured, "guest_tex");
+    if (guest_draws == 0) {
+      guest_draw_failed = 1;
+    }
 #endif
-    if (tiling_failed != 0) {
+#endif
+    if (tiling_failed != 0 || guest_draw_failed != 0) {
       return 1;
     }
     return 0;

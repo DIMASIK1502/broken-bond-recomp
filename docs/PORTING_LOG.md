@@ -525,8 +525,18 @@ SPIR-V 1.5 vertex module. A 64×48 `k_8_8_8_8` image tiled with
 linear bytes copied into a `R8G8B8A8_UNORM` image were read back unchanged.
 The same image was then drawn to an offscreen target. The vertex stage writes
 one interpolator at location 0, the fragment stage reads it and fetches the
-texel, and the rendered bytes matched the source. Guest shaders, fetch
-constants, and EDRAM are not in this path.
+texel, and the rendered bytes matched the source. `shader_db` then ran a batch
+of guest pixel shaders from this dump on that device. The 8×8 target starts
+magenta, alpha test is disabled, the color scale is 1, and pixel float
+constants are (1, 0.5, 0.25, 1). Three of eight textureless shaders wrote
+those constants into the color target: two as 255,127,64,255 and one as
+255,255,127,255. Of 2565 pixel shaders whose textures are all 2D, the first
+32 were drawn with their own image and sampler counts. Every image binding
+received one 32×32 RGBA8 texture and every sampler binding was nearest.
+Drawing each of those 32 a second time with a different texture changed all
+64 pixels for 10 shaders, so those shaders sampled the bound image. There
+are still no interpolators, no guest-memory fetches, and no EDRAM in this
+path.
 
 `GetTiledAddressLowerBound3D` masks Z with `~kTextureTileDepth` (`~4`) rather
 than `~(kTextureTileDepth - 1)`. On 300 of 600 tile corners, Z = 4 and
