@@ -135,7 +135,7 @@ struct LiveGuestBytes : broken_bond::host::GuestBytes {
 
 std::atomic<bool> g_draw_dumped{false};
 std::unique_ptr<broken_bond::gfx::Device> g_host;
-int g_host_budget = 10;
+int g_host_budget = 32;
 int g_host_learn = 1;
 std::unordered_set<uint64_t> g_host_seen;
 
@@ -564,7 +564,7 @@ void MaybeDumpDeviceDraw(uint32_t device, uint8_t* base) {
 REX_HOOK_RAW(sub_821B1DD0) {
   NoteSwapCaller(static_cast<uint32_t>(ctx.lr));
   if (g_host) {
-    g_host_budget = 10;
+    g_host_budget = 32;
     g_host_learn = 1;
     g_host->RestartRetainedFrame();
   }

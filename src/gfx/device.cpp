@@ -14,6 +14,8 @@ namespace {
 
 struct DrawScratch;
 void DestroyDrawScratch(VkDevice device, DrawScratch*& scratch);
+struct DrawCache;
+void DestroyDrawCache(VkDevice device, DrawCache*& cache);
 
 }  // namespace
 
@@ -40,6 +42,8 @@ struct Device::Vulkan {
   bool frame_restart = false;
   // Vertex and uniform bytes stay mapped for the life of the device.
   DrawScratch* scratch = nullptr;
+  // Pipelines and texture images are reused across draws.
+  DrawCache* draw_cache = nullptr;
 
   void ReleaseFrameImages() {
     if (device == VK_NULL_HANDLE) {
@@ -78,6 +82,7 @@ struct Device::Vulkan {
       vkDeviceWaitIdle(device);
       ReleaseFrameImages();
       DestroyDrawScratch(device, scratch);
+      DestroyDrawCache(device, draw_cache);
     }
     if (pool != VK_NULL_HANDLE) {
       vkDestroyCommandPool(device, pool, nullptr);
@@ -471,6 +476,90 @@ bool EnsureScratchBytes(VkPhysicalDevice physical, VkDevice device, Buffer& buff
   }
   capacity = size;
   return true;
+}
+
+struct KeptPipeline {
+  uint64_t key = 0;
+  VkShaderModule vertex = VK_NULL_HANDLE;
+  VkShaderModule fragment = VK_NULL_HANDLE;
+  VkDescriptorSetLayout sets[4] = {};
+  VkPipelineLayout layout = VK_NULL_HANDLE;
+  VkPipeline pipeline = VK_NULL_HANDLE;
+};
+
+struct KeptTexture {
+  uint32_t width = 0;
+  uint32_t height = 0;
+  VkImage image = VK_NULL_HANDLE;
+  VkDeviceMemory memory = VK_NULL_HANDLE;
+  VkImageView view = VK_NULL_HANDLE;
+  bool sampled = false;
+};
+
+struct DrawCache {
+  std::vector<KeptPipeline> pipelines;
+  std::vector<KeptTexture> textures;
+  VkSampler sampler = VK_NULL_HANDLE;
+};
+
+void DestroyDrawCache(VkDevice device, DrawCache*& cache) {
+  if (cache == nullptr) {
+    return;
+  }
+  if (device != VK_NULL_HANDLE) {
+    for (KeptPipeline& pipeline : cache->pipelines) {
+      if (pipeline.pipeline != VK_NULL_HANDLE) {
+        vkDestroyPipeline(device, pipeline.pipeline, nullptr);
+      }
+      if (pipeline.layout != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(device, pipeline.layout, nullptr);
+      }
+      for (VkDescriptorSetLayout set_layout : pipeline.sets) {
+        if (set_layout != VK_NULL_HANDLE) {
+          vkDestroyDescriptorSetLayout(device, set_layout, nullptr);
+        }
+      }
+      if (pipeline.fragment != VK_NULL_HANDLE) {
+        vkDestroyShaderModule(device, pipeline.fragment, nullptr);
+      }
+      if (pipeline.vertex != VK_NULL_HANDLE) {
+        vkDestroyShaderModule(device, pipeline.vertex, nullptr);
+      }
+    }
+    for (KeptTexture& texture : cache->textures) {
+      if (texture.view != VK_NULL_HANDLE) {
+        vkDestroyImageView(device, texture.view, nullptr);
+      }
+      if (texture.image != VK_NULL_HANDLE) {
+        vkDestroyImage(device, texture.image, nullptr);
+      }
+      if (texture.memory != VK_NULL_HANDLE) {
+        vkFreeMemory(device, texture.memory, nullptr);
+      }
+    }
+    if (cache->sampler != VK_NULL_HANDLE) {
+      vkDestroySampler(device, cache->sampler, nullptr);
+    }
+  }
+  delete cache;
+  cache = nullptr;
+}
+
+uint64_t HashMix(uint64_t hash, uint64_t value) {
+  hash ^= value;
+  hash *= 1099511628211ull;
+  return hash;
+}
+
+uint64_t HashWords(uint64_t hash, const uint32_t* words, size_t count) {
+  hash = HashMix(hash, count);
+  if (words == nullptr) {
+    return hash;
+  }
+  for (size_t i = 0; i < count; ++i) {
+    hash = HashMix(hash, words[i]);
+  }
+  return hash;
 }
 
 }  // namespace
@@ -1517,6 +1606,11 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
   VkSampler sampler = VK_NULL_HANDLE;
   Buffer readback{};
   VkCommandBuffer command = VK_NULL_HANDLE;
+  bool keep_pipeline = false;
+  bool keep_texture = false;
+  bool keep_sampler = false;
+  KeptTexture* texture_slot = nullptr;
+  uint64_t pipeline_key = 0;
   const bool retain_frame = fixed_state != nullptr && fixed_state->retain_frame;
   const bool reuse_frame = retain_frame && vulkan_->frame_color != VK_NULL_HANDLE &&
                            vulkan_->frame_width == width && vulkan_->frame_height == height;
@@ -1538,13 +1632,15 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
       vkFreeCommandBuffers(device, vulkan_->pool, 1, &command);
     }
     DestroyBuffer(device, readback);
-    if (sampler != VK_NULL_HANDLE) {
+    if (!keep_sampler && sampler != VK_NULL_HANDLE) {
       vkDestroySampler(device, sampler, nullptr);
     }
-    if (texture_view != VK_NULL_HANDLE) {
-      vkDestroyImageView(device, texture_view, nullptr);
+    if (!keep_texture) {
+      if (texture_view != VK_NULL_HANDLE) {
+        vkDestroyImageView(device, texture_view, nullptr);
+      }
+      DestroyImage(device, texture);
     }
-    DestroyImage(device, texture);
     if (!hold_targets) {
       if (target_view != VK_NULL_HANDLE) {
         vkDestroyImageView(device, target_view, nullptr);
@@ -1555,29 +1651,98 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
       DestroyImage(device, depth);
       DestroyImage(device, target);
     }
-    if (pipeline != VK_NULL_HANDLE) {
-      vkDestroyPipeline(device, pipeline, nullptr);
-    }
-    if (layout != VK_NULL_HANDLE) {
-      vkDestroyPipelineLayout(device, layout, nullptr);
+    if (!keep_pipeline) {
+      if (pipeline != VK_NULL_HANDLE) {
+        vkDestroyPipeline(device, pipeline, nullptr);
+      }
+      if (layout != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(device, layout, nullptr);
+      }
+      for (VkDescriptorSetLayout set_layout : set_layouts) {
+        if (set_layout != VK_NULL_HANDLE) {
+          vkDestroyDescriptorSetLayout(device, set_layout, nullptr);
+        }
+      }
+      if (fragment_module != VK_NULL_HANDLE) {
+        vkDestroyShaderModule(device, fragment_module, nullptr);
+      }
+      if (vertex_module != VK_NULL_HANDLE) {
+        vkDestroyShaderModule(device, vertex_module, nullptr);
+      }
     }
     if (pool != VK_NULL_HANDLE) {
       vkDestroyDescriptorPool(device, pool, nullptr);
     }
-    for (VkDescriptorSetLayout set_layout : set_layouts) {
-      if (set_layout != VK_NULL_HANDLE) {
-        vkDestroyDescriptorSetLayout(device, set_layout, nullptr);
-      }
-    }
-    if (fragment_module != VK_NULL_HANDLE) {
-      vkDestroyShaderModule(device, fragment_module, nullptr);
-    }
-    if (vertex_module != VK_NULL_HANDLE) {
-      vkDestroyShaderModule(device, vertex_module, nullptr);
-    }
   };
 
+  if (vulkan_->draw_cache == nullptr) {
+    vulkan_->draw_cache = new DrawCache;
+    vulkan_->draw_cache->textures.reserve(24);
+    vulkan_->draw_cache->pipelines.reserve(160);
+  }
+  DrawCache& draw_cache = *vulkan_->draw_cache;
+  const uint32_t* vertex_code = kPosition;
+  size_t vertex_code_words = sizeof(kPosition) / sizeof(uint32_t);
+  if (guest_vertex) {
+    vertex_code = words;
+    vertex_code_words = word_count;
+  } else if (write_interpolator) {
+    vertex_code = kInterpolatorVertex;
+    vertex_code_words = kInterpolatorVertexWords;
+  }
+  const uint32_t* fragment_code = words;
+  size_t fragment_code_words = word_count;
+  if (guest_vertex && fragment_words != nullptr && fragment_word_count != 0) {
+    fragment_code = fragment_words;
+    fragment_code_words = fragment_word_count;
+  } else if (guest_vertex) {
+    fragment_code = kPassFragment;
+    fragment_code_words = kPassFragmentWords;
+  }
+  pipeline_key = 14695981039346656037ull;
+  pipeline_key = HashWords(pipeline_key, vertex_code, vertex_code_words);
+  pipeline_key = HashWords(pipeline_key, fragment_code, fragment_code_words);
+  pipeline_key = HashMix(pipeline_key, image_count);
+  pipeline_key = HashMix(pipeline_key, sampler_count);
+  pipeline_key = HashMix(pipeline_key, width);
+  pipeline_key = HashMix(pipeline_key, height);
+  pipeline_key = HashMix(pipeline_key, guest_vertex ? 1u : 0u);
+  pipeline_key = HashMix(pipeline_key, (decoded.depth || retain_frame) ? 1u : 0u);
+  pipeline_key = HashMix(pipeline_key, decoded.depth ? 1u : 0u);
+  pipeline_key = HashMix(pipeline_key, decoded.depth_write ? 1u : 0u);
+  pipeline_key = HashMix(pipeline_key, uint32_t(decoded.depth_op));
+  pipeline_key = HashMix(pipeline_key, uint32_t(decoded.cull));
+  pipeline_key = HashMix(pipeline_key, uint32_t(decoded.front));
+  pipeline_key = HashMix(pipeline_key, fixed_state != nullptr ? 1u : 0u);
+  pipeline_key = HashMix(pipeline_key, uint32_t(decoded.src_color));
+  pipeline_key = HashMix(pipeline_key, uint32_t(decoded.dst_color));
+  pipeline_key = HashMix(pipeline_key, uint32_t(decoded.color_op));
+  pipeline_key = HashMix(pipeline_key, uint32_t(decoded.src_alpha));
+  pipeline_key = HashMix(pipeline_key, uint32_t(decoded.dst_alpha));
+  pipeline_key = HashMix(pipeline_key, uint32_t(decoded.alpha_op));
+  pipeline_key = HashMix(pipeline_key, write_interpolator ? 1u : 0u);
+  uint32_t interpolator_bits = 0;
+  std::memcpy(&interpolator_bits, &interpolator_x, sizeof(interpolator_bits));
+  pipeline_key = HashMix(pipeline_key, interpolator_bits);
+  for (const KeptPipeline& kept : draw_cache.pipelines) {
+    if (kept.key != pipeline_key) {
+      continue;
+    }
+    vertex_module = kept.vertex;
+    fragment_module = kept.fragment;
+    layout = kept.layout;
+    pipeline = kept.pipeline;
+    for (uint32_t i = 0; i < 4; ++i) {
+      set_layouts[i] = kept.sets[i];
+    }
+    keep_pipeline = true;
+    break;
+  }
+
+  const uint32_t uniform_bindings[4] = {0, 2, 3, 4};
+  const uint32_t uniform_count = guest_vertex ? 5u : 4u;
   VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+  if (!keep_pipeline) {
   if (guest_vertex) {
     module_info.codeSize = word_count * sizeof(uint32_t);
     module_info.pCode = words;
@@ -1618,8 +1783,6 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
   storage.descriptorCount = 1;
   storage.stageFlags = guest_stages;
   VkDescriptorSetLayoutBinding uniforms[5]{};
-  const uint32_t uniform_bindings[4] = {0, 2, 3, 4};
-  uint32_t uniform_count = 4;
   for (uint32_t i = 0; i < 4; ++i) {
     uniforms[i].binding = uniform_bindings[i];
     uniforms[i].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
@@ -1631,7 +1794,6 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
     uniforms[4].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     uniforms[4].descriptorCount = 1;
     uniforms[4].stageFlags = guest_stages;
-    uniform_count = 5;
   }
   VkDescriptorSetLayoutCreateInfo set_info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
   set_info.bindingCount = 1;
@@ -1682,6 +1844,7 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
     reason = "guest pipeline layout failed";
     cleanup();
     return false;
+  }
   }
 
   constexpr VkDeviceSize kUniformBytes = 65536;
@@ -1917,7 +2080,21 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
     }
     std::memcpy(scratch.upload_map, pixels.data(), pixels.size());
 
+    for (KeptTexture& kept : draw_cache.textures) {
+      if (kept.width != tex_w || kept.height != tex_h) {
+        continue;
+      }
+      texture.image = kept.image;
+      texture.memory = kept.memory;
+      texture_view = kept.view;
+      texture_slot = &kept;
+      keep_texture = true;
+      break;
+    }
     VkImageCreateInfo texture_info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    if (keep_texture) {
+      texture_info.extent = {tex_w, tex_h, 1};
+    } else {
     texture_info.imageType = VK_IMAGE_TYPE_2D;
     texture_info.format = VK_FORMAT_R8G8B8A8_UNORM;
     texture_info.extent = {tex_w, tex_h, 1};
@@ -1962,6 +2139,7 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
       cleanup();
       return false;
     }
+    }
     VkSamplerCreateInfo sampler_info{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     sampler_info.magFilter = VK_FILTER_NEAREST;
     sampler_info.minFilter = VK_FILTER_NEAREST;
@@ -1970,10 +2148,19 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
     sampler_info.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     sampler_info.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     sampler_info.maxLod = 0.f;
-    if (vkCreateSampler(device, &sampler_info, nullptr, &sampler) != VK_SUCCESS) {
+    if (draw_cache.sampler == VK_NULL_HANDLE &&
+        vkCreateSampler(device, &sampler_info, nullptr, &draw_cache.sampler) != VK_SUCCESS) {
       reason = "guest sampler failed";
       cleanup();
       return false;
+    }
+    sampler = draw_cache.sampler;
+    keep_sampler = true;
+    if (!keep_texture && draw_cache.textures.size() < 24) {
+      draw_cache.textures.push_back(
+          KeptTexture{tex_w, tex_h, texture.image, texture.memory, texture_view, false});
+      texture_slot = &draw_cache.textures.back();
+      keep_texture = true;
     }
   }
 
@@ -2269,11 +2456,25 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
   pipeline_info.pDepthStencilState = use_depth ? &depth_state : nullptr;
   pipeline_info.pColorBlendState = &blend_state;
   pipeline_info.layout = layout;
-  if (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &pipeline) !=
-      VK_SUCCESS) {
+  if (!keep_pipeline &&
+      vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &pipeline) !=
+          VK_SUCCESS) {
     reason = "guest pipeline failed";
     cleanup();
     return false;
+  }
+  if (!keep_pipeline && draw_cache.pipelines.size() < 160) {
+    KeptPipeline kept{};
+    kept.key = pipeline_key;
+    kept.vertex = vertex_module;
+    kept.fragment = fragment_module;
+    kept.layout = layout;
+    kept.pipeline = pipeline;
+    for (uint32_t i = 0; i < 4; ++i) {
+      kept.sets[i] = set_layouts[i];
+    }
+    draw_cache.pipelines.push_back(kept);
+    keep_pipeline = true;
   }
 
   VkCommandBufferAllocateInfo command_info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
@@ -2289,9 +2490,12 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
   begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
   vkBeginCommandBuffer(command, &begin);
   if (texture_view != VK_NULL_HANDLE) {
+    const bool texture_sampled = texture_slot != nullptr && texture_slot->sampled;
     VkImageMemoryBarrier upload_barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    upload_barrier.srcAccessMask = texture_sampled ? VK_ACCESS_SHADER_READ_BIT : 0;
     upload_barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    upload_barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    upload_barrier.oldLayout =
+        texture_sampled ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED;
     upload_barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     upload_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     upload_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -2299,8 +2503,11 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
     upload_barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     upload_barrier.subresourceRange.levelCount = 1;
     upload_barrier.subresourceRange.layerCount = 1;
-    vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                         0, 0, nullptr, 0, nullptr, 1, &upload_barrier);
+    vkCmdPipelineBarrier(command,
+                         texture_sampled ? VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+                                         : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                         &upload_barrier);
     VkBufferImageCopy upload_copy{};
     upload_copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     upload_copy.imageSubresource.layerCount = 1;
@@ -2314,6 +2521,9 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
     vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
                          VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1,
                          &upload_barrier);
+    if (texture_slot != nullptr) {
+      texture_slot->sampled = true;
+    }
   }
   VkImageMemoryBarrier target_barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
   target_barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;

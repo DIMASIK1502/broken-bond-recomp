@@ -861,6 +861,12 @@ Vertex and uniform buffers stay allocated on the device. Ten draws per
 present still keep the title at 30 Hz: about 1500 draws in five seconds,
 96 shaders. One frame still covers on the order of 1300 to 1900 pixels.
 The window is still the Xenos present.
+Pipelines and texture images stay on the device. Thirty-two draws per
+present keep the title at 30 Hz: about 4800 draws in five seconds, 96
+shaders. Title frames still cover about 1500 to 3800 pixels. Some frames
+cover about 52000. Forty draws once covered all 655360 pixels and frames
+of about 300000, and the present slipped toward 24 Hz, so the slot stays
+at 32. The window is still the Xenos present.
 
 `GetTiledAddressLowerBound3D` masks Z with `~kTextureTileDepth` (`~4`) rather
 than `~(kTextureTileDepth - 1)`. On 300 of 600 tile corners, Z = 4 and
