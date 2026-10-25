@@ -755,7 +755,11 @@ the vertices from the lowest index through the highest. A title run wrote
 one indexed triangle draw: 93 vertices at stride 7 (2604 bytes), 141 16-bit
 indices, first index 0, base vertex 0, 708 bytes of vertex microcode, 132
 bytes of pixel microcode, six declaration elements, and float constant 0
-equal to 0.5625. The window was closed after that snapshot.
+equal to 0.5625. The window was closed after that snapshot. Drawn at
+1280×512 with the snapshot's shaders, indices, and float constants, fetch
+endian 1 covers 197759 pixels. The covered region is one filled chevron.
+The first covered pixel is 186, 137, 125, 152. The pixel shader samples the
+host stand-in texture. Endian 2 covers one pixel.
 
 `GetTiledAddressLowerBound3D` masks Z with `~kTextureTileDepth` (`~4`) rather
 than `~(kTextureTileDepth - 1)`. On 300 of 600 tile corners, Z = 4 and

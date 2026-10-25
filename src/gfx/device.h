@@ -43,9 +43,14 @@ struct VertexStream {
   VertexAttribute attributes[8]{};
   uint32_t attribute_count = 0;
   // When set, these bytes are the vertices, packed at stride_words. The draw
-  // submits byte_count / (stride_words * 4) of them. Values are little-endian.
+  // submits byte_count / (stride_words * 4) of them. endian is the fetch
+  // constant's swap: 0 leaves each dword as stored.
   const uint8_t* bytes = nullptr;
   uint32_t byte_count = 0;
+  // Host-endian indices. When index_count is not zero the draw is indexed.
+  const uint16_t* indices = nullptr;
+  uint32_t index_count = 0;
+  uint32_t endian = 0;
 };
 
 struct DeviceInfo {
@@ -113,7 +118,9 @@ class Device {
   // memory. Vertex float constants are a repeated identity matrix.
   // texture_rgba, when set, replaces the 32×32 pattern. It is tightly packed
   // RGBA8 of texture_width by texture_height, and texture_width is a multiple
-  // of 32 so the fetch pitch can name it.
+  // of 32 so the fetch pitch can name it. vertex_constants and pixel_constants,
+  // when set, are 256 float4s each and replace the identity and the constant
+  // pattern.
   bool DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_t width,
                          uint32_t height, uint32_t image_count, uint32_t sampler_count,
                          uint32_t texture_key, bool write_interpolator, float interpolator_x,
@@ -121,7 +128,9 @@ class Device {
                          std::vector<uint8_t>& out, std::string& reason,
                          const uint32_t* fragment_words = nullptr, size_t fragment_word_count = 0,
                          const uint8_t* texture_rgba = nullptr, uint32_t texture_width = 0,
-                         uint32_t texture_height = 0, const RasterState* fixed_state = nullptr);
+                         uint32_t texture_height = 0, const RasterState* fixed_state = nullptr,
+                         const float* vertex_constants = nullptr,
+                         const float* pixel_constants = nullptr);
 
  private:
   struct Vulkan;

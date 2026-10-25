@@ -50,6 +50,8 @@
 #endif
 #if defined(BROKEN_BOND_HOST_GFX)
 #include "gfx/device.h"
+#include "gfx/device_shadow.h"
+#include "gfx/shader_object.h"
 #include "gfx/texture.h"
 #include "gfx/vertex_semantic.h"
 #endif
@@ -2162,6 +2164,229 @@ int DrawBootPair(const std::vector<uint8_t>& file, const std::vector<ShaderRecor
   std::cout << "boot_pair_ok 1\n";
   return 0;
 }
+
+void StoreBe(std::vector<uint8_t>& image, uint32_t at, uint32_t value) {
+  image[at] = static_cast<uint8_t>(value >> 24);
+  image[at + 1] = static_cast<uint8_t>(value >> 16);
+  image[at + 2] = static_cast<uint8_t>(value >> 8);
+  image[at + 3] = static_cast<uint8_t>(value);
+}
+
+uint32_t LoadBe(const std::vector<uint8_t>& image, uint32_t at) {
+  return (uint32_t(image[at]) << 24) | (uint32_t(image[at + 1]) << 16) |
+         (uint32_t(image[at + 2]) << 8) | uint32_t(image[at + 3]);
+}
+
+int DrawMesh(const char* path) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in) {
+    Fail(std::string("cannot open ") + path);
+  }
+  uint32_t magic = 0;
+  uint32_t image_device = 0;
+  uint32_t image_bytes = 0;
+  if (!in.read(reinterpret_cast<char*>(&magic), 4) ||
+      !in.read(reinterpret_cast<char*>(&image_device), 4) ||
+      !in.read(reinterpret_cast<char*>(&image_bytes), 4) || magic != 0x31445242u ||
+      image_bytes > (20u << 20)) {
+    Fail("mesh snapshot is not a device draw");
+  }
+  std::vector<uint8_t> image(image_bytes);
+  if (image_bytes != 0 &&
+      !in.read(reinterpret_cast<char*>(image.data()), static_cast<std::streamsize>(image_bytes))) {
+    Fail("mesh snapshot is short");
+  }
+  std::string reason;
+  broken_bond::gfx::DeviceDraw draw;
+  std::vector<uint8_t> stream_bytes;
+  std::vector<broken_bond::gfx::VertexElement> elements;
+  broken_bond::gfx::ShaderMicrocode vertex_ucode;
+  broken_bond::gfx::ShaderMicrocode pixel_ucode;
+  std::vector<uint8_t> vertex_raw;
+  std::vector<uint8_t> pixel_raw;
+  std::vector<float> floats;
+  if (!broken_bond::gfx::ReadDeviceDraw(image.data(), image.size(), image_device, draw, stream_bytes,
+                                        reason) ||
+      !broken_bond::gfx::ReadDeviceDeclaration(image.data(), image.size(), image_device, elements,
+                                               reason) ||
+      !broken_bond::gfx::ReadVertexShaderMicrocode(image.data(), image.size(), draw.vertex_shader,
+                                                   vertex_ucode, vertex_raw, reason) ||
+      !broken_bond::gfx::ReadPixelShaderMicrocode(image.data(), image.size(), draw.pixel_shader,
+                                                  pixel_ucode, pixel_raw, reason) ||
+      !broken_bond::gfx::ReadDeviceFloats(image.data(), image.size(), image_device, floats,
+                                          reason)) {
+    Fail(reason.empty() ? "mesh snapshot was not read" : reason);
+  }
+  if (image.size() < 12456u || vertex_raw.size() < 12 || vertex_raw.size() % 4 != 0 ||
+      pixel_raw.size() < 12 || floats.size() < 2048u || elements.empty() ||
+      draw.stream_stride_dwords == 0) {
+    Fail("mesh snapshot is missing a shader, a declaration, or vertices");
+  }
+  const uint32_t index_at = LoadBe(image, 12436u);
+  const uint32_t index_bytes = LoadBe(image, 12440u);
+  const uint32_t index_size = LoadBe(image, 12444u);
+  const uint32_t index_first = LoadBe(image, 12448u);
+  if (index_size != 2u || index_bytes < 6u || index_bytes % 2u != 0 ||
+      uint64_t(index_at) + index_bytes > image.size()) {
+    Fail("mesh snapshot index list is not 16-bit");
+  }
+  std::vector<uint16_t> indices(index_bytes / 2u);
+  for (uint32_t i = 0; i < indices.size(); ++i) {
+    const uint32_t at = index_at + i * 2u;
+    uint16_t index = uint16_t((uint32_t(image[at]) << 8) | uint32_t(image[at + 1]));
+    indices[i] = index >= index_first ? uint16_t(index - index_first) : index;
+  }
+  const uint32_t vertex_object = draw.vertex_shader & 0x1FFFFFFFu;
+  int marker = -1;
+  if (vertex_object + 0x800u <= image.size()) {
+    for (uint32_t at = vertex_object; at + 4u <= vertex_object + 0x800u; at += 4u) {
+      if (LoadBe(image, at) == 0x290u) {
+        marker = static_cast<int>(at);
+        break;
+      }
+    }
+  }
+  if (marker < 0) {
+    Fail("mesh vertex shader has no semantic marker");
+  }
+  std::vector<uint8_t> container(0x100u + vertex_raw.size(), 0);
+  StoreBe(container, 4u, 0x100u);
+  StoreBe(container, 24u, 0x60u);
+  StoreBe(container, 48u, 0xFFFE0300u);
+  StoreBe(container, 0x60u, 0u);
+  StoreBe(container, 0x64u, uint32_t(vertex_raw.size()));
+  const uint32_t blob = std::min(32u, uint32_t(image.size() - uint32_t(marker)) / 4u);
+  for (uint32_t i = 0; i < blob; ++i) {
+    StoreBe(container, 0x68u + i * 4u, LoadBe(image, uint32_t(marker) + i * 4u));
+  }
+  std::memcpy(container.data() + 0x100u, vertex_raw.data(), vertex_raw.size());
+  std::vector<broken_bond::gfx::VertexFetchSemantic> semantics;
+  if (!broken_bond::gfx::ReadVertexFetchSemantics(container.data(), container.size(), semantics,
+                                                 reason)) {
+    Fail(reason.empty() ? "mesh vertex semantics were not read" : reason);
+  }
+  std::vector<uint32_t> patched(vertex_raw.size() / 4u);
+  for (uint32_t i = 0; i < patched.size(); ++i) {
+    uint32_t loaded = 0;
+    std::memcpy(&loaded, vertex_raw.data() + i * 4u, 4u);
+    patched[i] = HostFromBe(loaded);
+  }
+  if (!broken_bond::gfx::PatchVertexDeclaration(patched.data(), uint32_t(patched.size()),
+                                               semantics.data(), uint32_t(semantics.size()),
+                                               elements.data(), uint32_t(elements.size()),
+                                               reason)) {
+    Fail(reason.empty() ? "mesh declaration was not patched" : reason);
+  }
+  HostProbe probe;
+  probe.Open();
+  rex::graphics::SpirvShaderTranslator::Features features(false);
+  if (probe.create_module != nullptr && probe.api >= VK_API_VERSION_1_2) {
+    features.spirv_version = spv::Spv_1_5;
+    features.max_storage_buffer_range = probe.storage_range;
+    features.signed_zero_inf_nan_preserve_float32 = probe.preserve;
+    features.denorm_flush_to_zero_float32 = probe.flush;
+    features.rounding_mode_rte_float32 = probe.rte;
+    features.demote_to_helper_invocation = probe.demote;
+    features.sample_rate_shading = probe.sample_rate;
+  } else {
+    features = rex::graphics::SpirvShaderTranslator::Features(true);
+  }
+  rex::graphics::SpirvShaderTranslator translator(features, false, false, false);
+  auto translate = [&](bool vertex, uint32_t mask, rex::graphics::SpirvShader& shader,
+                       std::vector<uint32_t>& words) -> bool {
+    rex::string::StringBuffer disassembly;
+    shader.AnalyzeUcode(disassembly);
+    const uint64_t modification_value = vertex ? translator.GetDefaultVertexShaderModification(0)
+                                              : translator.GetDefaultPixelShaderModification(0);
+    rex::graphics::SpirvShaderTranslator::Modification modification(modification_value);
+    if (vertex) {
+      modification.vertex.interpolator_mask = mask;
+    } else {
+      modification.pixel.interpolator_mask = mask;
+    }
+    rex::graphics::Shader::Translation& translation =
+        *shader.GetOrCreateTranslation(modification.value);
+    if (!translator.TranslateAnalyzedShader(translation)) {
+      reason = "mesh shader did not translate";
+      return false;
+    }
+    const std::vector<uint8_t>& binary = translation.translated_binary();
+    if (binary.size() < 4 || binary.size() % 4 != 0) {
+      reason = "mesh shader is not a SPIR-V module";
+      return false;
+    }
+    words.assign(reinterpret_cast<const uint32_t*>(binary.data()),
+                 reinterpret_cast<const uint32_t*>(binary.data() + binary.size()));
+    return true;
+  };
+  rex::graphics::SpirvShader vertex_shader(rex::graphics::xenos::ShaderType::kVertex, 0,
+                                          patched.data(), uint32_t(patched.size()),
+                                          std::endian::native);
+  rex::string::StringBuffer vertex_disassembly;
+  vertex_shader.AnalyzeUcode(vertex_disassembly);
+  const uint32_t mask = vertex_shader.writes_interpolators() & 0xFFFFu;
+  std::vector<uint32_t> vertex_words;
+  std::vector<uint32_t> pixel_words;
+  if (!translate(true, mask, vertex_shader, vertex_words)) {
+    Fail(reason);
+  }
+  rex::graphics::SpirvShader pixel_shader(rex::graphics::xenos::ShaderType::kPixel, 0,
+                                         reinterpret_cast<const uint32_t*>(pixel_raw.data()),
+                                         uint32_t(pixel_raw.size() / 4u), std::endian::big);
+  if (!translate(false, mask, pixel_shader, pixel_words)) {
+    Fail(reason);
+  }
+  if (vertex_shader.vertex_bindings().empty()) {
+    Fail("mesh vertex shader has no fetch");
+  }
+  const uint32_t image_count = uint32_t(pixel_shader.GetTextureBindingsAfterTranslation().size());
+  const uint32_t sampler_count = uint32_t(pixel_shader.GetSamplerBindingsAfterTranslation().size());
+  broken_bond::gfx::Device device;
+  if (!device.Open(reason)) {
+    Fail(reason);
+  }
+  std::cout << "mesh verts " << (stream_bytes.size() / (draw.stream_stride_dwords * 4u))
+            << " indices " << indices.size() << " vs " << vertex_raw.size() << " ps "
+            << pixel_raw.size() << " decl " << elements.size() << " fetches " << semantics.size()
+            << " mask " << mask << " images " << image_count << "\n";
+  constexpr uint32_t kWidth = 1280;
+  constexpr uint32_t kHeight = 512;
+  for (uint32_t endian : {1u, 2u}) {
+    broken_bond::gfx::VertexStream stream;
+    stream.fetch_constant = vertex_shader.vertex_bindings()[0].fetch_constant;
+    stream.stride_words = draw.stream_stride_dwords;
+    stream.bytes = stream_bytes.data();
+    stream.byte_count = uint32_t(stream_bytes.size());
+    stream.indices = indices.data();
+    stream.index_count = uint32_t(indices.size());
+    stream.endian = endian;
+    std::vector<uint8_t> pixels;
+    if (!device.DrawGuestFragment(vertex_words.data(), vertex_words.size(), kWidth, kHeight,
+                                  image_count, sampler_count, 1, false, 0.f, true, &stream, 1,
+                                  pixels, reason, pixel_words.data(), pixel_words.size(), nullptr, 0,
+                                  0, nullptr, floats.data(), floats.data() + 1024)) {
+      Fail(reason.empty() ? "mesh draw failed" : reason);
+    }
+    uint32_t covered = 0;
+    int first[4] = {-1, -1, -1, -1};
+    for (size_t i = 0; i + 3 < pixels.size(); i += 4) {
+      if (pixels[i] == 255 && pixels[i + 1] == 0 && pixels[i + 2] == 255 && pixels[i + 3] == 255) {
+        continue;
+      }
+      if (first[0] < 0) {
+        first[0] = pixels[i];
+        first[1] = pixels[i + 1];
+        first[2] = pixels[i + 2];
+        first[3] = pixels[i + 3];
+      }
+      ++covered;
+    }
+    std::cout << "mesh endian " << endian << " covered " << covered << " first " << first[0] << " "
+              << first[1] << " " << first[2] << " " << first[3] << "\n";
+  }
+  std::cout << "mesh_draw_ok 1\n";
+  return 0;
+}
 #endif
 #endif
 
@@ -2518,6 +2743,11 @@ void CheckTiling3D(TileResult& result) {
 
 int main(int argc, char** argv) {
   try {
+#if defined(SHADER_DB_TRANSLATE) && defined(BROKEN_BOND_HOST_GFX)
+    if (argc == 4 && std::string(argv[2]) == "mesh") {
+      return DrawMesh(argv[3]);
+    }
+#endif
     int tiling_failed = 0;
     int guest_draw_failed = 0;
     int semantic_failed = 0;

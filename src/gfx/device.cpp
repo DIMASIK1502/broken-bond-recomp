@@ -1256,7 +1256,8 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
                                std::vector<uint8_t>& out, std::string& reason,
                                const uint32_t* fragment_words, size_t fragment_word_count,
                                const uint8_t* texture_rgba, uint32_t texture_width,
-                               uint32_t texture_height, const RasterState* fixed_state) {
+                               uint32_t texture_height, const RasterState* fixed_state,
+                               const float* vertex_constants, const float* pixel_constants) {
   if (vulkan_ == nullptr || words == nullptr || word_count < 5 || width == 0 || height == 0 ||
       image_count > 16 || sampler_count > 8 || !info_.dynamic_rendering) {
     reason = "guest draw is missing a device, a shader, or dynamic rendering";
@@ -1314,6 +1315,9 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
   Buffer shared{};
   Buffer constants[4]{};
   Buffer vertex_floats{};
+  Buffer index_buffer{};
+  uint32_t draw_indices = 0;
+  const uint16_t* draw_index_values = nullptr;
   Image target{};
   Image depth{};
   VkImageView target_view = VK_NULL_HANDLE;
@@ -1357,6 +1361,7 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
       DestroyBuffer(device, constant);
     }
     DestroyBuffer(device, vertex_floats);
+    DestroyBuffer(device, index_buffer);
     DestroyBuffer(device, shared);
     if (pipeline != VK_NULL_HANDLE) {
       vkDestroyPipeline(device, pipeline, nullptr);
@@ -1537,9 +1542,13 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
       std::memcpy(system + 288, color_scale, sizeof(color_scale));
     } else if (buffer == &constants[1]) {
       auto* values = static_cast<float*>(mapped);
-      const float pattern[4] = {1.f, 0.5f, 0.25f, 1.f};
-      for (uint32_t i = 0; i < 256 * 4; ++i) {
-        values[i] = pattern[i & 3];
+      if (pixel_constants != nullptr) {
+        std::memcpy(values, pixel_constants, 256u * 4u * sizeof(float));
+      } else {
+        const float pattern[4] = {1.f, 0.5f, 0.25f, 1.f};
+        for (uint32_t i = 0; i < 256 * 4; ++i) {
+          values[i] = pattern[i & 3];
+        }
       }
     } else if (buffer == &constants[3] && !guest_vertex) {
       rex::graphics::xenos::xe_gpu_texture_fetch_t fetch{};
@@ -1576,11 +1585,15 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
       return false;
     }
     auto* values = static_cast<float*>(mapped);
-    for (uint32_t reg = 0; reg < 256; ++reg) {
-      values[reg * 4 + 0] = (reg % 4) == 0 ? 1.f : 0.f;
-      values[reg * 4 + 1] = (reg % 4) == 1 ? 1.f : 0.f;
-      values[reg * 4 + 2] = (reg % 4) == 2 ? 1.f : 0.f;
-      values[reg * 4 + 3] = (reg % 4) == 3 ? 1.f : 0.f;
+    if (vertex_constants != nullptr) {
+      std::memcpy(values, vertex_constants, 256u * 4u * sizeof(float));
+    } else {
+      for (uint32_t reg = 0; reg < 256; ++reg) {
+        values[reg * 4 + 0] = (reg % 4) == 0 ? 1.f : 0.f;
+        values[reg * 4 + 1] = (reg % 4) == 1 ? 1.f : 0.f;
+        values[reg * 4 + 2] = (reg % 4) == 2 ? 1.f : 0.f;
+        values[reg * 4 + 3] = (reg % 4) == 3 ? 1.f : 0.f;
+      }
     }
     vkUnmapMemory(device, vertex_floats.memory);
   }
@@ -1617,7 +1630,11 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
       }
       const uint32_t base = cursor;
       fetch[stream.fetch_constant * 2] = (base << 2) | 3u;
-      fetch[stream.fetch_constant * 2 + 1] = 0xFFFFFFu << 2;
+      fetch[stream.fetch_constant * 2 + 1] = (0xFFFFFFu << 2) | (stream.endian & 3u);
+      if (stream.indices != nullptr && stream.index_count != 0) {
+        draw_indices = stream.index_count;
+        draw_index_values = stream.indices;
+      }
       if (stream.bytes != nullptr) {
         const uint32_t stride_bytes = stride * 4u;
         if (stride_bytes == 0 || stream.byte_count < stride_bytes * 3u ||
@@ -1675,6 +1692,22 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
     }
     vkUnmapMemory(device, constants[3].memory);
     vkUnmapMemory(device, shared.memory);
+    if (draw_indices != 0) {
+      if (!MakeBuffer(vulkan_->physical, device, VkDeviceSize(draw_indices) * sizeof(uint16_t),
+                      VK_BUFFER_USAGE_INDEX_BUFFER_BIT, kHost, index_buffer, reason)) {
+        cleanup();
+        return false;
+      }
+      void* index_mapped = nullptr;
+      if (vkMapMemory(device, index_buffer.memory, 0, VkDeviceSize(draw_indices) * sizeof(uint16_t),
+                      0, &index_mapped) != VK_SUCCESS) {
+        reason = "guest index map failed";
+        cleanup();
+        return false;
+      }
+      std::memcpy(index_mapped, draw_index_values, size_t(draw_indices) * sizeof(uint16_t));
+      vkUnmapMemory(device, index_buffer.memory);
+    }
   }
 
   if (image_count != 0) {
@@ -2148,7 +2181,12 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
   vkCmdBeginRendering(command, &render);
   vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
   vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 4, sets, 0, nullptr);
-  vkCmdDraw(command, guest_vertices, 1, 0, 0);
+  if (draw_indices != 0) {
+    vkCmdBindIndexBuffer(command, index_buffer.buffer, 0, VK_INDEX_TYPE_UINT16);
+    vkCmdDrawIndexed(command, draw_indices, 1, 0, 0, 0);
+  } else {
+    vkCmdDraw(command, guest_vertices, 1, 0, 0);
+  }
   vkCmdEndRendering(command);
   target_barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
   target_barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
