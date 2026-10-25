@@ -689,7 +689,11 @@ plus the object's dword at +32 is packed the same way as a texture address,
 then `0xC0000000` is added, and that guest address is what the copy reads.
 The header's dword at +876 is the byte count. A sum of `0x1234` lands at
 `0xC0001234`. A sum of `0xE0000000` on the alternate slot lands at
-`0xC0001000`. The pixel shader object is not read this way.
+`0xC0001000`. The pixel shader object keeps the header offset at +64 and the
+base at +24. The header's dword at +40 plus that base is packed the same
+way, except the low bit of the sum is dropped before the pack; the packet
+then sets that bit on the stored word. The header's dword at +44 is the
+byte count. A sum of `0x1235` is read from `0xC0001234`.
 
 `GetTiledAddressLowerBound3D` masks Z with `~kTextureTileDepth` (`~4`) rather
 than `~(kTextureTileDepth - 1)`. On 300 of 600 tile corners, Z = 4 and

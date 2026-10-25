@@ -1,5 +1,5 @@
-// Microcode bytes of one vertex shader object, at the guest address
-// sub_821B6CE0 copies into the ring.
+// Microcode bytes of a shader object, at the guest address sub_821B6CE0
+// copies or names in the ring.
 
 #pragma once
 
@@ -15,9 +15,13 @@ struct ShaderMicrocode {
 };
 
 // guest is physical memory: a guest address is indexed with its low 29 bits.
-// shader is the vertex shader object. Dwords in guest are big-endian.
+// Dwords in guest are big-endian. shader is the vertex or pixel shader object.
 bool ReadVertexShaderMicrocode(const uint8_t* guest, size_t guest_bytes, uint32_t shader,
                                ShaderMicrocode& out, std::vector<uint8_t>& bytes,
                                std::string& reason);
+
+bool ReadPixelShaderMicrocode(const uint8_t* guest, size_t guest_bytes, uint32_t shader,
+                              ShaderMicrocode& out, std::vector<uint8_t>& bytes,
+                              std::string& reason);
 
 }  // namespace broken_bond::gfx

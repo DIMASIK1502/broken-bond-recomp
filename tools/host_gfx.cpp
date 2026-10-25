@@ -376,5 +376,25 @@ int main() {
     return Fail(reason.empty() ? "alternate shader slot did not land at 0xC0001000" : reason);
   }
   std::cout << "  shader_ucode_ok 1\n";
+
+  std::vector<uint8_t> pixel_guest(0x3000, 0);
+  constexpr uint32_t kPixel = 0xC0002000u;
+  store_be(pixel_guest, kPixel + 24u, 0);
+  store_be(pixel_guest, kPixel + 64u, 0x80u);
+  store_be(pixel_guest, kPixel + 0x80u + 40u, 0x1235u);
+  store_be(pixel_guest, kPixel + 0x80u + 44u, 4u);
+  pixel_guest[0x1234] = 0x11;
+  pixel_guest[0x1235] = 0x22;
+  pixel_guest[0x1236] = 0x33;
+  pixel_guest[0x1237] = 0x44;
+  if (!broken_bond::gfx::ReadPixelShaderMicrocode(pixel_guest.data(), pixel_guest.size(), kPixel,
+                                                  microcode, microcode_bytes, reason) ||
+      microcode.guest_address != 0xC0001234u || microcode.byte_count != 4u ||
+      microcode_bytes.size() != 4u || microcode_bytes[0] != 0x11 || microcode_bytes[1] != 0x22 ||
+      microcode_bytes[2] != 0x33 || microcode_bytes[3] != 0x44) {
+    return Fail(reason.empty() ? "pixel shader microcode did not drop the low address bit"
+                               : reason);
+  }
+  std::cout << "  pixel_ucode_ok 1\n";
   return 0;
 }

@@ -26,6 +26,28 @@ uint32_t GuestAddress(uint32_t sum) {
   return (low + carry) + 0xC0000000u;
 }
 
+bool Finish(const uint8_t* guest, size_t guest_bytes, uint32_t sum, uint32_t byte_count,
+            bool clear_low_bit, ShaderMicrocode& out, std::vector<uint8_t>& bytes,
+            std::string& reason) {
+  if (byte_count == 0 || (byte_count & 3u) != 0) {
+    reason = "shader microcode size is not a whole number of dwords";
+    return false;
+  }
+  if (clear_low_bit) {
+    sum &= ~1u;
+  }
+  const uint32_t guest_address = GuestAddress(sum);
+  const uint32_t physical = guest_address & kPhysicalMask;
+  if (static_cast<uint64_t>(physical) + byte_count > guest_bytes) {
+    reason = "shader microcode is outside guest memory";
+    return false;
+  }
+  out.guest_address = guest_address;
+  out.byte_count = byte_count;
+  bytes.assign(guest + physical, guest + physical + byte_count);
+  return true;
+}
+
 }  // namespace
 
 bool ReadVertexShaderMicrocode(const uint8_t* guest, size_t guest_bytes, uint32_t shader,
@@ -49,20 +71,26 @@ bool ReadVertexShaderMicrocode(const uint8_t* guest, size_t guest_bytes, uint32_
       !LoadBe(guest, guest_bytes, inner + 876u, byte_count, reason)) {
     return false;
   }
-  if (byte_count == 0 || (byte_count & 3u) != 0) {
-    reason = "vertex shader microcode size is not a whole number of dwords";
+  return Finish(guest, guest_bytes, address_part + base, byte_count, false, out, bytes, reason);
+}
+
+bool ReadPixelShaderMicrocode(const uint8_t* guest, size_t guest_bytes, uint32_t shader,
+                              ShaderMicrocode& out, std::vector<uint8_t>& bytes,
+                              std::string& reason) {
+  uint32_t base = 0;
+  uint32_t inner_offset = 0;
+  if (!LoadBe(guest, guest_bytes, shader + 24u, base, reason) ||
+      !LoadBe(guest, guest_bytes, shader + 64u, inner_offset, reason)) {
     return false;
   }
-  const uint32_t guest_address = GuestAddress(address_part + base);
-  const uint32_t physical = guest_address & kPhysicalMask;
-  if (static_cast<uint64_t>(physical) + byte_count > guest_bytes) {
-    reason = "vertex shader microcode is outside guest memory";
+  const uint32_t inner = shader + inner_offset;
+  uint32_t address_part = 0;
+  uint32_t byte_count = 0;
+  if (!LoadBe(guest, guest_bytes, inner + 40u, address_part, reason) ||
+      !LoadBe(guest, guest_bytes, inner + 44u, byte_count, reason)) {
     return false;
   }
-  out.guest_address = guest_address;
-  out.byte_count = byte_count;
-  bytes.assign(guest + physical, guest + physical + byte_count);
-  return true;
+  return Finish(guest, guest_bytes, address_part + base, byte_count, true, out, bytes, reason);
 }
 
 }  // namespace broken_bond::gfx
