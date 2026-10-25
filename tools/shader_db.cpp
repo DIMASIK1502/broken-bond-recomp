@@ -50,6 +50,7 @@
 #endif
 #if defined(BROKEN_BOND_HOST_GFX)
 #include "gfx/device.h"
+#include "gfx/texture.h"
 #include "gfx/vertex_semantic.h"
 #endif
 
@@ -2627,6 +2628,7 @@ int main(int argc, char** argv) {
     uint32_t pack_seen = 0;
     uint32_t pack_bad = 0;
     uint32_t slot_bad = 0;
+    bool fetch_sample_done = false;
     constexpr uint32_t kGuestSize = 8;
     std::vector<uint32_t> link_fragment;
     const auto draw_batch = [&](const std::vector<TranslateStats::GuestDraw>& batch,
@@ -2716,6 +2718,50 @@ int main(int argc, char** argv) {
         std::cout << " changed " << changed << " diff " << texture_diff;
         if (fragment.declare_test) {
           std::cout << " other_changed " << other_changed;
+        }
+        if (!fetch_sample_done && !fragment.vertex && fragment.images != 0 && second &&
+            texture_diff > 0) {
+          fetch_sample_done = true;
+          constexpr uint32_t kTex = 32;
+          std::vector<uint8_t> solid(static_cast<size_t>(kTex) * kTex * 4u, 0);
+          for (size_t i = 0; i < solid.size(); i += 4) {
+            solid[i] = 200;
+            solid[i + 1] = 10;
+            solid[i + 2] = 20;
+            solid[i + 3] = 255;
+          }
+          uint32_t fetch_words[6] = {};
+          std::vector<uint8_t> guest_tex;
+          std::vector<uint8_t> restored;
+          std::vector<uint8_t> sampled;
+          const bool prepared =
+              broken_bond::gfx::WriteRgba8Fetch(fetch_words, kTex, kTex, kTex, true, 2,
+                                                guest_reason) &&
+              broken_bond::gfx::StoreFetchRgba8(fetch_words, solid.data(), guest_tex, guest_reason) &&
+              broken_bond::gfx::LoadFetchRgba8(fetch_words, guest_tex.data(), guest_tex.size(),
+                                               restored, guest_reason) &&
+              restored == solid;
+          const bool sampled_ok =
+              prepared &&
+              device.DrawGuestFragment(fragment.words.data(), fragment.words.size(), kGuestSize,
+                                       kGuestSize, fragment.images, fragment.samplers, 0, false, 0.f,
+                                       false, nullptr, 0, sampled, guest_reason, nullptr, 0,
+                                       restored.data(), kTex, kTex);
+          uint32_t fetch_mismatch = 0;
+          if (sampled_ok) {
+            for (size_t i = 0; i + 3 < sampled.size() && i + 3 < other.size(); i += 4) {
+              if (sampled[i] != other[i] || sampled[i + 1] != other[i + 1] ||
+                  sampled[i + 2] != other[i + 2] || sampled[i + 3] != other[i + 3]) {
+                ++fetch_mismatch;
+              }
+            }
+          }
+          std::cout << " fetch_sample " << (sampled_ok && fetch_mismatch == 0 ? 1 : 0);
+          if (!sampled_ok) {
+            std::cout << " fetch_sample_failed " << guest_reason;
+          } else if (fetch_mismatch != 0) {
+            std::cout << " fetch_mismatch " << fetch_mismatch;
+          }
         }
         if (std::string(kind) == "guest_pack") {
           ++pack_seen;

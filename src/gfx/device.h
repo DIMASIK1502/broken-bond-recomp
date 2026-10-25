@@ -88,12 +88,17 @@ class Device {
   // pixel shader. Both stages must use interpolator 0 at location 0.
   // streams, when guest_vertex is set, are the vertex fetches placed in shared
   // memory. Vertex float constants are a repeated identity matrix.
+  // texture_rgba, when set, replaces the 32×32 pattern. It is tightly packed
+  // RGBA8 of texture_width by texture_height, and texture_width is a multiple
+  // of 32 so the fetch pitch can name it.
   bool DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_t width,
                          uint32_t height, uint32_t image_count, uint32_t sampler_count,
                          uint32_t texture_key, bool write_interpolator, float interpolator_x,
                          bool guest_vertex, const VertexStream* streams, uint32_t stream_count,
                          std::vector<uint8_t>& out, std::string& reason,
-                         const uint32_t* fragment_words = nullptr, size_t fragment_word_count = 0);
+                         const uint32_t* fragment_words = nullptr, size_t fragment_word_count = 0,
+                         const uint8_t* texture_rgba = nullptr, uint32_t texture_width = 0,
+                         uint32_t texture_height = 0);
 
  private:
   struct Vulkan;

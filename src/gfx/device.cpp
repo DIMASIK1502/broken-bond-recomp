@@ -945,7 +945,9 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
                                uint32_t texture_key, bool write_interpolator, float interpolator_x,
                                bool guest_vertex, const VertexStream* streams, uint32_t stream_count,
                                std::vector<uint8_t>& out, std::string& reason,
-                               const uint32_t* fragment_words, size_t fragment_word_count) {
+                               const uint32_t* fragment_words, size_t fragment_word_count,
+                               const uint8_t* texture_rgba, uint32_t texture_width,
+                               uint32_t texture_height) {
   if (vulkan_ == nullptr || words == nullptr || word_count < 5 || width == 0 || height == 0 ||
       image_count > 16 || sampler_count > 8 || !info_.dynamic_rendering) {
     reason = "guest draw is missing a device, a shader, or dynamic rendering";
@@ -1008,6 +1010,13 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
   Buffer readback{};
   VkCommandBuffer command = VK_NULL_HANDLE;
   constexpr uint32_t kTextureSize = 32;
+  const bool custom_texture = texture_rgba != nullptr;
+  const uint32_t tex_w = custom_texture ? texture_width : kTextureSize;
+  const uint32_t tex_h = custom_texture ? texture_height : kTextureSize;
+  if (image_count != 0 && (tex_w == 0 || tex_h == 0 || (tex_w & 31u) != 0)) {
+    reason = "guest texture width is not a multiple of 32";
+    return false;
+  }
   const auto cleanup = [&]() {
     if (command != VK_NULL_HANDLE) {
       vkFreeCommandBuffers(device, vulkan_->pool, 1, &command);
@@ -1215,10 +1224,10 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
       fetch.clamp_x = rex::graphics::xenos::ClampMode::kClampToEdge;
       fetch.clamp_y = rex::graphics::xenos::ClampMode::kClampToEdge;
       fetch.clamp_z = rex::graphics::xenos::ClampMode::kClampToEdge;
-      fetch.pitch = kTextureSize >> 5;
+      fetch.pitch = tex_w >> 5;
       fetch.format = rex::graphics::xenos::TextureFormat::k_8_8_8_8;
-      fetch.size_2d.width = kTextureSize - 1;
-      fetch.size_2d.height = kTextureSize - 1;
+      fetch.size_2d.width = tex_w - 1;
+      fetch.size_2d.height = tex_h - 1;
       fetch.swizzle = rex::graphics::xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA;
       fetch.mag_filter = rex::graphics::xenos::TextureFilter::kPoint;
       fetch.min_filter = rex::graphics::xenos::TextureFilter::kPoint;
@@ -1330,20 +1339,24 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
   }
 
   if (image_count != 0) {
-    std::vector<uint8_t> pixels(size_t(kTextureSize) * kTextureSize * 4);
-    for (uint32_t y = 0; y < kTextureSize; ++y) {
-      for (uint32_t x = 0; x < kTextureSize; ++x) {
-        uint8_t* pixel = pixels.data() + (size_t(y) * kTextureSize + x) * 4;
-        if (texture_key == 0) {
-          pixel[0] = uint8_t(17 + x);
-          pixel[1] = uint8_t(34 + y);
-          pixel[2] = 51;
-          pixel[3] = 255;
-        } else {
-          pixel[0] = 200;
-          pixel[1] = 10;
-          pixel[2] = 20;
-          pixel[3] = 255;
+    std::vector<uint8_t> pixels(size_t(tex_w) * tex_h * 4);
+    if (custom_texture) {
+      std::memcpy(pixels.data(), texture_rgba, pixels.size());
+    } else {
+      for (uint32_t y = 0; y < tex_h; ++y) {
+        for (uint32_t x = 0; x < tex_w; ++x) {
+          uint8_t* pixel = pixels.data() + (size_t(y) * tex_w + x) * 4;
+          if (texture_key == 0) {
+            pixel[0] = uint8_t(17 + x);
+            pixel[1] = uint8_t(34 + y);
+            pixel[2] = 51;
+            pixel[3] = 255;
+          } else {
+            pixel[0] = 200;
+            pixel[1] = 10;
+            pixel[2] = 20;
+            pixel[3] = 255;
+          }
         }
       }
     }
@@ -1364,7 +1377,7 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
     VkImageCreateInfo texture_info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     texture_info.imageType = VK_IMAGE_TYPE_2D;
     texture_info.format = VK_FORMAT_R8G8B8A8_UNORM;
-    texture_info.extent = {kTextureSize, kTextureSize, 1};
+    texture_info.extent = {tex_w, tex_h, 1};
     texture_info.mipLevels = 1;
     texture_info.arrayLayers = 1;
     texture_info.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -1668,7 +1681,7 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
     VkBufferImageCopy upload_copy{};
     upload_copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     upload_copy.imageSubresource.layerCount = 1;
-    upload_copy.imageExtent = {kTextureSize, kTextureSize, 1};
+    upload_copy.imageExtent = {tex_w, tex_h, 1};
     vkCmdCopyBufferToImage(command, texture_upload.buffer, texture.image,
                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &upload_copy);
     upload_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
