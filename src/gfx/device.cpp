@@ -943,7 +943,8 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
                                uint32_t height, uint32_t image_count, uint32_t sampler_count,
                                uint32_t texture_key, bool write_interpolator, float interpolator_x,
                                bool guest_vertex, const VertexStream* streams, uint32_t stream_count,
-                               std::vector<uint8_t>& out, std::string& reason) {
+                               std::vector<uint8_t>& out, std::string& reason,
+                               const uint32_t* fragment_words, size_t fragment_word_count) {
   if (vulkan_ == nullptr || words == nullptr || word_count < 5 || width == 0 || height == 0 ||
       image_count > 16 || sampler_count > 8 || !info_.dynamic_rendering) {
     reason = "guest draw is missing a device, a shader, or dynamic rendering";
@@ -1066,7 +1067,10 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
     cleanup();
     return false;
   }
-  if (guest_vertex) {
+  if (guest_vertex && fragment_words != nullptr && fragment_word_count != 0) {
+    module_info.codeSize = fragment_word_count * sizeof(uint32_t);
+    module_info.pCode = fragment_words;
+  } else if (guest_vertex) {
     module_info.codeSize = kPassFragmentWords * sizeof(uint32_t);
     module_info.pCode = kPassFragment;
   } else {
@@ -1283,7 +1287,7 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
       for (uint32_t vertex = 0; vertex < 3; ++vertex) {
         for (uint32_t a = 0; a < stream.attribute_count && a < 8; ++a) {
           const VertexAttribute& attribute = stream.attributes[a];
-          if (!attribute.is_float || attribute.components == 0) {
+          if (!attribute.is_float || attribute.components == 0 || a != stream.triangle_attribute) {
             continue;
           }
           const int32_t at = stream.stride_words == 0

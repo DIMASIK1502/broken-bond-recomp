@@ -100,6 +100,7 @@ if(EXISTS "${BROKEN_BOND_VULKAN_SDK}/Lib/vulkan-1.lib" AND
         src/gfx/device.cpp
         src/gfx/guest_stage.cpp
         src/gfx/texture.cpp
+        src/gfx/vertex_semantic.cpp
         "${BROKEN_BOND_REXGLUE_SOURCE}/src/graphics/pipeline/texture/conversion.cpp"
         "${BROKEN_BOND_REXGLUE_SOURCE}/src/graphics/pipeline/texture/info_formats.cpp"
         "${BROKEN_BOND_REXGLUE_SOURCE}/src/graphics/pipeline/texture/util.cpp")

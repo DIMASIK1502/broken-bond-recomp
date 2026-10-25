@@ -25,6 +25,8 @@ struct VertexStream {
   uint32_t fetch_constant = 0;
   uint32_t stride_words = 0;
   uint32_t index_register = 0xFFFFFFFFu;
+  // Which attribute receives the covering triangle. The others stay zero.
+  uint32_t triangle_attribute = 0;
   VertexAttribute attributes[8]{};
   uint32_t attribute_count = 0;
 };
@@ -69,13 +71,16 @@ class Device {
   // is the solid texel (200, 10, 20, 255). write_interpolator makes the vertex
   // stage write (interpolator_x, 0.25, 0.5, 1) at location 0. guest_vertex
   // treats words as a vertex shader and copies location 0 to the color target.
+  // fragment_words, when guest_vertex is set, replaces that copy with a guest
+  // pixel shader. Both stages must use interpolator 0 at location 0.
   // streams, when guest_vertex is set, are the vertex fetches placed in shared
   // memory. Vertex float constants are a repeated identity matrix.
   bool DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_t width,
                          uint32_t height, uint32_t image_count, uint32_t sampler_count,
                          uint32_t texture_key, bool write_interpolator, float interpolator_x,
                          bool guest_vertex, const VertexStream* streams, uint32_t stream_count,
-                         std::vector<uint8_t>& out, std::string& reason);
+                         std::vector<uint8_t>& out, std::string& reason,
+                         const uint32_t* fragment_words = nullptr, size_t fragment_word_count = 0);
 
  private:
   struct Vulkan;

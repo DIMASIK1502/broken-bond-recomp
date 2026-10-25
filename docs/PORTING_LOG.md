@@ -547,8 +547,26 @@ of 4 dwords. System constants then had NDC scale (1, 1, 1) at byte 124,
 vertex_index_max 0xFFFFFF at byte 500, and bit 10 set so W is kept. Shared
 memory held a covering triangle and fetch constant vf0 pointed at it. The first
 16 of those 31 produced fragments: 4 covered all 64 pixels and 12 covered 32.
-The real format and stride are not in the shader database, and EDRAM is still
-absent from this path.
+The real format and stride are not in the shader database. Xbox 360 patches
+them from the bound vertex declaration when the draw is recorded. The shader
+object still names the semantic: after the dword `0x290`, each following dword
+has the microcode instruction in bits 0:7, the D3D usage in bits 12:15, and the
+usage index in bits 16:19. That table matches the vfetch instructions of all
+4648 vertex shaders. Every one of them fetches position0. The other elements
+are normal0 (4051), texcoord0 (2420), color1 (1774), texcoord1 (904), blend
+weight and blend indices (715 each), tangent0 (605), color0 (473), plus a few
+texcoord2/3/4, color2/3, and position1. EDRAM is still absent, and a host draw
+still needs the declaration the game binds for that mesh. A probe declaration
+put position0 at float4 offset 0 and every other semantic at float4 offset 4,
+stride 8. Eight textureless shaders that write interpolator 0 were drawn twice.
+All eight covered the target when the triangle sat in position0. None covered
+it when the triangle sat only in the other slot. The same eight were then
+linked to the guest pixel shader that copies interpolator 0 unchanged
+(255,64,127,255 from the constant vertex stage, then 0,64,127,255). Each
+linked draw matched the passthrough fragment on all 64 pixels, including the
+shader that writes white and the seven that write black. Location 0 of the
+vertex stage is interpolator 0 of the pixel stage. The declaration is still
+the synthetic float4, and EDRAM is still absent.
 
 `GetTiledAddressLowerBound3D` masks Z with `~kTextureTileDepth` (`~4`) rather
 than `~(kTextureTileDepth - 1)`. On 300 of 600 tile corners, Z = 4 and

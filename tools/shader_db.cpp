@@ -50,6 +50,7 @@
 #endif
 #if defined(BROKEN_BOND_HOST_GFX)
 #include "gfx/device.h"
+#include "gfx/vertex_semantic.h"
 #endif
 
 REXCVAR_DEFINE_STRING(dump_shaders, "", "GPU", "Unused here. AnalyzeUcode reads it.");
@@ -525,12 +526,14 @@ struct TranslateStats {
     uint32_t samplers = 0;
     bool interpolate = false;
     bool vertex = false;
+    bool declare_test = false;
     std::vector<broken_bond::gfx::VertexStream> streams;
   };
   std::vector<GuestDraw> guest_alu;
   std::vector<GuestDraw> guest_textured;
   std::vector<GuestDraw> guest_interpolated;
   std::vector<GuestDraw> guest_vertices;
+  std::vector<GuestDraw> guest_declared;
   uint32_t guest_textured_seen = 0;
   uint32_t guest_interpolated_seen = 0;
   uint32_t guest_vertex_seen = 0;
@@ -1437,7 +1440,8 @@ void PatchZeroVertexFetches(std::vector<uint32_t>& dwords) {
 }
 
 void TranslateShader(rex::graphics::SpirvShaderTranslator& translator, uint32_t token,
-                     const UcodeSpan& ucode, TranslateStats& stats, HostProbe& probe) {
+                     const UcodeSpan& ucode, TranslateStats& stats, HostProbe& probe,
+                     const uint8_t* object, size_t object_size) {
   const auto type = token == 0xFFFE0300u ? rex::graphics::xenos::ShaderType::kVertex
                                          : rex::graphics::xenos::ShaderType::kPixel;
   rex::graphics::SpirvShader shader(type, 0, ucode.dwords, ucode.dword_count, std::endian::big);
@@ -1660,6 +1664,113 @@ void TranslateShader(rex::graphics::SpirvShaderTranslator& translator, uint32_t 
           }
         }
       }
+#if defined(BROKEN_BOND_HOST_GFX)
+      if (stage.vertex && stage.images == 0 && stage.samplers == 0 &&
+          (shader.writes_interpolators() & 1u) != 0 && shader.memexport_eM_written() == 0 &&
+          stats.guest_declared.size() < 8 && object != nullptr) {
+        bool one_stream = !shader.vertex_bindings().empty();
+        uint32_t fetch_constant = 0;
+        bool fetch_set = false;
+        for (const rex::graphics::Shader::VertexBinding& binding : shader.vertex_bindings()) {
+          if (!fetch_set) {
+            fetch_constant = binding.fetch_constant;
+            fetch_set = true;
+          } else if (binding.fetch_constant != fetch_constant) {
+            one_stream = false;
+          }
+          for (const rex::graphics::Shader::VertexBinding::Attribute& attribute : binding.attributes) {
+            if (attribute.fetch_instr.operand_count == 0) {
+              one_stream = false;
+              continue;
+            }
+            const rex::graphics::InstructionOperand& index = attribute.fetch_instr.operands[0];
+            if (index.storage_source != rex::graphics::InstructionStorageSource::kRegister ||
+                index.storage_index != 0 || index.is_negated ||
+                index.components[0] != rex::graphics::SwizzleSource::kX) {
+              one_stream = false;
+            }
+          }
+        }
+        std::vector<broken_bond::gfx::VertexFetchSemantic> semantics;
+        std::string reason;
+        if (one_stream &&
+            broken_bond::gfx::ReadVertexFetchSemantics(object, object_size, semantics, reason)) {
+          bool position = false;
+          bool other = false;
+          for (const broken_bond::gfx::VertexFetchSemantic& semantic : semantics) {
+            if (semantic.usage == 0 && semantic.usage_index == 0) {
+              position = true;
+            } else {
+              other = true;
+            }
+          }
+          std::vector<broken_bond::gfx::VertexElement> elements;
+          if (position && other) {
+            for (const broken_bond::gfx::VertexFetchSemantic& semantic : semantics) {
+              bool seen = false;
+              for (const broken_bond::gfx::VertexElement& element : elements) {
+                if (element.usage == semantic.usage && element.usage_index == semantic.usage_index) {
+                  seen = true;
+                }
+              }
+              if (seen) {
+                continue;
+              }
+              broken_bond::gfx::VertexElement element;
+              element.usage = semantic.usage;
+              element.usage_index = semantic.usage_index;
+              element.format = 38;
+              element.stride_words = 8;
+              element.offset_words = semantic.usage == 0 && semantic.usage_index == 0 ? 0 : 4;
+              elements.push_back(element);
+            }
+          }
+          std::vector<uint32_t> patched_ucode(ucode.dword_count);
+          for (uint32_t i = 0; i < ucode.dword_count; ++i) {
+            patched_ucode[i] = HostFromBe(ucode.dwords[i]);
+          }
+          if (position && other &&
+              broken_bond::gfx::PatchVertexDeclaration(patched_ucode.data(),
+                                                       uint32_t(patched_ucode.size()), semantics.data(),
+                                                       uint32_t(semantics.size()), elements.data(),
+                                                       uint32_t(elements.size()), reason)) {
+            rex::graphics::SpirvShader patched(rex::graphics::xenos::ShaderType::kVertex, 0,
+                                              patched_ucode.data(), patched_ucode.size(),
+                                              std::endian::native);
+            rex::string::StringBuffer patched_disassembly;
+            patched.AnalyzeUcode(patched_disassembly);
+            rex::graphics::SpirvShaderTranslator::Modification modification(
+                translator.GetDefaultVertexShaderModification(0));
+            modification.vertex.interpolator_mask = 1;
+            rex::graphics::Shader::Translation& declared =
+                *patched.GetOrCreateTranslation(modification.value);
+            if (translator.TranslateAnalyzedShader(declared)) {
+              const std::vector<uint8_t>& again = declared.translated_binary();
+              if (again.size() >= 4 && again.size() % 4 == 0) {
+                TranslateStats::GuestDraw draw;
+                draw.vertex = true;
+                draw.declare_test = true;
+                draw.words.assign(reinterpret_cast<const uint32_t*>(again.data()),
+                                  reinterpret_cast<const uint32_t*>(again.data() + again.size()));
+                broken_bond::gfx::VertexStream stream;
+                stream.fetch_constant = fetch_constant;
+                stream.stride_words = 8;
+                stream.index_register = 0;
+                stream.attribute_count = 2;
+                stream.attributes[0].offset_words = 0;
+                stream.attributes[0].components = 4;
+                stream.attributes[0].is_float = true;
+                stream.attributes[1].offset_words = 4;
+                stream.attributes[1].components = 4;
+                stream.attributes[1].is_float = true;
+                draw.streams.push_back(stream);
+                stats.guest_declared.push_back(std::move(draw));
+              }
+            }
+          }
+        }
+      }
+#endif
       ++stats.ok;
       stats.spirv_bytes += binary.size();
       return;
@@ -2032,6 +2143,7 @@ int main(int argc, char** argv) {
   try {
     int tiling_failed = 0;
     int guest_draw_failed = 0;
+    int semantic_failed = 0;
 #if defined(SHADER_DB_TRANSLATE)
     const TileResult tiling = CheckTiling();
     tiling_failed = (tiling.address_failed != 0 || tiling.duplicate != 0 ||
@@ -2130,6 +2242,11 @@ int main(int argc, char** argv) {
 
     uint32_t vertex = 0;
     uint32_t pixel = 0;
+#if defined(BROKEN_BOND_HOST_GFX)
+    uint32_t semantic_ok = 0;
+    std::map<uint32_t, uint32_t> semantic_uses;
+    std::string semantic_reason;
+#endif
     uint32_t other = 0;
     uint64_t raw_bytes = 0;
     uint64_t ucode_bytes = 0;
@@ -2161,11 +2278,29 @@ int main(int argc, char** argv) {
         Fail("shader object is shorter than its version token");
       }
       const uint32_t token = ReadBe32(object.data() + 48);
+#if defined(BROKEN_BOND_HOST_GFX)
+      if (token == 0xFFFE0300u) {
+        std::vector<broken_bond::gfx::VertexFetchSemantic> semantics;
+        std::string reason;
+        if (!broken_bond::gfx::ReadVertexFetchSemantics(object.data(), object.size(), semantics,
+                                                       reason)) {
+          semantic_failed = 1;
+          if (semantic_reason.empty()) {
+            semantic_reason = reason;
+          }
+        } else {
+          ++semantic_ok;
+          for (const broken_bond::gfx::VertexFetchSemantic& semantic : semantics) {
+            ++semantic_uses[(semantic.usage << 8) | semantic.usage_index];
+          }
+        }
+      }
+#endif
       const UcodeSpan ucode = LocateUcode(object.data(), object.size(), token);
       ucode_bytes += uint64_t(ucode.dword_count) * 4;
       ReadConstants(object.data(), object.size(), token, constants);
 #if defined(SHADER_DB_TRANSLATE)
-      TranslateShader(translator, token, ucode, translated, probe);
+      TranslateShader(translator, token, ucode, translated, probe, object.data(), object.size());
 #endif
       if (token == 0xFFFE0300u) {
         ++vertex;
@@ -2314,6 +2449,7 @@ int main(int argc, char** argv) {
     const bool guest_open = device.Open(guest_reason);
     uint32_t guest_draws = 0;
     constexpr uint32_t kGuestSize = 8;
+    std::vector<uint32_t> link_fragment;
     const auto draw_batch = [&](const std::vector<TranslateStats::GuestDraw>& batch,
                                 const char* kind) {
       for (const TranslateStats::GuestDraw& fragment : batch) {
@@ -2340,18 +2476,23 @@ int main(int argc, char** argv) {
         }
         uint32_t changed = 0;
         uint32_t texture_diff = 0;
-        const bool second =
-            fragment.vertex
-                ? false
-                : fragment.interpolate
-                      ? device.DrawGuestFragment(fragment.words.data(), fragment.words.size(),
-                                                 kGuestSize, kGuestSize, 0, 0, 0, true, 0.f, false,
-                                                 nullptr, 0, other, guest_reason)
-                      : fragment.images != 0 &&
-                            device.DrawGuestFragment(
-                                fragment.words.data(), fragment.words.size(), kGuestSize, kGuestSize,
-                                fragment.images, fragment.samplers, 1, false, 0.f, false, nullptr, 0,
-                                other, guest_reason);
+        uint32_t other_changed = 0;
+        bool second = false;
+        if (fragment.declare_test && !fragment.streams.empty()) {
+          std::vector<broken_bond::gfx::VertexStream> swapped = fragment.streams;
+          swapped[0].triangle_attribute = 1;
+          second = device.DrawGuestFragment(fragment.words.data(), fragment.words.size(), kGuestSize,
+                                            kGuestSize, 0, 0, 0, false, 0.f, true, swapped.data(),
+                                            uint32_t(swapped.size()), other, guest_reason);
+        } else if (!fragment.vertex && fragment.interpolate) {
+          second = device.DrawGuestFragment(fragment.words.data(), fragment.words.size(), kGuestSize,
+                                            kGuestSize, 0, 0, 0, true, 0.f, false, nullptr, 0, other,
+                                            guest_reason);
+        } else if (!fragment.vertex && fragment.images != 0) {
+          second = device.DrawGuestFragment(fragment.words.data(), fragment.words.size(), kGuestSize,
+                                            kGuestSize, fragment.images, fragment.samplers, 1, false,
+                                            0.f, false, nullptr, 0, other, guest_reason);
+        }
         for (size_t i = 0; i + 3 < drawn.size(); i += 4) {
           if (drawn[i] != 255 || drawn[i + 1] != 0 || drawn[i + 2] != 255 || drawn[i + 3] != 255) {
             ++changed;
@@ -2360,6 +2501,10 @@ int main(int argc, char** argv) {
               (drawn[i] != other[i] || drawn[i + 1] != other[i + 1] || drawn[i + 2] != other[i + 2] ||
                drawn[i + 3] != other[i + 3])) {
             ++texture_diff;
+          }
+          if (second && i + 3 < other.size() &&
+              (other[i] != 255 || other[i + 1] != 0 || other[i + 2] != 255 || other[i + 3] != 255)) {
+            ++other_changed;
           }
         }
         std::cout << kind << " ok images " << fragment.images << " samplers " << fragment.samplers
@@ -2380,8 +2525,10 @@ int main(int argc, char** argv) {
                       << stream.attributes[0].components;
           }
         }
-        std::cout << " changed " << changed
-                  << " diff " << texture_diff;
+        std::cout << " changed " << changed << " diff " << texture_diff;
+        if (fragment.declare_test) {
+          std::cout << " other_changed " << other_changed;
+        }
         if (drawn.size() >= 4) {
           std::cout << " first " << int(drawn[0]) << " " << int(drawn[1]) << " " << int(drawn[2])
                     << " " << int(drawn[3]);
@@ -2389,6 +2536,12 @@ int main(int argc, char** argv) {
         if (second && other.size() >= 4) {
           std::cout << " second " << int(other[0]) << " " << int(other[1]) << " " << int(other[2])
                     << " " << int(other[3]);
+        }
+        if (!fragment.vertex && fragment.interpolate && second && drawn.size() >= 4 &&
+            other.size() >= 4 && drawn[0] == 255 && drawn[1] == 64 && drawn[2] == 127 &&
+            drawn[3] == 255 && other[0] == 0 && other[1] == 64 && other[2] == 127 &&
+            other[3] == 255 && link_fragment.empty()) {
+          link_fragment = fragment.words;
         }
         std::cout << "\n";
         if (changed != 0) {
@@ -2400,6 +2553,17 @@ int main(int argc, char** argv) {
     std::cout << "guest_interpolated_seen " << translated.guest_interpolated_seen << "\n";
     std::cout << "guest_vertex_seen " << translated.guest_vertex_seen << "\n";
     std::cout << "guest_single_fetch " << translated.guest_fetch_seen << "\n";
+    std::cout << "vertex_semantics " << semantic_ok << " failed " << semantic_failed;
+    if (!semantic_reason.empty()) {
+      std::cout << " reason " << semantic_reason;
+    }
+    std::cout << "\n";
+    for (const auto& use : semantic_uses) {
+      const uint32_t usage = use.first >> 8;
+      const uint32_t index = use.first & 0xFFu;
+      std::cout << "vertex_semantic " << broken_bond::gfx::VertexUsageName(usage) << index << " "
+                << use.second << "\n";
+    }
     std::cout << "vb_shaders " << translated.vb_shaders << " with_binding " << translated.vb_with_binding
               << " attr_stride " << translated.vb_attr_stride << " float " << translated.vb_float
               << " index0 " << translated.vb_index0 << "\n";
@@ -2425,12 +2589,57 @@ int main(int argc, char** argv) {
     draw_batch(translated.guest_textured, "guest_tex");
     draw_batch(translated.guest_interpolated, "guest_interp");
     draw_batch(translated.guest_vertices, "guest_vert");
+    draw_batch(translated.guest_declared, "guest_decl");
+    uint32_t link_full = 0;
+    if (!guest_open || link_fragment.empty() || translated.guest_declared.empty()) {
+      std::cout << "guest_link missing\n";
+      guest_draw_failed = 1;
+    } else {
+      for (const TranslateStats::GuestDraw& vertex : translated.guest_declared) {
+        std::vector<uint8_t> passed;
+        std::vector<uint8_t> paired;
+        const bool pass_ok = device.DrawGuestFragment(
+            vertex.words.data(), vertex.words.size(), kGuestSize, kGuestSize, 0, 0, 0, false, 0.f,
+            true, vertex.streams.data(), uint32_t(vertex.streams.size()), passed, guest_reason);
+        const bool pair_ok =
+            pass_ok &&
+            device.DrawGuestFragment(vertex.words.data(), vertex.words.size(), kGuestSize, kGuestSize,
+                                    0, 0, 0, false, 0.f, true, vertex.streams.data(),
+                                    uint32_t(vertex.streams.size()), paired, guest_reason,
+                                    link_fragment.data(), link_fragment.size());
+        uint32_t matched = 0;
+        if (pair_ok) {
+          for (size_t i = 0; i + 3 < passed.size() && i + 3 < paired.size(); i += 4) {
+            if (passed[i] == paired[i] && passed[i + 1] == paired[i + 1] &&
+                passed[i + 2] == paired[i + 2] && passed[i + 3] == paired[i + 3]) {
+              ++matched;
+            }
+          }
+        }
+        std::cout << "guest_link " << (pair_ok ? "ok" : "failed");
+        if (!pair_ok) {
+          std::cout << " " << guest_reason;
+        }
+        std::cout << " matched " << matched;
+        if (paired.size() >= 4) {
+          std::cout << " first " << int(paired[0]) << " " << int(paired[1]) << " " << int(paired[2])
+                    << " " << int(paired[3]);
+        }
+        std::cout << "\n";
+        if (matched == kGuestSize * kGuestSize) {
+          ++link_full;
+        }
+      }
+      if (link_full != translated.guest_declared.size()) {
+        guest_draw_failed = 1;
+      }
+    }
     if (guest_draws == 0) {
       guest_draw_failed = 1;
     }
 #endif
 #endif
-    if (tiling_failed != 0 || guest_draw_failed != 0) {
+    if (tiling_failed != 0 || guest_draw_failed != 0 || semantic_failed != 0) {
       return 1;
     }
     return 0;
