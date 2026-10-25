@@ -596,8 +596,19 @@ shader texcoord0 moves interpolator 0, and interpolator 1 moves only when
 color0 and color1 are filled together, to 16,64,255,255. The mask-63 shader
 leaves interpolators 0, 1, 2, and 4 unchanged (white, black, black, and
 255,0,0,0), and normal0 moves interpolator 5 to 64,0,0,0. One mask-3 shader
-keeps a constant 0,255,0,0 in interpolator 1. The sizes are still the HLSL
-layout, not the declaration the game binds, and EDRAM is still absent.
+keeps a constant 0,255,0,0 in interpolator 1. The draw writers
+`sub_821A0D18` and `sub_821A0E70` copy fixed packets. The declaration is bound
+by `sub_821A6050`, which stores the pointer at device+11820, and applied when
+`sub_821B6CE0` loads the shader through `sub_821B6018`. The object has a count
+at +24 and 12-byte elements at +52: uint16 stream at +0, uint16 byte offset at
++2, a format and swizzle dword at +4, usage at +9, usage index at +10. The
+match compares usage and usage index with the same bit fields as the `0x290`
+table. Stream 0 is fetch constant 95. The stride in dwords is the byte at
+device+12528 plus the stream index, written by `sub_821A47B0` as the byte
+stride shifted right by 2. The microcode offset field receives that byte
+offset shifted right by 2. The low 6 bits of the dword at +4 are inserted into
+vfetch word1 bits 16:21, and a swizzle permute rewrites that word afterwards.
+EDRAM is still absent.
 
 `GetTiledAddressLowerBound3D` masks Z with `~kTextureTileDepth` (`~4`) rather
 than `~(kTextureTileDepth - 1)`. On 300 of 600 tile corners, Z = 4 and
