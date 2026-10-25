@@ -803,7 +803,16 @@ Clearing only the depth-enable bit covers the same 321377 pixels, the first
 of them 1, 61, 21, 0, in 911 colors. Blend word 1 writes that alpha 0.
 Clearing the cull bits and leaving the depth test on still covers 0.
 Two other draws in the set carry a 16-wide DXT1 image. The guest fetch
-describes width in 32-texel units, so those two are not uploaded.
+describes width in 32-texel units, so those two are not uploaded. The empty
+depth buffer for greater and greater-equal is the far value of that compare,
+0. With that clear, the 71-vertex mesh keeps all 321377 pixels while the
+test and the write stay enabled. The first covered pixel is 1, 61, 21, 0,
+in 262 colors. Clearing the depth-enable bit still covers 321377 pixels, in
+911 colors, and clearing the cull bits while the test stays on also covers
+321377. A host triangle at window z 0 passes greater-equal against this
+clear and fails a strict greater compare. A texture narrower than 32 texels
+is uploaded with a fetch pitch of one 32-texel unit. The two 16-wide draws
+then run: fetch endian 2 covers 143 pixels on one and 2 pixels on the other.
 
 `GetTiledAddressLowerBound3D` masks Z with `~kTextureTileDepth` (`~4`) rather
 than `~(kTextureTileDepth - 1)`. On 300 of 600 tile corners, Z = 4 and

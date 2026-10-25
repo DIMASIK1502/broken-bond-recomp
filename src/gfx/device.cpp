@@ -608,6 +608,16 @@ bool DecodeRaster(const Device::RasterState& raster, uint32_t width, DecodedRast
   return true;
 }
 
+// An empty depth buffer is the far value for the compare. Greater and
+// greater-equal keep the larger depth, so that far value is 0. Less and
+// less-equal keep the smaller depth, so it is 1.
+float DepthClear(VkCompareOp compare) {
+  if (compare == VK_COMPARE_OP_GREATER || compare == VK_COMPARE_OP_GREATER_OR_EQUAL) {
+    return 0.f;
+  }
+  return 1.f;
+}
+
 }  // namespace
 
 bool Device::DrawTexturedRgba8(const uint8_t* pixels, uint32_t width, uint32_t height,
@@ -1163,7 +1173,7 @@ bool Device::DrawTexturedRgba8(const uint8_t* pixels, uint32_t width, uint32_t h
   depth_attachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
   depth_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
   depth_attachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-  depth_attachment.clearValue.depthStencil.depth = 1.f;
+  depth_attachment.clearValue.depthStencil.depth = DepthClear(decoded.depth_op);
   VkRenderingInfo rendering{};
   rendering.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
   rendering.renderArea = {{0, 0}, {width, height}};
@@ -1332,8 +1342,8 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
   const bool custom_texture = texture_rgba != nullptr;
   const uint32_t tex_w = custom_texture ? texture_width : kTextureSize;
   const uint32_t tex_h = custom_texture ? texture_height : kTextureSize;
-  if (image_count != 0 && (tex_w == 0 || tex_h == 0 || (tex_w & 31u) != 0)) {
-    reason = "guest texture width is not a multiple of 32";
+  if (image_count != 0 && (tex_w == 0 || tex_h == 0)) {
+    reason = "guest texture is empty";
     return false;
   }
   const auto cleanup = [&]() {
@@ -1612,7 +1622,7 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
     }
     auto* memory = static_cast<uint32_t*>(memory_mapped);
     auto* fetch = static_cast<uint32_t*>(fetch_mapped);
-    if (custom_texture && tex_w >= 32u && (tex_w & 31u) == 0u && tex_h != 0u) {
+    if (custom_texture && tex_w != 0u && tex_h != 0u) {
       // The decoded image is linear RGBA8. Slot 0 and the other texture
       // fetches describe that image so an unnormalized fetch has its size.
       // A vertex fetch written below replaces any dword it shares.
@@ -1621,7 +1631,7 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
       image_fetch.clamp_x = rex::graphics::xenos::ClampMode::kClampToEdge;
       image_fetch.clamp_y = rex::graphics::xenos::ClampMode::kClampToEdge;
       image_fetch.clamp_z = rex::graphics::xenos::ClampMode::kClampToEdge;
-      image_fetch.pitch = tex_w >> 5;
+      image_fetch.pitch = (tex_w + 31u) >> 5;
       image_fetch.format = rex::graphics::xenos::TextureFormat::k_8_8_8_8;
       image_fetch.size_2d.width = tex_w - 1;
       image_fetch.size_2d.height = tex_h - 1;
@@ -2192,7 +2202,7 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
   depth_attachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
   depth_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
   depth_attachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-  depth_attachment.clearValue.depthStencil.depth = 1.f;
+  depth_attachment.clearValue.depthStencil.depth = DepthClear(decoded.depth_op);
   VkRenderingInfo render{VK_STRUCTURE_TYPE_RENDERING_INFO};
   render.renderArea.extent = {width, height};
   render.layerCount = 1;

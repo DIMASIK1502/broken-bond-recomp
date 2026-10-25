@@ -117,8 +117,9 @@ class Device {
   // streams, when guest_vertex is set, are the vertex fetches placed in shared
   // memory. Vertex float constants are a repeated identity matrix.
   // texture_rgba, when set, replaces the 32×32 pattern. It is tightly packed
-  // RGBA8 of texture_width by texture_height, and texture_width is a multiple
-  // of 32 so the fetch pitch can name it. vertex_constants and pixel_constants,
+  // RGBA8 of texture_width by texture_height. The fetch pitch is at least one
+  // 32-texel unit, so a width below 32 still names an image. vertex_constants
+  // and pixel_constants,
   // when set, are 256 float4s each and replace the identity and the constant
   // pattern.
   bool DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_t width,

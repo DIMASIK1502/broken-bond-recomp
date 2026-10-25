@@ -141,6 +141,24 @@ int main(int argc, char** argv) {
       depth_pass != linear) {
     return Fail(reason.empty() ? "depth less did not draw the image" : reason);
   }
+  depth.zfunc = rex::graphics::xenos::CompareFunction::kGreaterEqual;
+  state.depth_control = depth.value;
+  std::vector<uint8_t> depth_gequal;
+  if (!device.DrawTexturedRgba8(linear.data(), kPitch, kHeight, depth_gequal, reason, &state) ||
+      depth_gequal != linear) {
+    return Fail(reason.empty() ? "depth greater-equal did not draw the image" : reason);
+  }
+  depth.zfunc = rex::graphics::xenos::CompareFunction::kGreater;
+  state.depth_control = depth.value;
+  std::vector<uint8_t> depth_greater;
+  if (!device.DrawTexturedRgba8(linear.data(), kPitch, kHeight, depth_greater, reason, &state)) {
+    return Fail(reason);
+  }
+  for (uint8_t byte : depth_greater) {
+    if (byte != 0) {
+      return Fail("depth greater still drew the z = 0 triangle");
+    }
+  }
   depth.zfunc = rex::graphics::xenos::CompareFunction::kNever;
   state.depth_control = depth.value;
   std::vector<uint8_t> depth_fail;

@@ -2432,6 +2432,8 @@ int DrawMesh(const char* path) {
   const uint8_t* texture_rgba = rgba.empty() ? nullptr : rgba.data();
   const uint32_t texture_width = rgba.empty() ? 0u : texture_width_px;
   const uint32_t texture_height = rgba.empty() ? 0u : texture_height_px;
+  uint32_t best_endian = 1u;
+  uint32_t best_covered = 0u;
   auto draw_mesh = [&](uint32_t endian, const broken_bond::gfx::Device::RasterState* raster,
                        const char* label) {
     std::vector<uint8_t> padded;
@@ -2496,6 +2498,10 @@ int DrawMesh(const char* path) {
     }
     std::cout << "mesh " << label << " covered " << covered << " rgb " << colors.size() << " first "
               << first[0] << " " << first[1] << " " << first[2] << " " << first[3] << "\n";
+    if (raster == nullptr && label[0] == 'e' && covered >= best_covered) {
+      best_covered = covered;
+      best_endian = endian;
+    }
     if (label[0] == 'e' && texture_rgba != nullptr) {
       std::vector<uint8_t> plain;
       std::string plain_reason;
@@ -2528,14 +2534,15 @@ int DrawMesh(const char* path) {
   raster.clear_green = 0.f;
   raster.clear_blue = 1.f;
   raster.clear_alpha = 1.f;
-  std::cout << "mesh surface msaa " << ((draw.surface_info >> 16) & 3u) << "\n";
-  draw_mesh(1u, &raster, "raster");
+  std::cout << "mesh surface msaa " << ((draw.surface_info >> 16) & 3u) << " raster endian "
+            << best_endian << "\n";
+  draw_mesh(best_endian, &raster, "raster");
   broken_bond::gfx::Device::RasterState depth_off = raster;
   depth_off.depth_control &= ~2u;
-  draw_mesh(1u, &depth_off, "depth off");
+  draw_mesh(best_endian, &depth_off, "depth off");
   broken_bond::gfx::Device::RasterState cull_off = raster;
   cull_off.mode_cntl &= ~3u;
-  draw_mesh(1u, &cull_off, "cull off");
+  draw_mesh(best_endian, &cull_off, "cull off");
   std::cout << "mesh_draw_ok 1\n";
   return 0;
 }
