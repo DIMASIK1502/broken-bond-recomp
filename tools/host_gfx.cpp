@@ -79,5 +79,61 @@ int main() {
     return Fail("drawn image does not match the texture");
   }
   std::cout << "  draw_ok 1\n";
+
+  constexpr uint32_t kFetchWidth = 48;
+  constexpr uint32_t kFetchHeight = 32;
+  constexpr uint32_t kFetchPitch = 64;
+  constexpr uint32_t kEndian8in32 = 2;
+  std::vector<uint8_t> picture(static_cast<size_t>(kFetchWidth) * kFetchHeight * 4u);
+  for (uint32_t y = 0; y < kFetchHeight; ++y) {
+    for (uint32_t x = 0; x < kFetchWidth; ++x) {
+      uint8_t* pixel = picture.data() + (static_cast<size_t>(y) * kFetchWidth + x) * 4u;
+      pixel[0] = static_cast<uint8_t>(x + 1u);
+      pixel[1] = static_cast<uint8_t>(y + 3u);
+      pixel[2] = static_cast<uint8_t>(x + y);
+      pixel[3] = 255;
+    }
+  }
+  uint32_t fetch_words[6] = {};
+  if (!broken_bond::gfx::WriteRgba8Fetch(fetch_words, kFetchWidth, kFetchHeight, kFetchPitch, false,
+                                        kEndian8in32, reason)) {
+    return Fail(reason);
+  }
+  broken_bond::gfx::TextureFetch fetch;
+  if (!broken_bond::gfx::ReadTextureFetch(fetch_words, fetch, reason) || fetch.tiled ||
+      fetch.width != kFetchWidth || fetch.height != kFetchHeight || fetch.pitch != kFetchPitch ||
+      fetch.endian != kEndian8in32 || fetch.format != 6u) {
+    return Fail(reason.empty() ? "fetch constant fields did not round-trip" : reason);
+  }
+  std::vector<uint8_t> guest;
+  if (!broken_bond::gfx::StoreFetchRgba8(fetch_words, picture.data(), guest, reason)) {
+    return Fail(reason);
+  }
+  if (guest.size() < 4 || guest[0] != 255 || guest[1] != picture[2] || guest[2] != picture[1] ||
+      guest[3] != picture[0]) {
+    return Fail("linear fetch memory did not swap endian");
+  }
+  std::vector<uint8_t> restored;
+  if (!broken_bond::gfx::LoadFetchRgba8(fetch_words, guest.data(), guest.size(), restored, reason) ||
+      restored != picture) {
+    return Fail(reason.empty() ? "linear fetch did not restore the image" : reason);
+  }
+  std::cout << "  fetch_linear_ok 1\n";
+
+  if (!broken_bond::gfx::WriteRgba8Fetch(fetch_words, kFetchWidth, kFetchHeight, kFetchPitch, true,
+                                        kEndian8in32, reason)) {
+    return Fail(reason);
+  }
+  if (!broken_bond::gfx::StoreFetchRgba8(fetch_words, picture.data(), guest, reason) ||
+      !broken_bond::gfx::LoadFetchRgba8(fetch_words, guest.data(), guest.size(), restored, reason) ||
+      restored != picture) {
+    return Fail(reason.empty() ? "tiled fetch did not restore the image" : reason);
+  }
+  std::vector<uint8_t> fetch_drawn;
+  if (!device.DrawTexturedRgba8(restored.data(), kFetchWidth, kFetchHeight, fetch_drawn, reason) ||
+      fetch_drawn != picture) {
+    return Fail(reason.empty() ? "drawn fetch image does not match" : reason);
+  }
+  std::cout << "  fetch_draw_ok 1\n";
   return 0;
 }

@@ -661,7 +661,10 @@ its mask into device+24. `sub_821AE158` sends the low half of that qword
 through `sub_821B5D68`, which copies each dirty run of 24 bytes to
 `SHADER_CONSTANT_FETCH` at register `0x4800` plus 6 per slot. Bit 31 of that
 mask is slot 0, and `sub_825FABE0` binds that slot from its object. The host
-still does not sample the shadow.
+reads those six dwords for a 2D `k_8_8_8_8` image. A 48×32 picture with pitch
+64 and endian `k8in32` comes back unchanged from linear memory and from a
+tiled guest buffer, and the draw of that picture matches. The live device
+shadow is still not sampled.
 
 `GetTiledAddressLowerBound3D` masks Z with `~kTextureTileDepth` (`~4`) rather
 than `~(kTextureTileDepth - 1)`. On 300 of 600 tile corners, Z = 4 and
