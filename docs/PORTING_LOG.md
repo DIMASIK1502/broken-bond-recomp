@@ -857,6 +857,10 @@ A shader that fails to draw is remembered by its address, so the next
 present does not pack it again. After the cache is full the title stays
 at 30 Hz: about 900 draws in five seconds, 96 shaders, and one frame
 covers about 1800 pixels. The window is still the Xenos present.
+Vertex and uniform buffers stay allocated on the device. Ten draws per
+present still keep the title at 30 Hz: about 1500 draws in five seconds,
+96 shaders. One frame still covers on the order of 1300 to 1900 pixels.
+The window is still the Xenos present.
 
 `GetTiledAddressLowerBound3D` masks Z with `~kTextureTileDepth` (`~4`) rather
 than `~(kTextureTileDepth - 1)`. On 300 of 600 tile corners, Z = 4 and

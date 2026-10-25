@@ -10,6 +10,13 @@
 
 namespace broken_bond::gfx {
 
+namespace {
+
+struct DrawScratch;
+void DestroyDrawScratch(VkDevice device, DrawScratch*& scratch);
+
+}  // namespace
+
 extern const uint32_t kInterpolatorVertex[];
 extern const size_t kInterpolatorVertexWords;
 extern const uint32_t kPassFragment[];
@@ -31,6 +38,8 @@ struct Device::Vulkan {
   uint32_t frame_width = 0;
   uint32_t frame_height = 0;
   bool frame_restart = false;
+  // Vertex and uniform bytes stay mapped for the life of the device.
+  DrawScratch* scratch = nullptr;
 
   void ReleaseFrameImages() {
     if (device == VK_NULL_HANDLE) {
@@ -68,6 +77,7 @@ struct Device::Vulkan {
     if (device != VK_NULL_HANDLE) {
       vkDeviceWaitIdle(device);
       ReleaseFrameImages();
+      DestroyDrawScratch(device, scratch);
     }
     if (pool != VK_NULL_HANDLE) {
       vkDestroyCommandPool(device, pool, nullptr);
@@ -338,6 +348,128 @@ bool MakeBuffer(VkPhysicalDevice physical, VkDevice device, VkDeviceSize size,
     reason = "vkBindBufferMemory failed";
     return false;
   }
+  return true;
+}
+
+struct DrawScratch {
+  Buffer shared{};
+  Buffer constants[4]{};
+  Buffer vertex_floats{};
+  Buffer index_buffer{};
+  Buffer texture_upload{};
+  void* shared_map = nullptr;
+  void* constant_map[4]{};
+  void* vertex_map = nullptr;
+  void* index_map = nullptr;
+  void* upload_map = nullptr;
+  VkDeviceSize index_capacity = 0;
+  VkDeviceSize upload_capacity = 0;
+};
+
+void DestroyDrawScratch(VkDevice device, DrawScratch*& scratch) {
+  if (scratch == nullptr) {
+    return;
+  }
+  if (device != VK_NULL_HANDLE) {
+    if (scratch->shared_map != nullptr) {
+      vkUnmapMemory(device, scratch->shared.memory);
+    }
+    for (uint32_t i = 0; i < 4; ++i) {
+      if (scratch->constant_map[i] != nullptr) {
+        vkUnmapMemory(device, scratch->constants[i].memory);
+      }
+    }
+    if (scratch->vertex_map != nullptr) {
+      vkUnmapMemory(device, scratch->vertex_floats.memory);
+    }
+    if (scratch->index_map != nullptr) {
+      vkUnmapMemory(device, scratch->index_buffer.memory);
+    }
+    if (scratch->upload_map != nullptr) {
+      vkUnmapMemory(device, scratch->texture_upload.memory);
+    }
+    DestroyBuffer(device, scratch->texture_upload);
+    DestroyBuffer(device, scratch->index_buffer);
+    DestroyBuffer(device, scratch->vertex_floats);
+    for (Buffer& constant : scratch->constants) {
+      DestroyBuffer(device, constant);
+    }
+    DestroyBuffer(device, scratch->shared);
+  }
+  delete scratch;
+  scratch = nullptr;
+}
+
+bool MapScratch(VkDevice device, Buffer& buffer, VkDeviceSize bytes, void*& mapped,
+                std::string& reason) {
+  if (vkMapMemory(device, buffer.memory, 0, bytes, 0, &mapped) != VK_SUCCESS || mapped == nullptr) {
+    reason = "guest scratch map failed";
+    return false;
+  }
+  std::memset(mapped, 0, size_t(bytes));
+  return true;
+}
+
+bool EnsureDrawScratch(VkPhysicalDevice physical, VkDevice device, DrawScratch*& scratch,
+                       std::string& reason) {
+  if (scratch != nullptr && scratch->shared.buffer != VK_NULL_HANDLE) {
+    return true;
+  }
+  if (scratch == nullptr) {
+    scratch = new DrawScratch;
+  }
+  constexpr VkDeviceSize kUniformBytes = 65536;
+  constexpr VkDeviceSize kVertexBytes = (8u << 20) + 4096u;
+  constexpr VkMemoryPropertyFlags kHost =
+      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+  if (!MakeBuffer(physical, device, kVertexBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, kHost,
+                  scratch->shared, reason) ||
+      !MakeBuffer(physical, device, kUniformBytes, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, kHost,
+                  scratch->constants[0], reason) ||
+      !MakeBuffer(physical, device, kUniformBytes, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, kHost,
+                  scratch->constants[1], reason) ||
+      !MakeBuffer(physical, device, kUniformBytes, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, kHost,
+                  scratch->constants[2], reason) ||
+      !MakeBuffer(physical, device, kUniformBytes, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, kHost,
+                  scratch->constants[3], reason) ||
+      !MakeBuffer(physical, device, kUniformBytes, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, kHost,
+                  scratch->vertex_floats, reason) ||
+      !MapScratch(device, scratch->shared, kVertexBytes, scratch->shared_map, reason) ||
+      !MapScratch(device, scratch->constants[0], kUniformBytes, scratch->constant_map[0], reason) ||
+      !MapScratch(device, scratch->constants[1], kUniformBytes, scratch->constant_map[1], reason) ||
+      !MapScratch(device, scratch->constants[2], kUniformBytes, scratch->constant_map[2], reason) ||
+      !MapScratch(device, scratch->constants[3], kUniformBytes, scratch->constant_map[3], reason) ||
+      !MapScratch(device, scratch->vertex_floats, kUniformBytes, scratch->vertex_map, reason)) {
+    DestroyDrawScratch(device, scratch);
+    return false;
+  }
+  return true;
+}
+
+bool EnsureScratchBytes(VkPhysicalDevice physical, VkDevice device, Buffer& buffer, void*& mapped,
+                        VkDeviceSize& capacity, VkDeviceSize bytes, VkBufferUsageFlags usage,
+                        std::string& reason) {
+  if (buffer.buffer != VK_NULL_HANDLE && mapped != nullptr && capacity >= bytes) {
+    return true;
+  }
+  if (mapped != nullptr) {
+    vkUnmapMemory(device, buffer.memory);
+    mapped = nullptr;
+  }
+  DestroyBuffer(device, buffer);
+  capacity = 0;
+  const VkDeviceSize size = bytes < 4096u ? 4096u : bytes;
+  constexpr VkMemoryPropertyFlags kHost =
+      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+  if (!MakeBuffer(physical, device, size, usage, kHost, buffer, reason)) {
+    return false;
+  }
+  if (vkMapMemory(device, buffer.memory, 0, size, 0, &mapped) != VK_SUCCESS || mapped == nullptr) {
+    reason = "guest scratch map failed";
+    DestroyBuffer(device, buffer);
+    return false;
+  }
+  capacity = size;
   return true;
 }
 
@@ -1374,10 +1506,6 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
   VkPipeline pipeline = VK_NULL_HANDLE;
   VkDescriptorPool pool = VK_NULL_HANDLE;
   VkDescriptorSet sets[4] = {};
-  Buffer shared{};
-  Buffer constants[4]{};
-  Buffer vertex_floats{};
-  Buffer index_buffer{};
   uint32_t draw_indices = 0;
   const uint16_t* draw_index_values = nullptr;
   Image target{};
@@ -1387,7 +1515,6 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
   Image texture{};
   VkImageView texture_view = VK_NULL_HANDLE;
   VkSampler sampler = VK_NULL_HANDLE;
-  Buffer texture_upload{};
   Buffer readback{};
   VkCommandBuffer command = VK_NULL_HANDLE;
   const bool retain_frame = fixed_state != nullptr && fixed_state->retain_frame;
@@ -1411,7 +1538,6 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
       vkFreeCommandBuffers(device, vulkan_->pool, 1, &command);
     }
     DestroyBuffer(device, readback);
-    DestroyBuffer(device, texture_upload);
     if (sampler != VK_NULL_HANDLE) {
       vkDestroySampler(device, sampler, nullptr);
     }
@@ -1429,12 +1555,6 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
       DestroyImage(device, depth);
       DestroyImage(device, target);
     }
-    for (Buffer& constant : constants) {
-      DestroyBuffer(device, constant);
-    }
-    DestroyBuffer(device, vertex_floats);
-    DestroyBuffer(device, index_buffer);
-    DestroyBuffer(device, shared);
     if (pipeline != VK_NULL_HANDLE) {
       vkDestroyPipeline(device, pipeline, nullptr);
     }
@@ -1566,97 +1686,81 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
 
   constexpr VkDeviceSize kUniformBytes = 65536;
   // The shared buffer holds the vertex stream. Uniform buffers stay inside
-  // the 64 KB limit reported by the device.
+  // the 64 KB limit reported by the device. Both stay mapped on the device.
   constexpr VkDeviceSize kVertexBytes = (8u << 20) + 4096u;
   constexpr VkMemoryPropertyFlags kHost =
       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-  if (!MakeBuffer(vulkan_->physical, device, kVertexBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                  kHost, shared, reason) ||
-      !MakeBuffer(vulkan_->physical, device, kUniformBytes, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-                  kHost, constants[0], reason) ||
-      !MakeBuffer(vulkan_->physical, device, kUniformBytes, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-                  kHost, constants[1], reason) ||
-      !MakeBuffer(vulkan_->physical, device, kUniformBytes, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-                  kHost, constants[2], reason) ||
-      !MakeBuffer(vulkan_->physical, device, kUniformBytes, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-                  kHost, constants[3], reason)) {
+  if (!EnsureDrawScratch(vulkan_->physical, device, vulkan_->scratch, reason)) {
     cleanup();
     return false;
   }
-  for (Buffer* buffer : {&shared, &constants[0], &constants[1], &constants[2], &constants[3]}) {
-    const VkDeviceSize bytes = buffer == &shared ? kVertexBytes : kUniformBytes;
-    void* mapped = nullptr;
-    if (vkMapMemory(device, buffer->memory, 0, bytes, 0, &mapped) != VK_SUCCESS) {
-      reason = "guest constant map failed";
-      cleanup();
-      return false;
+  DrawScratch& scratch = *vulkan_->scratch;
+  Buffer& shared = scratch.shared;
+  Buffer (&constants)[4] = scratch.constants;
+  Buffer& vertex_floats = scratch.vertex_floats;
+  Buffer& index_buffer = scratch.index_buffer;
+  Buffer& texture_upload = scratch.texture_upload;
+  // Shaders keep temporary values in this shared buffer. Clear it, and the
+  // uniform ranges, so one draw cannot see the previous draw's values.
+  std::memset(scratch.shared_map, 0, size_t(kVertexBytes));
+  std::memset(scratch.constant_map[0], 0, size_t(kUniformBytes));
+  std::memset(scratch.constant_map[1], 0, size_t(kUniformBytes));
+  std::memset(scratch.constant_map[2], 0, size_t(kUniformBytes));
+  std::memset(scratch.constant_map[3], 0, size_t(kUniformBytes));
+  std::memset(scratch.vertex_map, 0, size_t(kUniformBytes));
+  {
+    // Alpha test function 7 is "always". Bit 10 keeps the vertex shader's W
+    // instead of treating it as 1/W. The host NDC scale is 1 so a clip-space
+    // triangle is not multiplied by zero. vertex_index_max (byte 500) must
+    // be above the vertex ids or every fetch index is clamped to 0.
+    auto* system = static_cast<uint8_t*>(scratch.constant_map[0]);
+    const uint32_t alpha_test_always = (7u << 16) | (1u << 10);
+    std::memcpy(system, &alpha_test_always, sizeof(alpha_test_always));
+    const float ndc_scale[3] = {1.f, 1.f, 1.f};
+    std::memcpy(system + 124, ndc_scale, sizeof(ndc_scale));
+    const uint32_t vertex_index_max = 0x00FFFFFFu;
+    std::memcpy(system + 500, &vertex_index_max, sizeof(vertex_index_max));
+    const uint32_t swizzle = 0x688u | (0x688u << 12);
+    for (uint32_t i = 0; i < 16; ++i) {
+      std::memcpy(system + 208 + i * sizeof(uint32_t), &swizzle, sizeof(swizzle));
     }
-    std::memset(mapped, 0, size_t(bytes));
-    if (buffer == &constants[0]) {
-      // Alpha test function 7 is "always". color_exp_bias stays at 1 so the
-      // shader's own color is what gets stored. Swizzle RGBA for every fetch.
-      auto* system = static_cast<uint8_t*>(mapped);
-      // Alpha test function 7 is "always". Bit 10 keeps the vertex shader's W
-      // instead of treating it as 1/W. The host NDC scale is 1 so a clip-space
-      // triangle is not multiplied by zero. vertex_index_max (byte 500) must
-      // be above the vertex ids or every fetch index is clamped to 0.
-      const uint32_t alpha_test_always = (7u << 16) | (1u << 10);
-      std::memcpy(system, &alpha_test_always, sizeof(alpha_test_always));
-      const float ndc_scale[3] = {1.f, 1.f, 1.f};
-      std::memcpy(system + 124, ndc_scale, sizeof(ndc_scale));
-      const uint32_t vertex_index_max = 0x00FFFFFFu;
-      std::memcpy(system + 500, &vertex_index_max, sizeof(vertex_index_max));
-      const uint32_t swizzle = 0x688u | (0x688u << 12);
-      for (uint32_t i = 0; i < 16; ++i) {
-        std::memcpy(system + 208 + i * sizeof(uint32_t), &swizzle, sizeof(swizzle));
-      }
-      const float color_scale[4] = {1.f, 1.f, 1.f, 1.f};
-      std::memcpy(system + 288, color_scale, sizeof(color_scale));
-    } else if (buffer == &constants[1]) {
-      auto* values = static_cast<float*>(mapped);
-      if (pixel_constants != nullptr) {
-        std::memcpy(values, pixel_constants, 256u * 4u * sizeof(float));
-      } else {
-        const float pattern[4] = {1.f, 0.5f, 0.25f, 1.f};
-        for (uint32_t i = 0; i < 256 * 4; ++i) {
-          values[i] = pattern[i & 3];
-        }
-      }
-    } else if (buffer == &constants[3] && !guest_vertex) {
-      rex::graphics::xenos::xe_gpu_texture_fetch_t fetch{};
-      fetch.type = rex::graphics::xenos::FetchConstantType::kTexture;
-      fetch.clamp_x = rex::graphics::xenos::ClampMode::kClampToEdge;
-      fetch.clamp_y = rex::graphics::xenos::ClampMode::kClampToEdge;
-      fetch.clamp_z = rex::graphics::xenos::ClampMode::kClampToEdge;
-      fetch.pitch = tex_w >> 5;
-      fetch.format = rex::graphics::xenos::TextureFormat::k_8_8_8_8;
-      fetch.size_2d.width = tex_w - 1;
-      fetch.size_2d.height = tex_h - 1;
-      fetch.swizzle = rex::graphics::xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA;
-      fetch.mag_filter = rex::graphics::xenos::TextureFilter::kPoint;
-      fetch.min_filter = rex::graphics::xenos::TextureFilter::kPoint;
-      fetch.mip_filter = rex::graphics::xenos::TextureFilter::kBaseMap;
-      fetch.dimension = rex::graphics::xenos::DataDimension::k2DOrStacked;
-      auto* words_out = static_cast<rex::graphics::xenos::xe_gpu_texture_fetch_t*>(mapped);
-      for (uint32_t i = 0; i < 32; ++i) {
-        words_out[i] = fetch;
+    const float color_scale[4] = {1.f, 1.f, 1.f, 1.f};
+    std::memcpy(system + 288, color_scale, sizeof(color_scale));
+  }
+  {
+    auto* values = static_cast<float*>(scratch.constant_map[1]);
+    if (pixel_constants != nullptr) {
+      std::memcpy(values, pixel_constants, 256u * 4u * sizeof(float));
+    } else {
+      const float pattern[4] = {1.f, 0.5f, 0.25f, 1.f};
+      for (uint32_t i = 0; i < 256 * 4; ++i) {
+        values[i] = pattern[i & 3];
       }
     }
-    vkUnmapMemory(device, buffer->memory);
+  }
+  if (!guest_vertex) {
+    rex::graphics::xenos::xe_gpu_texture_fetch_t fetch{};
+    fetch.type = rex::graphics::xenos::FetchConstantType::kTexture;
+    fetch.clamp_x = rex::graphics::xenos::ClampMode::kClampToEdge;
+    fetch.clamp_y = rex::graphics::xenos::ClampMode::kClampToEdge;
+    fetch.clamp_z = rex::graphics::xenos::ClampMode::kClampToEdge;
+    fetch.pitch = tex_w >> 5;
+    fetch.format = rex::graphics::xenos::TextureFormat::k_8_8_8_8;
+    fetch.size_2d.width = tex_w - 1;
+    fetch.size_2d.height = tex_h - 1;
+    fetch.swizzle = rex::graphics::xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA;
+    fetch.mag_filter = rex::graphics::xenos::TextureFilter::kPoint;
+    fetch.min_filter = rex::graphics::xenos::TextureFilter::kPoint;
+    fetch.mip_filter = rex::graphics::xenos::TextureFilter::kBaseMap;
+    fetch.dimension = rex::graphics::xenos::DataDimension::k2DOrStacked;
+    auto* words_out =
+        static_cast<rex::graphics::xenos::xe_gpu_texture_fetch_t*>(scratch.constant_map[3]);
+    for (uint32_t i = 0; i < 32; ++i) {
+      words_out[i] = fetch;
+    }
   }
   if (guest_vertex) {
-    if (!MakeBuffer(vulkan_->physical, device, kUniformBytes, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-                    kHost, vertex_floats, reason)) {
-      cleanup();
-      return false;
-    }
-    void* mapped = nullptr;
-    if (vkMapMemory(device, vertex_floats.memory, 0, kUniformBytes, 0, &mapped) != VK_SUCCESS) {
-      reason = "guest vertex constant map failed";
-      cleanup();
-      return false;
-    }
-    auto* values = static_cast<float*>(mapped);
+    auto* values = static_cast<float*>(scratch.vertex_map);
     if (vertex_constants != nullptr) {
       std::memcpy(values, vertex_constants, 256u * 4u * sizeof(float));
     } else {
@@ -1667,23 +1771,11 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
         values[reg * 4 + 3] = (reg % 4) == 3 ? 1.f : 0.f;
       }
     }
-    vkUnmapMemory(device, vertex_floats.memory);
   }
   uint32_t guest_vertices = 3;
   if (guest_vertex && streams != nullptr && stream_count != 0) {
-    void* memory_mapped = nullptr;
-    void* fetch_mapped = nullptr;
-    if (vkMapMemory(device, shared.memory, 0, kVertexBytes, 0, &memory_mapped) != VK_SUCCESS ||
-        vkMapMemory(device, constants[3].memory, 0, kUniformBytes, 0, &fetch_mapped) != VK_SUCCESS) {
-      reason = "guest vertex memory map failed";
-      if (memory_mapped != nullptr) {
-        vkUnmapMemory(device, shared.memory);
-      }
-      cleanup();
-      return false;
-    }
-    auto* memory = static_cast<uint32_t*>(memory_mapped);
-    auto* fetch = static_cast<uint32_t*>(fetch_mapped);
+    auto* memory = static_cast<uint32_t*>(scratch.shared_map);
+    auto* fetch = static_cast<uint32_t*>(scratch.constant_map[3]);
     if (custom_texture && tex_w != 0u && tex_h != 0u) {
       // The decoded image is linear RGBA8. Slot 0 and the other texture
       // fetches describe that image so an unnormalized fetch has its size.
@@ -1735,8 +1827,6 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
         if (stride_bytes == 0 || stream.byte_count < stride_bytes * 3u ||
             stream.byte_count % stride_bytes != 0 || cursor + stream.byte_count / 4u > kDwords) {
           reason = "vertex stream does not fit the draw";
-          vkUnmapMemory(device, constants[3].memory);
-          vkUnmapMemory(device, shared.memory);
           cleanup();
           return false;
         }
@@ -1785,23 +1875,15 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
       }
       cursor += stride * 3;
     }
-    vkUnmapMemory(device, constants[3].memory);
-    vkUnmapMemory(device, shared.memory);
     if (draw_indices != 0) {
-      if (!MakeBuffer(vulkan_->physical, device, VkDeviceSize(draw_indices) * sizeof(uint16_t),
-                      VK_BUFFER_USAGE_INDEX_BUFFER_BIT, kHost, index_buffer, reason)) {
+      const VkDeviceSize index_bytes = VkDeviceSize(draw_indices) * sizeof(uint16_t);
+      if (!EnsureScratchBytes(vulkan_->physical, device, index_buffer, scratch.index_map,
+                              scratch.index_capacity, index_bytes, VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                              reason)) {
         cleanup();
         return false;
       }
-      void* index_mapped = nullptr;
-      if (vkMapMemory(device, index_buffer.memory, 0, VkDeviceSize(draw_indices) * sizeof(uint16_t),
-                      0, &index_mapped) != VK_SUCCESS) {
-        reason = "guest index map failed";
-        cleanup();
-        return false;
-      }
-      std::memcpy(index_mapped, draw_index_values, size_t(draw_indices) * sizeof(uint16_t));
-      vkUnmapMemory(device, index_buffer.memory);
+      std::memcpy(scratch.index_map, draw_index_values, size_t(index_bytes));
     }
   }
 
@@ -1827,19 +1909,13 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
         }
       }
     }
-    if (!MakeBuffer(vulkan_->physical, device, pixels.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                    kHost, texture_upload, reason)) {
+    if (!EnsureScratchBytes(vulkan_->physical, device, texture_upload, scratch.upload_map,
+                            scratch.upload_capacity, pixels.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                            reason)) {
       cleanup();
       return false;
     }
-    void* upload = nullptr;
-    if (vkMapMemory(device, texture_upload.memory, 0, pixels.size(), 0, &upload) != VK_SUCCESS) {
-      reason = "guest texture upload failed";
-      cleanup();
-      return false;
-    }
-    std::memcpy(upload, pixels.data(), pixels.size());
-    vkUnmapMemory(device, texture_upload.memory);
+    std::memcpy(scratch.upload_map, pixels.data(), pixels.size());
 
     VkImageCreateInfo texture_info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     texture_info.imageType = VK_IMAGE_TYPE_2D;
