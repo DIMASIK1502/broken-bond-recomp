@@ -31,6 +31,17 @@ bool LoadByte(const uint8_t* guest, size_t guest_bytes, uint32_t address, uint32
   return true;
 }
 
+bool LoadBe16(const uint8_t* guest, size_t guest_bytes, uint32_t address, uint32_t& out,
+              std::string& reason) {
+  const uint32_t physical = address & kPhysicalMask;
+  if (guest == nullptr || static_cast<uint64_t>(physical) + 2u > guest_bytes) {
+    reason = "declaration halfword is outside guest memory";
+    return false;
+  }
+  out = (uint32_t(guest[physical]) << 8) | uint32_t(guest[physical + 1]);
+  return true;
+}
+
 }  // namespace
 
 bool ReadDeviceDraw(const uint8_t* guest, size_t guest_bytes, uint32_t device, DeviceDraw& out,
@@ -61,6 +72,60 @@ bool ReadDeviceDraw(const uint8_t* guest, size_t guest_bytes, uint32_t device, D
     return false;
   }
   stream.assign(guest + physical, guest + physical + out.stream_bytes);
+  return true;
+}
+
+bool ReadDeviceDeclaration(const uint8_t* guest, size_t guest_bytes, uint32_t device,
+                           std::vector<VertexElement>& elements, std::string& reason) {
+  uint32_t declaration = 0;
+  if (!LoadBe(guest, guest_bytes, device + 11820u, declaration, reason)) {
+    return false;
+  }
+  elements.clear();
+  if (declaration == 0) {
+    return true;
+  }
+  uint32_t count = 0;
+  if (!LoadBe(guest, guest_bytes, declaration + 24u, count, reason)) {
+    return false;
+  }
+  if (count > 32u) {
+    reason = "vertex declaration has more than 32 elements";
+    return false;
+  }
+  elements.reserve(count);
+  for (uint32_t i = 0; i < count; ++i) {
+    const uint32_t element = declaration + 52u + i * 12u;
+    uint32_t stream = 0;
+    uint32_t byte_offset = 0;
+    uint32_t format = 0;
+    uint32_t usage = 0;
+    uint32_t usage_index = 0;
+    uint32_t stride = 0;
+    if (!LoadBe16(guest, guest_bytes, element, stream, reason) ||
+        !LoadBe16(guest, guest_bytes, element + 2u, byte_offset, reason) ||
+        !LoadBe(guest, guest_bytes, element + 4u, format, reason) ||
+        !LoadByte(guest, guest_bytes, element + 9u, usage, reason) ||
+        !LoadByte(guest, guest_bytes, element + 10u, usage_index, reason)) {
+      return false;
+    }
+    if (stream > 95u) {
+      reason = "vertex declaration stream is above fetch constant 0";
+      return false;
+    }
+    if (!LoadByte(guest, guest_bytes, device + 12528u + stream, stride, reason)) {
+      return false;
+    }
+    VertexElement out;
+    out.usage = usage;
+    out.usage_index = usage_index;
+    out.format = format & 0x3Fu;
+    out.offset_words = static_cast<int32_t>(byte_offset >> 2);
+    out.stride_words = stride;
+    out.signed_components = (format & 0x100u) != 0;
+    out.integer_components = (format & 0x200u) != 0;
+    elements.push_back(out);
+  }
   return true;
 }
 

@@ -7,6 +7,8 @@
 #include <string>
 #include <vector>
 
+#include "gfx/vertex_semantic.h"
+
 namespace broken_bond::gfx {
 
 struct DeviceDraw {
@@ -28,5 +30,12 @@ struct DeviceDraw {
 // device+1912: the packed address, then the byte count.
 bool ReadDeviceDraw(const uint8_t* guest, size_t guest_bytes, uint32_t device, DeviceDraw& out,
                     std::vector<uint8_t>& stream, std::string& reason);
+
+// The declaration pointer is the dword at device+11820. A zero pointer yields
+// no elements. Count is the dword at object+24. Element i is 12 bytes at
+// object+52. offset_words is the byte offset shifted right by 2, and
+// stride_words is the byte at device+12528 plus the element's stream.
+bool ReadDeviceDeclaration(const uint8_t* guest, size_t guest_bytes, uint32_t device,
+                           std::vector<VertexElement>& elements, std::string& reason);
 
 }  // namespace broken_bond::gfx

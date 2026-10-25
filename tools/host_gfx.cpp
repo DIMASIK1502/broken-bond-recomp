@@ -429,5 +429,40 @@ int main() {
     }
   }
   std::cout << "  device_draw_ok 1\n";
+
+  auto store_be16 = [](std::vector<uint8_t>& memory, uint32_t address, uint16_t value) {
+    uint8_t* slot = memory.data() + (address & 0x1FFFFFFFu);
+    slot[0] = static_cast<uint8_t>(value >> 8);
+    slot[1] = static_cast<uint8_t>(value);
+  };
+  std::vector<uint8_t> decl_guest(0xC000, 0);
+  constexpr uint32_t kDeclDevice = 0xC0008000u;
+  constexpr uint32_t kDecl = 0xC0001000u;
+  store_be(decl_guest, kDeclDevice + 11820u, kDecl);
+  store_be(decl_guest, kDecl + 24u, 2u);
+  store_be16(decl_guest, kDecl + 52u, 0);
+  store_be16(decl_guest, kDecl + 54u, 0);
+  store_be(decl_guest, kDecl + 56u, 0x31Au);
+  decl_guest[(kDecl + 61u) & 0x1FFFFFFFu] = 0;
+  decl_guest[(kDecl + 62u) & 0x1FFFFFFFu] = 0;
+  store_be16(decl_guest, kDecl + 64u, 1);
+  store_be16(decl_guest, kDecl + 66u, 8);
+  store_be(decl_guest, kDecl + 68u, 6u);
+  decl_guest[(kDecl + 73u) & 0x1FFFFFFFu] = 5;
+  decl_guest[(kDecl + 74u) & 0x1FFFFFFFu] = 1;
+  decl_guest[(kDeclDevice + 12528u) & 0x1FFFFFFFu] = 5;
+  decl_guest[(kDeclDevice + 12529u) & 0x1FFFFFFFu] = 4;
+  std::vector<broken_bond::gfx::VertexElement> elements;
+  if (!broken_bond::gfx::ReadDeviceDeclaration(decl_guest.data(), decl_guest.size(), kDeclDevice,
+                                               elements, reason) ||
+      elements.size() != 2u || elements[0].format != 26u || elements[0].offset_words != 0 ||
+      elements[0].stride_words != 5u || !elements[0].signed_components ||
+      !elements[0].integer_components || elements[0].usage != 0u || elements[0].usage_index != 0u ||
+      elements[1].format != 6u || elements[1].offset_words != 2 || elements[1].stride_words != 4u ||
+      elements[1].signed_components || elements[1].integer_components || elements[1].usage != 5u ||
+      elements[1].usage_index != 1u) {
+    return Fail(reason.empty() ? "vertex declaration did not match the shadow" : reason);
+  }
+  std::cout << "  declaration_ok 1\n";
   return 0;
 }

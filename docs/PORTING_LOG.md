@@ -703,7 +703,15 @@ shader pointer is at device+12696, the pixel shader at device+12692,
 `RB_BLENDCONTROL0` at device+10552, and `PA_SU_SC_MODE_CNTL` at
 device+10568. A packed address of `0x4000` and a count of 8 come back as
 `0xC0004000` and those 8 bytes, with stride 2. This reads a guest image of
-the shadow, not the live device.
+the shadow, not the live device. The declaration pointer is the dword at
+device+11820. Its count is the dword at +24, and element `i` is 12 bytes at
++52: a big-endian stream and byte offset, then the format dword. Bits 0:5 of
+that dword are the vertex format, bit 8 is signed, and bit 9 is integer.
+Usage is the byte at +9 and the usage index is the byte at +10. The dword
+offset written into vfetch is the byte offset shifted right by 2, and the
+stride comes from the byte at device+12528 plus the stream. Two elements
+come back as format 26 at dword 0 with stride 5, signed and integer, and
+format 6 at dword 2 with stride 4.
 
 `GetTiledAddressLowerBound3D` masks Z with `~kTextureTileDepth` (`~4`) rather
 than `~(kTextureTileDepth - 1)`. On 300 of 600 tile corners, Z = 4 and
