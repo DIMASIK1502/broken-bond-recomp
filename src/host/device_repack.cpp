@@ -3,6 +3,8 @@
 #include <cstring>
 #include <fstream>
 
+#include <rex/graphics/xenos.h>
+
 namespace broken_bond::host {
 namespace {
 
@@ -16,6 +18,52 @@ constexpr uint32_t kPsBytes = 0x200u;
 constexpr uint32_t kPayloadAt = 0x6000u;
 constexpr uint32_t kMaxBlob = 1u << 20;
 constexpr uint32_t kMaxStream = 8u << 20;
+constexpr uint32_t kMaxTexture = 1u << 20;
+
+struct LevelLayout {
+  uint32_t block = 1;
+  uint32_t bytes_per_block = 4;
+  uint32_t log2 = 2;
+};
+
+bool LevelLayoutFor(uint32_t format, LevelLayout& out) {
+  if (format == static_cast<uint32_t>(rex::graphics::xenos::TextureFormat::k_8_8_8_8)) {
+    out = {1u, 4u, 2u};
+    return true;
+  }
+  if (format == static_cast<uint32_t>(rex::graphics::xenos::TextureFormat::k_DXT1)) {
+    out = {4u, 8u, 3u};
+    return true;
+  }
+  return false;
+}
+
+// Same 2D address as rex::graphics::texture_util::GetTiledOffset2D. The game
+// does not link the host texture library, so the copy length lives here.
+int32_t TiledOffset2D(int32_t x, int32_t y, uint32_t pitch, uint32_t bytes_per_block_log2) {
+  const int32_t macro =
+      ((x >> 5) + (y >> 5) * int32_t(pitch >> 5)) << (int32_t(bytes_per_block_log2) + 7);
+  const int32_t micro = ((x & 7) + ((y & 0xE) << 2)) << int32_t(bytes_per_block_log2);
+  const int32_t offset = macro + ((micro & ~0xF) << 1) + (micro & 0xF) + ((y & 1) << 4);
+  return ((offset & ~0x1FF) << 3) + ((y & 16) << 7) + ((offset & 0x1C0) << 2) +
+         (((((y & 8) >> 2) + (x >> 3)) & 3) << 6) + (offset & 0x3F);
+}
+
+uint32_t TiledBound2D(uint32_t right, uint32_t bottom, uint32_t pitch, uint32_t log2) {
+  if (right == 0 || bottom == 0) {
+    return 0;
+  }
+  uint32_t upper = static_cast<uint32_t>(TiledOffset2D(int32_t((right - 1u) & ~31u),
+                                                       int32_t((bottom - 1u) & ~31u), pitch, log2));
+  if (log2 == 0) {
+    upper += 0xA00u;
+  } else if (log2 == 1) {
+    upper += 0xC00u;
+  } else {
+    upper += 0x400u << log2;
+  }
+  return upper;
+}
 
 bool ReadExact(const GuestBytes& live, uint32_t address, void* dst, size_t bytes,
                std::string& reason) {
@@ -82,6 +130,73 @@ bool Microcode(const GuestBytes& live, uint32_t shader, uint32_t base_at, uint32
 }
 
 }  // namespace
+
+uint32_t TextureCopyBytes(uint32_t format, uint32_t width, uint32_t height, uint32_t pitch,
+                          bool tiled) {
+  LevelLayout level;
+  if (!LevelLayoutFor(format, level) || width == 0 || height == 0 || pitch < width ||
+      (pitch % level.block) != 0) {
+    return 0;
+  }
+  const uint32_t pitch_blocks = pitch / level.block;
+  const uint32_t y_blocks = (height + level.block - 1u) / level.block;
+  const uint32_t x_blocks = (width + level.block - 1u) / level.block;
+  if (!tiled) {
+    const uint64_t bytes = uint64_t(pitch_blocks) * y_blocks * level.bytes_per_block;
+    return bytes > 0xFFFFFFFFull ? 0u : static_cast<uint32_t>(bytes);
+  }
+  const uint64_t bytes =
+      uint64_t(TiledBound2D(x_blocks, y_blocks, pitch_blocks, level.log2)) + level.bytes_per_block;
+  return bytes > 0xFFFFFFFFull ? 0u : static_cast<uint32_t>(bytes);
+}
+
+struct SlotTexture {
+  uint32_t guest = 0;
+  uint32_t bytes = 0;
+  uint32_t format = 0;
+  uint32_t width = 0;
+  uint32_t height = 0;
+  uint32_t pitch = 0;
+  uint32_t endian = 0;
+  uint32_t tiled = 0;
+};
+
+bool DescribeSlot0(const GuestBytes& live, uint32_t device, SlotTexture& out, std::string& reason) {
+  out = {};
+  uint32_t words[6] = {};
+  for (uint32_t i = 0; i < 6u; ++i) {
+    if (!LoadBe(live, device + 1152u + i * 4u, words[i], reason)) {
+      return false;
+    }
+  }
+  rex::graphics::xenos::xe_gpu_texture_fetch_t fetch{};
+  std::memcpy(&fetch, words, sizeof(fetch));
+  if (fetch.type != rex::graphics::xenos::FetchConstantType::kTexture) {
+    return true;
+  }
+  if (fetch.dimension != rex::graphics::xenos::DataDimension::k2DOrStacked) {
+    reason = "texture is not 2D";
+    return false;
+  }
+  out.format = static_cast<uint32_t>(fetch.format);
+  out.endian = static_cast<uint32_t>(fetch.endianness);
+  out.tiled = fetch.tiled != 0 ? 1u : 0u;
+  out.pitch = fetch.pitch << 5;
+  out.width = fetch.size_2d.width + 1;
+  out.height = fetch.size_2d.height + 1;
+  out.bytes = TextureCopyBytes(out.format, out.width, out.height, out.pitch, out.tiled != 0);
+  if (out.bytes == 0 || out.bytes > kMaxTexture) {
+    reason = "texture is " + std::to_string(out.bytes) + " bytes";
+    return false;
+  }
+  const uint64_t guest = (uint64_t(fetch.base_address) << 12) + 0xC0000000ull;
+  if (guest > 0xFFFFFFFFull) {
+    reason = "texture is outside guest memory";
+    return false;
+  }
+  out.guest = static_cast<uint32_t>(guest);
+  return true;
+}
 
 bool RepackDeviceDraw(const GuestBytes& live, uint32_t device, std::vector<uint8_t>& image,
                       uint32_t& image_device, std::string& reason, const DrawSpan& span) {
@@ -164,11 +279,17 @@ bool RepackDeviceDraw(const GuestBytes& live, uint32_t device, std::vector<uint8
     return false;
   }
 
+  SlotTexture texture;
+  if (!DescribeSlot0(live, device, texture, reason)) {
+    return false;
+  }
   const uint32_t decl_bytes = declaration == 0 ? 0u : 52u + decl_count * 12u;
   const uint32_t pixel_ucode_at = (kPayloadAt + vertex_ucode_bytes + 15u) & ~15u;
   const uint32_t stream_at = (pixel_ucode_at + pixel_ucode_bytes + 15u) & ~15u;
   const uint32_t index_at = (stream_at + stream_bytes + 15u) & ~15u;
-  const uint32_t image_bytes = span.index_bytes == 0 ? stream_at + stream_bytes : index_at + span.index_bytes;
+  const uint32_t tail = span.index_bytes == 0 ? stream_at + stream_bytes : index_at + span.index_bytes;
+  const uint32_t texture_at = (tail + 15u) & ~15u;
+  const uint32_t image_bytes = texture.bytes == 0 ? tail : texture_at + texture.bytes;
   image.assign(image_bytes, 0);
   if (!ReadExact(live, device, image.data(), kDeviceBytes, reason) ||
       (decl_bytes != 0 &&
@@ -183,6 +304,11 @@ bool RepackDeviceDraw(const GuestBytes& live, uint32_t device, std::vector<uint8
        !ReadExact(live, span.index_address, image.data() + index_at, span.index_bytes, reason))) {
     return false;
   }
+  if (texture.bytes != 0 &&
+      !live.Read(texture.guest, image.data() + texture_at, texture.bytes)) {
+    reason = "texture is outside guest memory";
+    return false;
+  }
 
   StoreBe(image, 12696u, kVsAt + 0xC0000000u);
   StoreBe(image, 12692u, kPsAt + 0xC0000000u);
@@ -194,6 +320,14 @@ bool RepackDeviceDraw(const GuestBytes& live, uint32_t device, std::vector<uint8
   StoreBe(image, 12444u, span.index_size);
   StoreBe(image, 12448u, span.index_first);
   StoreBe(image, 12452u, span.base_vertex);
+  StoreBe(image, 12456u, texture.bytes == 0 ? 0u : texture_at);
+  StoreBe(image, 12460u, texture.bytes);
+  StoreBe(image, 12464u, texture.format);
+  StoreBe(image, 12468u, texture.width);
+  StoreBe(image, 12472u, texture.height);
+  StoreBe(image, 12476u, texture.pitch);
+  StoreBe(image, 12480u, texture.endian);
+  StoreBe(image, 12484u, texture.tiled);
 
   StoreBe(image, kVsAt + 32u, 0);
   StoreBe(image, kVsAt + vertex_table, 0x400u);
@@ -278,6 +412,33 @@ bool ReadDeviceDrawIndices(const std::vector<uint8_t>& image, DeviceDrawIndexInf
       (out.offset > image.size() || out.bytes > image.size() - out.offset)) {
     out = {};
     return false;
+  }
+  return true;
+}
+
+bool ReadDeviceDrawTexture(const std::vector<uint8_t>& image, DeviceDrawTexture& out) {
+  out = {};
+  if (image.size() < 12488u) {
+    return false;
+  }
+  auto load = [&](uint32_t at) {
+    const uint8_t* bytes = image.data() + at;
+    return (uint32_t(bytes[0]) << 24) | (uint32_t(bytes[1]) << 16) | (uint32_t(bytes[2]) << 8) |
+           uint32_t(bytes[3]);
+  };
+  out.offset = load(12456u);
+  out.bytes = load(12460u);
+  out.format = load(12464u);
+  out.width = load(12468u);
+  out.height = load(12472u);
+  out.pitch = load(12476u);
+  out.endian = load(12480u);
+  out.tiled = load(12484u);
+  const bool tail = out.bytes != 0 && out.offset <= image.size() &&
+                    out.bytes <= image.size() - out.offset && out.offset + out.bytes == image.size();
+  const bool format = out.format == 6u || out.format == 18u;
+  if (!tail || !format) {
+    out = {};
   }
   return true;
 }

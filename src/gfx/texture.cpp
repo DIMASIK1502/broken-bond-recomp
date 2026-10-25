@@ -249,4 +249,166 @@ bool LoadFetchRgba8(const uint32_t words[6], const uint8_t* guest, size_t guest_
   return true;
 }
 
+namespace {
+
+struct LevelLayout {
+  uint32_t block = 1;
+  uint32_t bytes_per_block = 4;
+  uint32_t log2 = 2;
+};
+
+bool LevelLayoutFor(uint32_t format, LevelLayout& out) {
+  if (format == static_cast<uint32_t>(rex::graphics::xenos::TextureFormat::k_8_8_8_8)) {
+    out = {1u, 4u, 2u};
+    return true;
+  }
+  if (format == static_cast<uint32_t>(rex::graphics::xenos::TextureFormat::k_DXT1)) {
+    out = {4u, 8u, 3u};
+    return true;
+  }
+  return false;
+}
+
+void Expand565(uint16_t packed, uint8_t out[4]) {
+  const uint32_t red = (packed >> 11) & 31u;
+  const uint32_t green = (packed >> 5) & 63u;
+  const uint32_t blue = packed & 31u;
+  out[0] = static_cast<uint8_t>((red << 3) | (red >> 2));
+  out[1] = static_cast<uint8_t>((green << 2) | (green >> 4));
+  out[2] = static_cast<uint8_t>((blue << 3) | (blue >> 2));
+  out[3] = 255;
+}
+
+void DecodeDxt1Block(const uint8_t* block, uint8_t* linear, uint32_t width, uint32_t height,
+                     uint32_t x0, uint32_t y0) {
+  const uint16_t color0 = uint16_t(block[0] | (uint16_t(block[1]) << 8));
+  const uint16_t color1 = uint16_t(block[2] | (uint16_t(block[3]) << 8));
+  const uint32_t indices = uint32_t(block[4]) | (uint32_t(block[5]) << 8) |
+                           (uint32_t(block[6]) << 16) | (uint32_t(block[7]) << 24);
+  uint8_t colors[4][4];
+  Expand565(color0, colors[0]);
+  Expand565(color1, colors[1]);
+  if (color0 > color1) {
+    for (int channel = 0; channel < 3; ++channel) {
+      colors[2][channel] =
+          static_cast<uint8_t>((2u * colors[0][channel] + colors[1][channel]) / 3u);
+      colors[3][channel] =
+          static_cast<uint8_t>((colors[0][channel] + 2u * colors[1][channel]) / 3u);
+    }
+    colors[2][3] = 255;
+    colors[3][3] = 255;
+  } else {
+    for (int channel = 0; channel < 3; ++channel) {
+      colors[2][channel] = static_cast<uint8_t>((colors[0][channel] + colors[1][channel]) / 2u);
+      colors[3][channel] = 0;
+    }
+    colors[2][3] = 255;
+    colors[3][3] = 0;
+  }
+  for (uint32_t py = 0; py < 4u; ++py) {
+    for (uint32_t px = 0; px < 4u; ++px) {
+      const uint32_t x = x0 + px;
+      const uint32_t y = y0 + py;
+      if (x >= width || y >= height) {
+        continue;
+      }
+      const uint32_t index = (indices >> ((py * 4u + px) * 2u)) & 3u;
+      std::memcpy(linear + (static_cast<size_t>(y) * width + x) * 4u, colors[index], 4);
+    }
+  }
+}
+
+void SwapBlock(uint8_t* block, uint32_t bytes, uint32_t endian) {
+  for (uint32_t at = 0; at + 4u <= bytes; at += 4u) {
+    uint32_t word = 0;
+    std::memcpy(&word, block + at, 4);
+    word = rex::graphics::xenos::GpuSwap(word, static_cast<rex::graphics::xenos::Endian>(endian));
+    std::memcpy(block + at, &word, 4);
+  }
+}
+
+}  // namespace
+
+uint32_t GuestTextureBytes(uint32_t format, uint32_t width, uint32_t height, uint32_t pitch,
+                           bool tiled) {
+  LevelLayout level;
+  if (!LevelLayoutFor(format, level) || width == 0 || height == 0 || pitch < width ||
+      (pitch % level.block) != 0) {
+    return 0;
+  }
+  const uint32_t pitch_blocks = pitch / level.block;
+  const uint32_t y_blocks = (height + level.block - 1u) / level.block;
+  const uint32_t x_blocks = (width + level.block - 1u) / level.block;
+  if (!tiled) {
+    const uint64_t bytes = uint64_t(pitch_blocks) * y_blocks * level.bytes_per_block;
+    return bytes > 0xFFFFFFFFull ? 0u : static_cast<uint32_t>(bytes);
+  }
+  const uint32_t bound = rex::graphics::texture_util::GetTiledAddressUpperBound2D(
+      x_blocks, y_blocks, pitch_blocks, level.log2);
+  const uint64_t bytes = uint64_t(bound) + level.bytes_per_block;
+  return bytes > 0xFFFFFFFFull ? 0u : static_cast<uint32_t>(bytes);
+}
+
+bool LoadGuestTextureRgba8(uint32_t format, uint32_t width, uint32_t height, uint32_t pitch,
+                           uint32_t endian, bool tiled, const uint8_t* guest, size_t guest_bytes,
+                           std::vector<uint8_t>& linear, std::string& reason) {
+  LevelLayout level;
+  if (!LevelLayoutFor(format, level) || endian > 3u || guest == nullptr) {
+    reason = guest == nullptr ? "empty texture" : "texture format is not RGBA8 or DXT1";
+    if (endian > 3u) {
+      reason = "texture endian is out of range";
+    }
+    return false;
+  }
+  const uint32_t need = GuestTextureBytes(format, width, height, pitch, tiled);
+  if (need == 0 || guest_bytes < need) {
+    reason = "texture is shorter than its base level";
+    return false;
+  }
+  linear.assign(static_cast<size_t>(width) * height * 4u, 0);
+  if (format == static_cast<uint32_t>(rex::graphics::xenos::TextureFormat::k_8_8_8_8)) {
+    uint32_t words[6] = {};
+    if (!WriteRgba8Fetch(words, width, height, pitch, tiled, endian, reason)) {
+      return false;
+    }
+    return LoadFetchRgba8(words, guest, guest_bytes, linear, reason);
+  }
+  const uint32_t pitch_blocks = pitch / level.block;
+  const uint32_t width_blocks = (width + level.block - 1u) / level.block;
+  const uint32_t height_blocks = (height + level.block - 1u) / level.block;
+  std::vector<uint8_t> blocks(static_cast<size_t>(width_blocks) * height_blocks * level.bytes_per_block);
+  if (!tiled) {
+    for (uint32_t by = 0; by < height_blocks; ++by) {
+      std::memcpy(blocks.data() + static_cast<size_t>(by) * width_blocks * level.bytes_per_block,
+                  guest + static_cast<size_t>(by) * pitch_blocks * level.bytes_per_block,
+                  static_cast<size_t>(width_blocks) * level.bytes_per_block);
+    }
+  } else {
+    const rex::graphics::FormatInfo* info = rex::graphics::FormatInfo::Get(format);
+    if (info == nullptr || info->bytes_per_block() != level.bytes_per_block) {
+      reason = "DXT1 is not an 8-byte block";
+      return false;
+    }
+    rex::graphics::texture_conversion::UntileInfo untile{};
+    untile.width = width_blocks;
+    untile.height = height_blocks;
+    untile.input_pitch = pitch_blocks;
+    untile.output_pitch = width_blocks;
+    untile.input_format_info = info;
+    untile.output_format_info = info;
+    untile.copy_callback = [](void* output, const void* input, size_t length) {
+      std::memcpy(output, input, length);
+    };
+    rex::graphics::texture_conversion::Untile(blocks.data(), guest, &untile);
+  }
+  for (uint32_t by = 0; by < height_blocks; ++by) {
+    for (uint32_t bx = 0; bx < width_blocks; ++bx) {
+      uint8_t* block = blocks.data() + (static_cast<size_t>(by) * width_blocks + bx) * level.bytes_per_block;
+      SwapBlock(block, level.bytes_per_block, endian);
+      DecodeDxt1Block(block, linear.data(), width, height, bx * level.block, by * level.block);
+    }
+  }
+  return true;
+}
+
 }  // namespace broken_bond::gfx

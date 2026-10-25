@@ -157,6 +157,14 @@ void WriteDump(const LiveGuestBytes& live, uint32_t device, const broken_bond::h
   uint32_t image_device = 0;
   std::string reason;
   if (!broken_bond::host::RepackDeviceDraw(live, device, image, image_device, reason, span)) {
+    if (reason.rfind("texture ", 0) == 0) {
+      static bool logged = false;
+      if (!logged) {
+        logged = true;
+        REXLOG_INFO("device draw dump waiting: {}", reason);
+      }
+      return;
+    }
     static std::atomic<int> copies{0};
     if (reason.rfind("vertex stream is ", 0) != 0 && reason.rfind("index list is ", 0) != 0 &&
         copies.fetch_add(1, std::memory_order_relaxed) > 32) {
@@ -178,8 +186,11 @@ void WriteDump(const LiveGuestBytes& live, uint32_t device, const broken_bond::h
   g_draw_dumped.store(true, std::memory_order_relaxed);
   broken_bond::host::DeviceDrawIndexInfo indices;
   broken_bond::host::ReadDeviceDrawIndices(image, indices);
-  REXLOG_INFO("device draw dumped: {} bytes, stream {}, indices {} -> device-draw.bin", image.size(),
-              broken_bond::host::DeviceDrawStreamBytes(image), indices.bytes);
+  broken_bond::host::DeviceDrawTexture texture;
+  broken_bond::host::ReadDeviceDrawTexture(image, texture);
+  REXLOG_INFO("device draw dumped: {} bytes, stream {}, indices {}, texture {} -> device-draw.bin",
+              image.size(), broken_bond::host::DeviceDrawStreamBytes(image), indices.bytes,
+              texture.bytes);
 }
 
 void MaybeDumpAuto(uint32_t device, uint32_t prim, uint32_t vertex_start, uint32_t vertex_count,

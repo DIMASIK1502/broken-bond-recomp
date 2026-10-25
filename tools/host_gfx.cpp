@@ -14,6 +14,7 @@
 #include "gfx/shader_object.h"
 #include "gfx/texture.h"
 
+#include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/xenos.h>
 
@@ -595,6 +596,83 @@ int main(int argc, char** argv) {
     return Fail(reason.empty() ? "draw span did not keep the draw's own vertices" : reason);
   }
   std::cout << "  span_ok 1\n";
+
+  const uint32_t dxt_linear = broken_bond::host::TextureCopyBytes(18, 4, 4, 32, false);
+  const uint32_t dxt_frame = broken_bond::host::TextureCopyBytes(18, 256, 256, 256, true);
+  const uint32_t rgba_linear = broken_bond::host::TextureCopyBytes(6, 48, 32, 64, false);
+  const uint32_t rgba_tiled = broken_bond::host::TextureCopyBytes(6, 32, 32, 32, true);
+  const uint32_t dxt_small = broken_bond::host::TextureCopyBytes(18, 8, 4, 32, true);
+  if (dxt_linear != 64u || dxt_frame == 0u || dxt_frame > (1u << 20) || dxt_small == 0u ||
+      rgba_linear != 64u * 32u * 4u ||
+      dxt_linear != broken_bond::gfx::GuestTextureBytes(18, 4, 4, 32, false) ||
+      dxt_frame != broken_bond::gfx::GuestTextureBytes(18, 256, 256, 256, true) ||
+      dxt_small != broken_bond::gfx::GuestTextureBytes(18, 8, 4, 32, true) ||
+      rgba_linear != broken_bond::gfx::GuestTextureBytes(6, 48, 32, 64, false) ||
+      rgba_tiled != broken_bond::gfx::GuestTextureBytes(6, 32, 32, 32, true)) {
+    return Fail("texture copy size does not match the SDK bound");
+  }
+  uint8_t red_block[64] = {};
+  red_block[0] = 0x00;
+  red_block[1] = 0xF8;
+  red_block[2] = 0x1F;
+  red_block[3] = 0x00;
+  std::vector<uint8_t> decoded;
+  if (!broken_bond::gfx::LoadGuestTextureRgba8(18, 4, 4, 32, 0, false, red_block, 64, decoded,
+                                              reason) ||
+      decoded.size() != 64u || decoded[0] != 255 || decoded[1] != 0 || decoded[2] != 0 ||
+      decoded[3] != 255) {
+    return Fail(reason.empty() ? "linear DXT1 did not decode to red" : reason);
+  }
+  uint8_t swapped_block[64] = {};
+  swapped_block[0] = 0xF8;
+  swapped_block[1] = 0x00;
+  swapped_block[2] = 0x00;
+  swapped_block[3] = 0x1F;
+  if (!broken_bond::gfx::LoadGuestTextureRgba8(18, 4, 4, 32, 1, false, swapped_block, 64, decoded,
+                                              reason) ||
+      decoded[0] != 255 || decoded[1] != 0 || decoded[2] != 0 || decoded[3] != 255) {
+    return Fail(reason.empty() ? "k8in16 DXT1 did not decode to red" : reason);
+  }
+  std::vector<uint8_t> tiled_guest(dxt_small, 0);
+  const uint32_t tiled_block = static_cast<uint32_t>(
+      rex::graphics::texture_util::GetTiledOffset2D(1, 0, 8, 3));
+  if (static_cast<uint64_t>(tiled_block) + 8u > tiled_guest.size()) {
+    return Fail("tiled DXT1 block is outside the copy");
+  }
+  std::memcpy(tiled_guest.data() + tiled_block, red_block, 8);
+  if (!broken_bond::gfx::LoadGuestTextureRgba8(18, 8, 4, 32, 0, true, tiled_guest.data(),
+                                              tiled_guest.size(), decoded, reason) ||
+      decoded.size() != 8u * 4u * 4u || decoded[(4u) * 4u] != 255 || decoded[(4u) * 4u + 1u] != 0) {
+    return Fail(reason.empty() ? "tiled DXT1 did not decode the second block" : reason);
+  }
+  rex::graphics::xenos::xe_gpu_texture_fetch_t dxt_fetch{};
+  dxt_fetch.type = rex::graphics::xenos::FetchConstantType::kTexture;
+  dxt_fetch.format = rex::graphics::xenos::TextureFormat::k_DXT1;
+  dxt_fetch.pitch = 1;
+  dxt_fetch.size_2d.width = 3;
+  dxt_fetch.size_2d.height = 3;
+  dxt_fetch.dimension = rex::graphics::xenos::DataDimension::k2DOrStacked;
+  dxt_fetch.base_address = 0x32;
+  uint32_t dxt_words[6] = {};
+  std::memcpy(dxt_words, &dxt_fetch, sizeof(dxt_words));
+  for (uint32_t i = 0; i < 6u; ++i) {
+    store_be(live, kLiveDevice + 1152u + i * 4u, dxt_words[i]);
+  }
+  std::memcpy(live.data() + 0x32000u, red_block, 64);
+  broken_bond::host::DrawSpan texture_span;
+  texture_span.vertex_count = 1;
+  std::vector<uint8_t> with_texture;
+  uint32_t with_device = 0;
+  broken_bond::host::DeviceDrawTexture copied;
+  if (!broken_bond::host::RepackDeviceDraw(live_bytes, kLiveDevice, with_texture, with_device,
+                                           reason, texture_span) ||
+      !broken_bond::host::ReadDeviceDrawTexture(with_texture, copied) || copied.bytes != 64u ||
+      copied.format != 18u || copied.width != 4u || copied.height != 4u || copied.pitch != 32u ||
+      copied.endian != 0u || copied.tiled != 0u || copied.offset + 2u > with_texture.size() ||
+      with_texture[copied.offset] != 0x00 || with_texture[copied.offset + 1] != 0xF8) {
+    return Fail(reason.empty() ? "device draw did not keep the DXT1 base level" : reason);
+  }
+  std::cout << "  texture_ok 1\n";
 
   uint32_t shadow_fetch_words[6] = {};
   std::vector<uint8_t> fetch_guest(0x2000, 0);

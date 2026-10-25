@@ -759,7 +759,26 @@ equal to 0.5625. The window was closed after that snapshot. Drawn at
 1280×512 with the snapshot's shaders, indices, and float constants, fetch
 endian 1 covers 197759 pixels. The covered region is one filled chevron.
 The first covered pixel is 186, 137, 125, 152. The pixel shader samples the
-host stand-in texture. Endian 2 covers one pixel.
+host stand-in texture. Endian 2 covers one pixel. Slot 0 of that draw is
+a 2D `k_DXT1` texture, 256×256, pitch 256, tiled, endian `k8in16`, mips
+0 through 8, at physical `0x19FFC000`. The dump now copies that base level
+(32776 bytes, the tiled bound plus one block) from guest
+`0xD9FFC000` and records it after the index list. A missing or oversized
+texture does not stop the dump. Both image bindings are `tf0`. Untiling
+with the SDK and decoding DXT1 after the `k8in16` swap produces an opaque
+bark image, 1094 distinct colors, first texel 90, 73, 49, 255. Drawn in
+place of the stand-in, endian 1 still covers 197759 pixels and the first
+pixel is still 186, 137, 125, 152. Every covered pixel is that RGB. It is
+pixel constant `c0` (0.7294, 0.5373, 0.4902), and a byte compare against
+the stand-in differs by 0 because this bark is fully opaque and the
+shader's color lerp is saturated onto `c0`. Forcing the texture alpha to
+0 turns the chevron's alpha to 0, so the fetch is reading the image.
+`surface_info` is 335676672: pitch 1280, MSAA field 2, which is 4×. This
+draw stays 1×. Depth control 7341926 is greater-equal with the test and
+the write enabled; against a depth clear of 1 it covers 0 pixels. Clearing
+only the depth-enable bit covers 123879, and the blend word 1 writes alpha
+0. Clearing the cull bits and leaving the depth test on still covers 0.
+The window was closed after the new snapshot.
 
 `GetTiledAddressLowerBound3D` masks Z with `~kTextureTileDepth` (`~4`) rather
 than `~(kTextureTileDepth - 1)`. On 300 of 600 tile corners, Z = 4 and

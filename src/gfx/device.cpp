@@ -1612,6 +1612,29 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
     }
     auto* memory = static_cast<uint32_t*>(memory_mapped);
     auto* fetch = static_cast<uint32_t*>(fetch_mapped);
+    if (custom_texture && tex_w >= 32u && (tex_w & 31u) == 0u && tex_h != 0u) {
+      // The decoded image is linear RGBA8. Slot 0 and the other texture
+      // fetches describe that image so an unnormalized fetch has its size.
+      // A vertex fetch written below replaces any dword it shares.
+      rex::graphics::xenos::xe_gpu_texture_fetch_t image_fetch{};
+      image_fetch.type = rex::graphics::xenos::FetchConstantType::kTexture;
+      image_fetch.clamp_x = rex::graphics::xenos::ClampMode::kClampToEdge;
+      image_fetch.clamp_y = rex::graphics::xenos::ClampMode::kClampToEdge;
+      image_fetch.clamp_z = rex::graphics::xenos::ClampMode::kClampToEdge;
+      image_fetch.pitch = tex_w >> 5;
+      image_fetch.format = rex::graphics::xenos::TextureFormat::k_8_8_8_8;
+      image_fetch.size_2d.width = tex_w - 1;
+      image_fetch.size_2d.height = tex_h - 1;
+      image_fetch.swizzle = rex::graphics::xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA;
+      image_fetch.mag_filter = rex::graphics::xenos::TextureFilter::kPoint;
+      image_fetch.min_filter = rex::graphics::xenos::TextureFilter::kPoint;
+      image_fetch.mip_filter = rex::graphics::xenos::TextureFilter::kBaseMap;
+      image_fetch.dimension = rex::graphics::xenos::DataDimension::k2DOrStacked;
+      static_assert(sizeof(image_fetch) == 24);
+      for (uint32_t slot = 0; slot < 32u; ++slot) {
+        std::memcpy(fetch + slot * 6u, &image_fetch, sizeof(image_fetch));
+      }
+    }
     constexpr uint32_t kDwords = uint32_t(kVertexBytes / 4u);
     const float triangle[3][4] = {
         {-1.f, -1.f, 0.f, 1.f},

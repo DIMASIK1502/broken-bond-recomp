@@ -64,4 +64,25 @@ bool ReadDeviceDrawIndices(const std::vector<uint8_t>& image, DeviceDrawIndexInf
 bool IndexRange(const uint8_t* indices, uint32_t byte_count, uint32_t index_size, uint32_t& first,
                 uint32_t& count, std::string& reason);
 
+// Bytes of one 2D base level. format 6 is k_8_8_8_8 and format 18 is k_DXT1.
+// Zero when the pitch does not cover the image. A tiled size includes the
+// last block the 2D address math can touch.
+uint32_t TextureCopyBytes(uint32_t format, uint32_t width, uint32_t height, uint32_t pitch,
+                          bool tiled);
+
+// Slot 0's base level, appended after the index list. bytes is zero when the
+// draw had no 2D texture, or when these dwords are not a texture tail.
+struct DeviceDrawTexture {
+  uint32_t offset = 0;
+  uint32_t bytes = 0;
+  uint32_t format = 0;
+  uint32_t width = 0;
+  uint32_t height = 0;
+  uint32_t pitch = 0;
+  uint32_t endian = 0;
+  uint32_t tiled = 0;
+};
+
+bool ReadDeviceDrawTexture(const std::vector<uint8_t>& image, DeviceDrawTexture& out);
+
 }  // namespace broken_bond::host

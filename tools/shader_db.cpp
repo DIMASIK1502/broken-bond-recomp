@@ -2341,6 +2341,38 @@ int DrawMesh(const char* path) {
   }
   const uint32_t image_count = uint32_t(pixel_shader.GetTextureBindingsAfterTranslation().size());
   const uint32_t sampler_count = uint32_t(pixel_shader.GetSamplerBindingsAfterTranslation().size());
+  uint32_t texture_offset = 0;
+  uint32_t texture_bytes = 0;
+  uint32_t texture_format = 0;
+  uint32_t texture_width_px = 0;
+  uint32_t texture_height_px = 0;
+  uint32_t texture_pitch = 0;
+  uint32_t texture_endian = 0;
+  uint32_t texture_tiled = 0;
+  if (image.size() >= 12488u) {
+    texture_offset = LoadBe(image, 12456u);
+    texture_bytes = LoadBe(image, 12460u);
+    texture_format = LoadBe(image, 12464u);
+    texture_width_px = LoadBe(image, 12468u);
+    texture_height_px = LoadBe(image, 12472u);
+    texture_pitch = LoadBe(image, 12476u);
+    texture_endian = LoadBe(image, 12480u);
+    texture_tiled = LoadBe(image, 12484u);
+  }
+  const bool texture_tail = texture_bytes != 0 && texture_offset <= image.size() &&
+                            texture_bytes <= image.size() - texture_offset &&
+                            texture_offset + texture_bytes == image.size() &&
+                            (texture_format == 6u || texture_format == 18u);
+  if (!texture_tail) {
+    texture_bytes = 0;
+  }
+  std::vector<uint8_t> rgba;
+  if (texture_bytes != 0 &&
+      !broken_bond::gfx::LoadGuestTextureRgba8(
+          texture_format, texture_width_px, texture_height_px, texture_pitch, texture_endian,
+          texture_tiled != 0, image.data() + texture_offset, texture_bytes, rgba, reason)) {
+    Fail(reason.empty() ? "mesh texture was not decoded" : reason);
+  }
   broken_bond::gfx::Device device;
   if (!device.Open(reason)) {
     Fail(reason);
@@ -2348,10 +2380,26 @@ int DrawMesh(const char* path) {
   std::cout << "mesh verts " << (stream_bytes.size() / (draw.stream_stride_dwords * 4u))
             << " indices " << indices.size() << " vs " << vertex_raw.size() << " ps "
             << pixel_raw.size() << " decl " << elements.size() << " fetches " << semantics.size()
-            << " mask " << mask << " images " << image_count << "\n";
+            << " mask " << mask << " images " << image_count << " vf "
+            << vertex_shader.vertex_bindings()[0].fetch_constant << "\n";
+  for (const auto& binding : pixel_shader.GetTextureBindingsAfterTranslation()) {
+    std::cout << "mesh tf " << binding.fetch_constant << "\n";
+  }
+  if (texture_bytes == 0) {
+    std::cout << "mesh texture 0\n";
+  } else {
+    std::cout << "mesh texture " << texture_width_px << "x" << texture_height_px << " format "
+              << texture_format << " endian " << texture_endian << " tiled " << texture_tiled
+              << " bytes " << texture_bytes << " texel " << int(rgba[0]) << " " << int(rgba[1])
+              << " " << int(rgba[2]) << " " << int(rgba[3]) << "\n";
+  }
   constexpr uint32_t kWidth = 1280;
   constexpr uint32_t kHeight = 512;
-  for (uint32_t endian : {1u, 2u}) {
+  const uint8_t* texture_rgba = rgba.empty() ? nullptr : rgba.data();
+  const uint32_t texture_width = rgba.empty() ? 0u : texture_width_px;
+  const uint32_t texture_height = rgba.empty() ? 0u : texture_height_px;
+  auto draw_mesh = [&](uint32_t endian, const broken_bond::gfx::Device::RasterState* raster,
+                       const char* label) {
     broken_bond::gfx::VertexStream stream;
     stream.fetch_constant = vertex_shader.vertex_bindings()[0].fetch_constant;
     stream.stride_words = draw.stream_stride_dwords;
@@ -2363,8 +2411,13 @@ int DrawMesh(const char* path) {
     std::vector<uint8_t> pixels;
     if (!device.DrawGuestFragment(vertex_words.data(), vertex_words.size(), kWidth, kHeight,
                                   image_count, sampler_count, 1, false, 0.f, true, &stream, 1,
-                                  pixels, reason, pixel_words.data(), pixel_words.size(), nullptr, 0,
-                                  0, nullptr, floats.data(), floats.data() + 1024)) {
+                                  pixels, reason, pixel_words.data(), pixel_words.size(),
+                                  texture_rgba, texture_width, texture_height, raster, floats.data(),
+                                  floats.data() + 1024)) {
+      if (raster != nullptr) {
+        std::cout << "mesh " << label << " failed: " << reason << "\n";
+        return;
+      }
       Fail(reason.empty() ? "mesh draw failed" : reason);
     }
     uint32_t covered = 0;
@@ -2381,9 +2434,45 @@ int DrawMesh(const char* path) {
       }
       ++covered;
     }
-    std::cout << "mesh endian " << endian << " covered " << covered << " first " << first[0] << " "
+    std::cout << "mesh " << label << " covered " << covered << " first " << first[0] << " "
               << first[1] << " " << first[2] << " " << first[3] << "\n";
-  }
+    if (label[0] == 'e' && label[7] == '1' && texture_rgba != nullptr) {
+      std::vector<uint8_t> plain;
+      std::string plain_reason;
+      if (device.DrawGuestFragment(vertex_words.data(), vertex_words.size(), kWidth, kHeight,
+                                   image_count, sampler_count, 1, false, 0.f, true, &stream, 1,
+                                   plain, plain_reason, pixel_words.data(), pixel_words.size(),
+                                   nullptr, 0, 0, nullptr, floats.data(), floats.data() + 1024)) {
+        uint32_t differ = 0;
+        const size_t n = std::min(pixels.size(), plain.size());
+        for (size_t i = 0; i < n; ++i) {
+          if (pixels[i] != plain[i]) {
+            ++differ;
+          }
+        }
+        std::cout << "mesh texture differs " << differ << "\n";
+      }
+    }
+  };
+  draw_mesh(1u, nullptr, "endian 1");
+  draw_mesh(2u, nullptr, "endian 2");
+  broken_bond::gfx::Device::RasterState raster;
+  raster.surface_info = draw.surface_info & ~0x30000u;
+  raster.depth_control = draw.depth_control;
+  raster.blend_control = draw.blend_control;
+  raster.mode_cntl = draw.mode_cntl;
+  raster.clear_red = 1.f;
+  raster.clear_green = 0.f;
+  raster.clear_blue = 1.f;
+  raster.clear_alpha = 1.f;
+  std::cout << "mesh surface msaa " << ((draw.surface_info >> 16) & 3u) << "\n";
+  draw_mesh(1u, &raster, "raster");
+  broken_bond::gfx::Device::RasterState depth_off = raster;
+  depth_off.depth_control &= ~2u;
+  draw_mesh(1u, &depth_off, "depth off");
+  broken_bond::gfx::Device::RasterState cull_off = raster;
+  cull_off.mode_cntl &= ~3u;
+  draw_mesh(1u, &cull_off, "cull off");
   std::cout << "mesh_draw_ok 1\n";
   return 0;
 }
