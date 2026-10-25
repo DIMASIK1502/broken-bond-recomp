@@ -746,7 +746,16 @@ and every pixel still comes back that color. The shared vertex buffer is
 8 MB. The dword at device+1916 is the buffer end minus the offset. A title
 run left about 272 MB there, and the value changed on every draw, so it is
 the arena leftover rather than the mesh. The draw's own count is
-`num_indices`, the high 16 bits of `VGT_DRAW_INITIATOR`.
+`num_indices`, the high 16 bits of `VGT_DRAW_INITIATOR`. Auto-index draws
+enter `sub_821AE5D0` with that count in r6 and the first vertex in r5.
+Indexed draws enter `sub_821AE9C0` with the index count in r7. The index
+buffer object is the pointer at device+12436; its base is object+24, and bit
+31 of object+0 selects 32-bit indices. The dump copies that index list and
+the vertices from the lowest index through the highest. A title run wrote
+one indexed triangle draw: 93 vertices at stride 7 (2604 bytes), 141 16-bit
+indices, first index 0, base vertex 0, 708 bytes of vertex microcode, 132
+bytes of pixel microcode, six declaration elements, and float constant 0
+equal to 0.5625. The window was closed after that snapshot.
 
 `GetTiledAddressLowerBound3D` masks Z with `~kTextureTileDepth` (`~4`) rather
 than `~(kTextureTileDepth - 1)`. On 300 of 600 tile corners, Z = 4 and

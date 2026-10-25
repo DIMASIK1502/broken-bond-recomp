@@ -84,7 +84,7 @@ bool Microcode(const GuestBytes& live, uint32_t shader, uint32_t base_at, uint32
 }  // namespace
 
 bool RepackDeviceDraw(const GuestBytes& live, uint32_t device, std::vector<uint8_t>& image,
-                      uint32_t& image_device, std::string& reason) {
+                      uint32_t& image_device, std::string& reason, const DrawSpan& span) {
   uint32_t vertex_shader = 0;
   uint32_t pixel_shader = 0;
   uint32_t declaration = 0;
@@ -93,20 +93,51 @@ bool RepackDeviceDraw(const GuestBytes& live, uint32_t device, std::vector<uint8
   if (!LoadBe(live, device + 12696u, vertex_shader, reason) ||
       !LoadBe(live, device + 12692u, pixel_shader, reason) ||
       !LoadBe(live, device + 11820u, declaration, reason) ||
-      !LoadBe(live, device + 1912u, stream_packed, reason) ||
-      !LoadBe(live, device + 1916u, stream_bytes, reason)) {
+      !LoadBe(live, device + 1912u, stream_packed, reason)) {
     return false;
   }
   if (vertex_shader == 0 || pixel_shader == 0) {
     reason = "device draw is missing a shader";
     return false;
   }
-  // device+1916 is the buffer end minus the offset. On this title that is
-  // the arena leftover, hundreds of megabytes, not the indices of the draw.
-  // The draw count is num_indices in the initiator, so an oversized value
-  // is rejected before the copy.
+  uint64_t stream_skip = 0;
+  if (span.vertex_count == 0) {
+    // device+1916 is the buffer end minus the offset. On this title that is
+    // the arena leftover, hundreds of megabytes, not the indices of the draw.
+    if (!LoadBe(live, device + 1916u, stream_bytes, reason)) {
+      return false;
+    }
+  } else {
+    uint8_t stride_dwords = 0;
+    if (!ReadExact(live, device + 12528u, &stride_dwords, 1, reason)) {
+      return false;
+    }
+    if (stride_dwords == 0) {
+      reason = "vertex stride is 0";
+      return false;
+    }
+    const uint64_t stride_bytes = uint64_t(stride_dwords) * 4u;
+    const uint64_t bytes = uint64_t(span.vertex_count) * stride_bytes;
+    stream_skip = uint64_t(span.vertex_start) * stride_bytes;
+    if (bytes == 0 || bytes > kMaxStream || stream_skip > 0xFFFFFFFFull) {
+      reason = "vertex stream is " + std::to_string(bytes) + " bytes";
+      return false;
+    }
+    stream_bytes = static_cast<uint32_t>(bytes);
+  }
+  // An oversized value is rejected before the copy.
   if (stream_bytes == 0 || stream_bytes > kMaxStream) {
     reason = "vertex stream is " + std::to_string(stream_bytes) + " bytes";
+    return false;
+  }
+  if (span.index_bytes > kMaxStream || (span.index_bytes != 0 && span.index_size != 2u &&
+                                        span.index_size != 4u)) {
+    reason = "index list is " + std::to_string(span.index_bytes) + " bytes";
+    return false;
+  }
+  const uint64_t stream_address = uint64_t(stream_packed) + 0xC0000000ull + stream_skip;
+  if (stream_address > 0xFFFFFFFFull) {
+    reason = "vertex stream is outside guest memory";
     return false;
   }
   uint32_t decl_count = 0;
@@ -136,7 +167,8 @@ bool RepackDeviceDraw(const GuestBytes& live, uint32_t device, std::vector<uint8
   const uint32_t decl_bytes = declaration == 0 ? 0u : 52u + decl_count * 12u;
   const uint32_t pixel_ucode_at = (kPayloadAt + vertex_ucode_bytes + 15u) & ~15u;
   const uint32_t stream_at = (pixel_ucode_at + pixel_ucode_bytes + 15u) & ~15u;
-  const uint32_t image_bytes = stream_at + stream_bytes;
+  const uint32_t index_at = (stream_at + stream_bytes + 15u) & ~15u;
+  const uint32_t image_bytes = span.index_bytes == 0 ? stream_at + stream_bytes : index_at + span.index_bytes;
   image.assign(image_bytes, 0);
   if (!ReadExact(live, device, image.data(), kDeviceBytes, reason) ||
       (decl_bytes != 0 &&
@@ -145,8 +177,10 @@ bool RepackDeviceDraw(const GuestBytes& live, uint32_t device, std::vector<uint8
       !ReadExact(live, pixel_shader, image.data() + kPsAt, kPsBytes, reason) ||
       !ReadExact(live, vertex_ucode, image.data() + kPayloadAt, vertex_ucode_bytes, reason) ||
       !ReadExact(live, pixel_ucode, image.data() + pixel_ucode_at, pixel_ucode_bytes, reason) ||
-      !ReadExact(live, stream_packed + 0xC0000000u, image.data() + stream_at, stream_bytes,
-                 reason)) {
+      !ReadExact(live, static_cast<uint32_t>(stream_address), image.data() + stream_at, stream_bytes,
+                 reason) ||
+      (span.index_bytes != 0 &&
+       !ReadExact(live, span.index_address, image.data() + index_at, span.index_bytes, reason))) {
     return false;
   }
 
@@ -155,6 +189,11 @@ bool RepackDeviceDraw(const GuestBytes& live, uint32_t device, std::vector<uint8
   StoreBe(image, 11820u, declaration == 0 ? 0u : kDeclAt + 0xC0000000u);
   StoreBe(image, 1912u, stream_at);
   StoreBe(image, 1916u, stream_bytes);
+  StoreBe(image, 12436u, span.index_bytes == 0 ? 0u : index_at);
+  StoreBe(image, 12440u, span.index_bytes);
+  StoreBe(image, 12444u, span.index_size);
+  StoreBe(image, 12448u, span.index_first);
+  StoreBe(image, 12452u, span.base_vertex);
 
   StoreBe(image, kVsAt + 32u, 0);
   StoreBe(image, kVsAt + vertex_table, 0x400u);
@@ -199,7 +238,7 @@ bool ReadDeviceDrawFile(const std::string& path, std::vector<uint8_t>& image, ui
   uint32_t bytes = 0;
   if (!in || !in.read(reinterpret_cast<char*>(&magic), 4) ||
       !in.read(reinterpret_cast<char*>(&image_device), 4) ||
-      !in.read(reinterpret_cast<char*>(&bytes), 4) || magic != 0x31445242u || bytes > (12u << 20)) {
+      !in.read(reinterpret_cast<char*>(&bytes), 4) || magic != 0x31445242u || bytes > (20u << 20)) {
     reason = "device draw file is not a snapshot";
     return false;
   }
@@ -218,6 +257,68 @@ uint32_t DeviceDrawStreamBytes(const std::vector<uint8_t>& image) {
   const uint8_t* bytes = image.data() + 1916u;
   return (uint32_t(bytes[0]) << 24) | (uint32_t(bytes[1]) << 16) | (uint32_t(bytes[2]) << 8) |
          uint32_t(bytes[3]);
+}
+
+bool ReadDeviceDrawIndices(const std::vector<uint8_t>& image, DeviceDrawIndexInfo& out) {
+  out = {};
+  if (image.size() < 12456u) {
+    return false;
+  }
+  auto load = [&](uint32_t at) {
+    const uint8_t* bytes = image.data() + at;
+    return (uint32_t(bytes[0]) << 24) | (uint32_t(bytes[1]) << 16) | (uint32_t(bytes[2]) << 8) |
+           uint32_t(bytes[3]);
+  };
+  out.offset = load(12436u);
+  out.bytes = load(12440u);
+  out.size = load(12444u);
+  out.first = load(12448u);
+  out.base_vertex = load(12452u);
+  if (out.bytes != 0 &&
+      (out.offset > image.size() || out.bytes > image.size() - out.offset)) {
+    out = {};
+    return false;
+  }
+  return true;
+}
+
+bool IndexRange(const uint8_t* indices, uint32_t byte_count, uint32_t index_size, uint32_t& first,
+                uint32_t& count, std::string& reason) {
+  if (indices == nullptr || (index_size != 2u && index_size != 4u) || byte_count == 0 ||
+      (byte_count % index_size) != 0) {
+    reason = "index list is " + std::to_string(byte_count) + " bytes";
+    return false;
+  }
+  const uint32_t restart = index_size == 2u ? 0xFFFFu : 0xFFFFFFFFu;
+  uint32_t lowest = 0xFFFFFFFFu;
+  uint32_t highest = 0;
+  bool any = false;
+  for (uint32_t at = 0; at < byte_count; at += index_size) {
+    uint32_t index = 0;
+    if (index_size == 2u) {
+      index = (uint32_t(indices[at]) << 8) | uint32_t(indices[at + 1]);
+    } else {
+      index = (uint32_t(indices[at]) << 24) | (uint32_t(indices[at + 1]) << 16) |
+              (uint32_t(indices[at + 2]) << 8) | uint32_t(indices[at + 3]);
+    }
+    if (index == restart) {
+      continue;
+    }
+    any = true;
+    if (index < lowest) {
+      lowest = index;
+    }
+    if (index > highest) {
+      highest = index;
+    }
+  }
+  if (!any || uint64_t(highest) - lowest + 1u > 0xFFFFFFFFull) {
+    reason = "index list has no vertices";
+    return false;
+  }
+  first = lowest;
+  count = highest - lowest + 1u;
+  return true;
 }
 
 }  // namespace broken_bond::host

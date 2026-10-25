@@ -16,11 +16,25 @@ class GuestBytes {
   virtual bool Read(uint32_t address, void* dst, size_t bytes) const = 0;
 };
 
+// A zero vertex_count keeps the byte count stored at device+1916. A non-zero
+// count copies that many vertices from vertex_start, using the stride byte at
+// device+12528. index_bytes, when non-zero, are copied from index_address and
+// recorded after the vertices. index_first is the lowest index in that list.
+struct DrawSpan {
+  uint32_t vertex_count = 0;
+  uint32_t vertex_start = 0;
+  uint32_t index_address = 0;
+  uint32_t index_bytes = 0;
+  uint32_t index_size = 0;
+  uint32_t index_first = 0;
+  uint32_t base_vertex = 0;
+};
+
 // image_device is the guest address of the device inside image. Shader
 // pointers, the declaration, stream 0, and both microcode blobs are moved
 // next to it and the shadow words are rewritten to match.
 bool RepackDeviceDraw(const GuestBytes& live, uint32_t device, std::vector<uint8_t>& image,
-                      uint32_t& image_device, std::string& reason);
+                      uint32_t& image_device, std::string& reason, const DrawSpan& span = {});
 
 // Little-endian file: magic, image_device, byte count, then the image.
 bool WriteDeviceDrawFile(const std::string& path, const std::vector<uint8_t>& image,
@@ -31,5 +45,23 @@ bool ReadDeviceDrawFile(const std::string& path, std::vector<uint8_t>& image, ui
 // Byte count of stream 0 stored in the compact image. Zero when the image is
 // too small to hold that dword.
 uint32_t DeviceDrawStreamBytes(const std::vector<uint8_t>& image);
+
+// Index list recorded in the compact image. bytes is zero when the draw had
+// no indices. offset is the physical start of those bytes. first is the
+// lowest index, so a later draw subtracts it from every index.
+struct DeviceDrawIndexInfo {
+  uint32_t offset = 0;
+  uint32_t bytes = 0;
+  uint32_t size = 0;
+  uint32_t first = 0;
+  uint32_t base_vertex = 0;
+};
+
+bool ReadDeviceDrawIndices(const std::vector<uint8_t>& image, DeviceDrawIndexInfo& out);
+
+// Lowest and highest index in a big-endian list. 0xFFFF and 0xFFFFFFFF are
+// skipped. first is the lowest. count is highest - lowest + 1.
+bool IndexRange(const uint8_t* indices, uint32_t byte_count, uint32_t index_size, uint32_t& first,
+                uint32_t& count, std::string& reason);
 
 }  // namespace broken_bond::host

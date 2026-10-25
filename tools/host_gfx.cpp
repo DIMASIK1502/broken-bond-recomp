@@ -566,6 +566,36 @@ int main(int argc, char** argv) {
   std::cout << "  repack_ok 1\n";
   std::cout << "  floats_ok 1\n";
 
+  uint32_t index_first = 0;
+  uint32_t index_count = 0;
+  const uint8_t index_list[] = {0x00, 0x02, 0x00, 0x05, 0xFF, 0xFF, 0x00, 0x03};
+  live[0x31000] = 0x00;
+  live[0x31001] = 0x02;
+  live[0x31002] = 0x00;
+  live[0x31003] = 0x05;
+  broken_bond::host::DrawSpan span;
+  span.vertex_count = 1;
+  span.index_address = 0xC0031000u;
+  span.index_bytes = 4;
+  span.index_size = 2;
+  span.index_first = 2;
+  span.base_vertex = 7;
+  std::vector<uint8_t> ranged;
+  uint32_t ranged_device = 0;
+  broken_bond::host::DeviceDrawIndexInfo ranged_indices;
+  if (!broken_bond::host::IndexRange(index_list, 8, 2, index_first, index_count, reason) ||
+      index_first != 2u || index_count != 4u ||
+      !broken_bond::host::RepackDeviceDraw(live_bytes, kLiveDevice, ranged, ranged_device, reason,
+                                           span) ||
+      !broken_bond::host::ReadDeviceDrawIndices(ranged, ranged_indices) ||
+      broken_bond::host::DeviceDrawStreamBytes(ranged) != 20u || ranged_indices.bytes != 4u ||
+      ranged_indices.size != 2u || ranged_indices.first != 2u || ranged_indices.base_vertex != 7u ||
+      ranged_indices.offset + 4u > ranged.size() || ranged[ranged_indices.offset] != 0x00 ||
+      ranged[ranged_indices.offset + 1] != 0x02) {
+    return Fail(reason.empty() ? "draw span did not keep the draw's own vertices" : reason);
+  }
+  std::cout << "  span_ok 1\n";
+
   uint32_t shadow_fetch_words[6] = {};
   std::vector<uint8_t> fetch_guest(0x2000, 0);
   constexpr uint32_t kFetchDevice = 0xC0000000u;
