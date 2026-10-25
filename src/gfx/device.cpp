@@ -1487,30 +1487,34 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
     return false;
   }
 
-  constexpr VkDeviceSize kBytes = 65536;
+  constexpr VkDeviceSize kUniformBytes = 65536;
+  // The shared buffer holds the vertex stream. Uniform buffers stay inside
+  // the 64 KB limit reported by the device.
+  constexpr VkDeviceSize kVertexBytes = (8u << 20) + 4096u;
   constexpr VkMemoryPropertyFlags kHost =
       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-  if (!MakeBuffer(vulkan_->physical, device, kBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, kHost,
-                  shared, reason) ||
-      !MakeBuffer(vulkan_->physical, device, kBytes, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, kHost,
-                  constants[0], reason) ||
-      !MakeBuffer(vulkan_->physical, device, kBytes, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, kHost,
-                  constants[1], reason) ||
-      !MakeBuffer(vulkan_->physical, device, kBytes, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, kHost,
-                  constants[2], reason) ||
-      !MakeBuffer(vulkan_->physical, device, kBytes, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, kHost,
-                  constants[3], reason)) {
+  if (!MakeBuffer(vulkan_->physical, device, kVertexBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                  kHost, shared, reason) ||
+      !MakeBuffer(vulkan_->physical, device, kUniformBytes, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                  kHost, constants[0], reason) ||
+      !MakeBuffer(vulkan_->physical, device, kUniformBytes, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                  kHost, constants[1], reason) ||
+      !MakeBuffer(vulkan_->physical, device, kUniformBytes, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                  kHost, constants[2], reason) ||
+      !MakeBuffer(vulkan_->physical, device, kUniformBytes, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                  kHost, constants[3], reason)) {
     cleanup();
     return false;
   }
   for (Buffer* buffer : {&shared, &constants[0], &constants[1], &constants[2], &constants[3]}) {
+    const VkDeviceSize bytes = buffer == &shared ? kVertexBytes : kUniformBytes;
     void* mapped = nullptr;
-    if (vkMapMemory(device, buffer->memory, 0, kBytes, 0, &mapped) != VK_SUCCESS) {
+    if (vkMapMemory(device, buffer->memory, 0, bytes, 0, &mapped) != VK_SUCCESS) {
       reason = "guest constant map failed";
       cleanup();
       return false;
     }
-    std::memset(mapped, 0, size_t(kBytes));
+    std::memset(mapped, 0, size_t(bytes));
     if (buffer == &constants[0]) {
       // Alpha test function 7 is "always". color_exp_bias stays at 1 so the
       // shader's own color is what gets stored. Swizzle RGBA for every fetch.
@@ -1560,13 +1564,13 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
     vkUnmapMemory(device, buffer->memory);
   }
   if (guest_vertex) {
-    if (!MakeBuffer(vulkan_->physical, device, kBytes, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, kHost,
-                    vertex_floats, reason)) {
+    if (!MakeBuffer(vulkan_->physical, device, kUniformBytes, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                    kHost, vertex_floats, reason)) {
       cleanup();
       return false;
     }
     void* mapped = nullptr;
-    if (vkMapMemory(device, vertex_floats.memory, 0, kBytes, 0, &mapped) != VK_SUCCESS) {
+    if (vkMapMemory(device, vertex_floats.memory, 0, kUniformBytes, 0, &mapped) != VK_SUCCESS) {
       reason = "guest vertex constant map failed";
       cleanup();
       return false;
@@ -1584,8 +1588,8 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
   if (guest_vertex && streams != nullptr && stream_count != 0) {
     void* memory_mapped = nullptr;
     void* fetch_mapped = nullptr;
-    if (vkMapMemory(device, shared.memory, 0, kBytes, 0, &memory_mapped) != VK_SUCCESS ||
-        vkMapMemory(device, constants[3].memory, 0, kBytes, 0, &fetch_mapped) != VK_SUCCESS) {
+    if (vkMapMemory(device, shared.memory, 0, kVertexBytes, 0, &memory_mapped) != VK_SUCCESS ||
+        vkMapMemory(device, constants[3].memory, 0, kUniformBytes, 0, &fetch_mapped) != VK_SUCCESS) {
       reason = "guest vertex memory map failed";
       if (memory_mapped != nullptr) {
         vkUnmapMemory(device, shared.memory);
@@ -1595,7 +1599,7 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
     }
     auto* memory = static_cast<uint32_t*>(memory_mapped);
     auto* fetch = static_cast<uint32_t*>(fetch_mapped);
-    constexpr uint32_t kDwords = 65536 / 4;
+    constexpr uint32_t kDwords = uint32_t(kVertexBytes / 4u);
     const float triangle[3][4] = {
         {-1.f, -1.f, 0.f, 1.f},
         {3.f, -1.f, 0.f, 1.f},
@@ -1807,7 +1811,7 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
   Buffer* bound[5] = {&shared, &constants[0], &constants[1], &constants[2], &constants[3]};
   for (uint32_t i = 0; i < 5; ++i) {
     buffer_infos[i].buffer = bound[i]->buffer;
-    buffer_infos[i].range = kBytes;
+    buffer_infos[i].range = i == 0 ? kVertexBytes : kUniformBytes;
   }
   VkWriteDescriptorSet writes[6]{};
   writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -1827,7 +1831,7 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
   uint32_t write_count = 5;
   if (guest_vertex) {
     buffer_infos[5].buffer = vertex_floats.buffer;
-    buffer_infos[5].range = kBytes;
+    buffer_infos[5].range = kUniformBytes;
     writes[5].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[5].dstSet = sets[1];
     writes[5].dstBinding = 1;
