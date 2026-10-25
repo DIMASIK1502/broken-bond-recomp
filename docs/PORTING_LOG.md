@@ -732,7 +732,9 @@ The four non-zero constants are the diagonal of that matrix, each 1. The
 vertex shader fetches position and texcoord from `vf0` (fetch constant 95)
 at stride 5, divides xyz by the fetched w, and dots that with `c0`–`c3`
 swizzled `zxyw`. The pixel shader samples `tf0` and multiplies by `c12`.
-A translated draw of the pair still returns the clear color.
+The translator pads a 3-float fetch with 0, so the draw loads a fourth
+float of 1 for that w. All 64 pixels of the 8×8 target come back
+255, 10, 10, 255.
 
 `GetTiledAddressLowerBound3D` masks Z with `~kTextureTileDepth` (`~4`) rather
 than `~(kTextureTileDepth - 1)`. On 300 of 600 tile corners, Z = 4 and

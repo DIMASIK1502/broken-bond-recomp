@@ -2098,7 +2098,8 @@ int DrawBootPair(const std::vector<uint8_t>& file, const std::vector<ShaderRecor
       broken_bond::gfx::VertexAttribute& out = stream.attributes[stream.attribute_count];
       out.offset_words = attribute.fetch_instr.attributes.offset;
       out.is_float = format == rex::graphics::xenos::VertexFormat::k_32_32_FLOAT ||
-                     format == rex::graphics::xenos::VertexFormat::k_32_32_32_FLOAT;
+                     format == rex::graphics::xenos::VertexFormat::k_32_32_32_FLOAT ||
+                     format == rex::graphics::xenos::VertexFormat::k_32_32_32_32_FLOAT;
       out.components = out.is_float
                            ? uint32_t(rex::graphics::xenos::GetVertexFormatComponentCount(format))
                            : 0;
@@ -2140,7 +2141,8 @@ int DrawBootPair(const std::vector<uint8_t>& file, const std::vector<ShaderRecor
   std::cout << "boot_pair mask " << mask << " images " << image_count << " samplers "
             << sampler_count << " covered " << covered << " first " << first[0] << " " << first[1]
             << " " << first[2] << " " << first[3] << "\n";
-  if (covered == 0) {
+  if (covered != kSize * kSize || first[0] != 255 || first[1] != 10 || first[2] != 10 ||
+      first[3] != 255) {
     const std::string_view vertex_text = vertex_disassembly.to_string_view();
     const std::string_view pixel_text = pixel_disassembly.to_string_view();
     std::cout << std::string(vertex_text.data(), vertex_text.size()) << "\n";
