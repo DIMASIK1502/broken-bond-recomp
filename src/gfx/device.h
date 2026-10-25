@@ -116,7 +116,7 @@ class Device {
                          std::vector<uint8_t>& out, std::string& reason,
                          const uint32_t* fragment_words = nullptr, size_t fragment_word_count = 0,
                          const uint8_t* texture_rgba = nullptr, uint32_t texture_width = 0,
-                         uint32_t texture_height = 0);
+                         uint32_t texture_height = 0, const RasterState* fixed_state = nullptr);
 
  private:
   struct Vulkan;

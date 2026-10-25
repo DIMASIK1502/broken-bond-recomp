@@ -204,5 +204,70 @@ int main() {
     return Fail(reason.empty() ? "drawn fetch image does not match" : reason);
   }
   std::cout << "  fetch_draw_ok 1\n";
+
+  std::vector<uint32_t> pass;
+  if (!broken_bond::gfx::InterpolatorPassFragment(0, pass)) {
+    return Fail("interpolator pass fragment was not built");
+  }
+  constexpr uint32_t kGuestWidth = 32;
+  constexpr uint32_t kGuestHeight = 8;
+  broken_bond::gfx::Device::RasterState guest_state;
+  rex::graphics::reg::RB_SURFACE_INFO guest_surface{};
+  guest_surface.surface_pitch = kGuestWidth;
+  guest_state.surface_info = guest_surface.value;
+  guest_state.clear_red = 1.f;
+  guest_state.clear_blue = 1.f;
+  guest_state.clear_alpha = 1.f;
+  rex::graphics::reg::RB_BLENDCONTROL guest_blend{};
+  guest_blend.color_srcblend = rex::graphics::xenos::BlendFactor::kOne;
+  guest_blend.color_destblend = rex::graphics::xenos::BlendFactor::kZero;
+  guest_blend.alpha_srcblend = rex::graphics::xenos::BlendFactor::kOne;
+  guest_blend.alpha_destblend = rex::graphics::xenos::BlendFactor::kZero;
+  guest_state.blend_control = guest_blend.value;
+  rex::graphics::reg::RB_DEPTHCONTROL guest_depth{};
+  guest_depth.z_enable = 1;
+  guest_depth.zfunc = rex::graphics::xenos::CompareFunction::kLess;
+  guest_state.depth_control = guest_depth.value;
+  auto draw_guest = [&](std::vector<uint8_t>& out) {
+    return device.DrawGuestFragment(pass.data(), pass.size(), kGuestWidth, kGuestHeight, 0, 0, 0,
+                                    true, 1.f, false, nullptr, 0, out, reason, nullptr, 0, nullptr,
+                                    0, 0, &guest_state);
+  };
+  std::vector<uint8_t> guest_drawn;
+  if (!draw_guest(guest_drawn)) {
+    return Fail(reason);
+  }
+  for (size_t i = 0; i + 3 < guest_drawn.size(); i += 4) {
+    if (guest_drawn[i] != 255 || guest_drawn[i + 1] != 64 || guest_drawn[i + 2] != 127 ||
+        guest_drawn[i + 3] != 255) {
+      return Fail("guest depth less did not keep the interpolator color");
+    }
+  }
+  rex::graphics::reg::PA_SU_SC_MODE_CNTL guest_mode{};
+  guest_mode.cull_back = 1;
+  guest_state.mode_cntl = guest_mode.value;
+  if (!draw_guest(guest_drawn)) {
+    return Fail(reason);
+  }
+  for (size_t i = 0; i + 3 < guest_drawn.size(); i += 4) {
+    if (guest_drawn[i] != 255 || guest_drawn[i + 1] != 0 || guest_drawn[i + 2] != 255 ||
+        guest_drawn[i + 3] != 255) {
+      return Fail("guest back cull still drew the triangle");
+    }
+  }
+  guest_mode.cull_back = 0;
+  guest_state.mode_cntl = guest_mode.value;
+  guest_depth.zfunc = rex::graphics::xenos::CompareFunction::kNever;
+  guest_state.depth_control = guest_depth.value;
+  if (!draw_guest(guest_drawn)) {
+    return Fail(reason);
+  }
+  for (size_t i = 0; i + 3 < guest_drawn.size(); i += 4) {
+    if (guest_drawn[i] != 255 || guest_drawn[i + 1] != 0 || guest_drawn[i + 2] != 255 ||
+        guest_drawn[i + 3] != 255) {
+      return Fail("guest depth never still drew the triangle");
+    }
+  }
+  std::cout << "  guest_raster_ok 1\n";
   return 0;
 }

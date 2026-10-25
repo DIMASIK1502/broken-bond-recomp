@@ -670,8 +670,10 @@ solid draw. The same draw reads `RB_SURFACE_INFO`, `RB_DEPTHCONTROL`,
 `RB_BLENDCONTROL0`, and `PA_SU_SC_MODE_CNTL`. On a 64×48 picture, culling the
 front face leaves the clear, a dest-one blend keeps magenta, depth Less at
 z = 0 against a clear of 1 keeps the picture, and depth Never leaves the
-clear. A surface that is not 1x MSAA is rejected. The guest shader path does
-not use these words yet, and the live device shadow is still not sampled.
+clear. A surface that is not 1x MSAA is rejected. A guest pass fragment on a
+32×8 target uses the same words. Depth Less keeps the interpolator color
+255,64,127,255, depth Never leaves the magenta clear, and culling the back
+face leaves that clear. The live device shadow is still not sampled.
 
 `GetTiledAddressLowerBound3D` masks Z with `~kTextureTileDepth` (`~4`) rather
 than `~(kTextureTileDepth - 1)`. On 300 of 600 tile corners, Z = 4 and
