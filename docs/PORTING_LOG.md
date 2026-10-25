@@ -741,7 +741,8 @@ at stride 5, divides xyz by the fetched w, and dots that with `c0`–`c3`
 swizzled `zxyw`. The pixel shader samples `tf0` and multiplies by `c12`.
 The translator pads a 3-float fetch with 0, so the draw loads a fourth
 float of 1 for that w. Every pixel of a 1280×512 target comes back
-255, 10, 10, 255.
+255, 10, 10, 255. The same three vertices can be passed in as stream bytes,
+and every pixel still comes back that color.
 
 `GetTiledAddressLowerBound3D` masks Z with `~kTextureTileDepth` (`~4`) rather
 than `~(kTextureTileDepth - 1)`. On 300 of 600 tile corners, Z = 4 and

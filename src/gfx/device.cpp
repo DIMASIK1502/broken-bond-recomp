@@ -1580,6 +1580,7 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
     }
     vkUnmapMemory(device, vertex_floats.memory);
   }
+  uint32_t guest_vertices = 3;
   if (guest_vertex && streams != nullptr && stream_count != 0) {
     void* memory_mapped = nullptr;
     void* fetch_mapped = nullptr;
@@ -1613,6 +1614,21 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
       const uint32_t base = cursor;
       fetch[stream.fetch_constant * 2] = (base << 2) | 3u;
       fetch[stream.fetch_constant * 2 + 1] = 0xFFFFFFu << 2;
+      if (stream.bytes != nullptr) {
+        const uint32_t stride_bytes = stride * 4u;
+        if (stride_bytes == 0 || stream.byte_count < stride_bytes * 3u ||
+            stream.byte_count % stride_bytes != 0 || cursor + stream.byte_count / 4u > kDwords) {
+          reason = "vertex stream does not fit the draw";
+          vkUnmapMemory(device, constants[3].memory);
+          vkUnmapMemory(device, shared.memory);
+          cleanup();
+          return false;
+        }
+        std::memcpy(memory + base, stream.bytes, stream.byte_count);
+        guest_vertices = stream.byte_count / stride_bytes;
+        cursor += stream.byte_count / 4u;
+        continue;
+      }
       for (uint32_t vertex = 0; vertex < 3; ++vertex) {
         for (uint32_t a = 0; a < stream.attribute_count && a < 8; ++a) {
           const VertexAttribute& attribute = stream.attributes[a];
@@ -2128,7 +2144,7 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
   vkCmdBeginRendering(command, &render);
   vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
   vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 4, sets, 0, nullptr);
-  vkCmdDraw(command, 3, 1, 0, 0);
+  vkCmdDraw(command, guest_vertices, 1, 0, 0);
   vkCmdEndRendering(command);
   target_barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
   target_barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;

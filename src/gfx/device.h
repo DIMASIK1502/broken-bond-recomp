@@ -42,6 +42,10 @@ struct VertexStream {
   int32_t short_w_scale = 0;
   VertexAttribute attributes[8]{};
   uint32_t attribute_count = 0;
+  // When set, these bytes are the vertices, packed at stride_words. The draw
+  // submits byte_count / (stride_words * 4) of them. Values are little-endian.
+  const uint8_t* bytes = nullptr;
+  uint32_t byte_count = 0;
 };
 
 struct DeviceInfo {

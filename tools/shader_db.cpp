@@ -2111,6 +2111,13 @@ int DrawBootPair(const std::vector<uint8_t>& file, const std::vector<ShaderRecor
       ++stream.attribute_count;
     }
   }
+  const float supplied[3][5] = {
+      {-1.f, -1.f, 0.f, 1.f, 0.5f},
+      {3.f, -1.f, 0.f, 1.f, 0.5f},
+      {-1.f, 3.f, 0.f, 1.f, 0.5f},
+  };
+  stream.bytes = reinterpret_cast<const uint8_t*>(supplied);
+  stream.byte_count = sizeof(supplied);
   broken_bond::gfx::Device device;
   if (!device.Open(reason)) {
     std::cerr << reason << "\n";
