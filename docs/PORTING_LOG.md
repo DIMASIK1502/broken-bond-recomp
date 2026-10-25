@@ -575,8 +575,15 @@ the same first pixel. Doubling xyz and w together left those images
 unchanged. Two encodings of the same ratio, xyz scaled by 2 with w = 1 and
 xyz scaled by 4 with w = 2, matched on all 64 pixels of all eight shaders,
 while that ratio itself changed the picture: partial covers became full and
-a green value moved from 89 to 105. The drawn position is xyz/w. The
-declaration is still not the mesh the game binds, and EDRAM is still absent.
+a green value moved from 89 to 105. The drawn position is xyz/w. The same
+eight multi-semantic shaders were then packed in `VSIN` order: position is
+that signed integer `SHORT4` in the first two dwords, and each later semantic
+is a float4. Strides were 6, 10, and 14 for 2, 3, and 4 attributes. All eight
+covered 64 pixels when the triangle was in the position slot, and the first
+pixel matched the float4 declaration probe, including the white shader. None
+covered when the triangle sat only in the following float4. The sizes are
+still the HLSL layout, not the declaration the game binds, and EDRAM is still
+absent.
 
 `GetTiledAddressLowerBound3D` masks Z with `~kTextureTileDepth` (`~4`) rather
 than `~(kTextureTileDepth - 1)`. On 300 of 600 tile corners, Z = 4 and

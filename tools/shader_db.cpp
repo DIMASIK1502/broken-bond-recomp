@@ -534,6 +534,7 @@ struct TranslateStats {
   std::vector<GuestDraw> guest_interpolated;
   std::vector<GuestDraw> guest_vertices;
   std::vector<GuestDraw> guest_declared;
+  std::vector<GuestDraw> guest_packed;
   std::vector<GuestDraw> guest_short;
   uint32_t guest_textured_seen = 0;
   uint32_t guest_interpolated_seen = 0;
@@ -1769,6 +1770,110 @@ void TranslateShader(rex::graphics::SpirvShaderTranslator& translator, uint32_t 
               }
             }
           }
+          if (position && other && stats.guest_packed.size() < 8) {
+            struct PackedSemantic {
+              uint32_t usage;
+              uint32_t usage_index;
+              uint32_t rank;
+            };
+            std::vector<PackedSemantic> packed_semantics;
+            for (const broken_bond::gfx::VertexFetchSemantic& semantic : semantics) {
+              bool seen = false;
+              for (const PackedSemantic& item : packed_semantics) {
+                if (item.usage == semantic.usage && item.usage_index == semantic.usage_index) {
+                  seen = true;
+                }
+              }
+              if (seen) {
+                continue;
+              }
+              uint32_t rank = 1000 + semantic.usage * 16 + semantic.usage_index;
+              if (semantic.usage == 0) {
+                rank = semantic.usage_index;
+              } else if (semantic.usage == 10) {
+                rank = 10 + semantic.usage_index;
+              } else if (semantic.usage == 2) {
+                rank = 20 + semantic.usage_index;
+              } else if (semantic.usage == 1) {
+                rank = 30 + semantic.usage_index;
+              } else if (semantic.usage == 3) {
+                rank = 40 + semantic.usage_index;
+              } else if (semantic.usage == 6) {
+                rank = 50 + semantic.usage_index;
+              } else if (semantic.usage == 5) {
+                rank = 70 + semantic.usage_index;
+              }
+              packed_semantics.push_back({semantic.usage, semantic.usage_index, rank});
+            }
+            std::sort(packed_semantics.begin(), packed_semantics.end(),
+                      [](const PackedSemantic& a, const PackedSemantic& b) { return a.rank < b.rank; });
+            if (packed_semantics.size() <= 8 && packed_semantics[0].usage == 0 &&
+                packed_semantics[0].usage_index == 0) {
+              std::vector<broken_bond::gfx::VertexElement> packed_elements;
+              int32_t cursor = 0;
+              for (const PackedSemantic& item : packed_semantics) {
+                broken_bond::gfx::VertexElement element;
+                element.usage = item.usage;
+                element.usage_index = item.usage_index;
+                element.offset_words = cursor;
+                if (item.usage == 0 && item.usage_index == 0) {
+                  element.format = 26;
+                  element.signed_components = true;
+                  element.integer_components = true;
+                  cursor += 2;
+                } else {
+                  element.format = 38;
+                  cursor += 4;
+                }
+                packed_elements.push_back(element);
+              }
+              for (broken_bond::gfx::VertexElement& element : packed_elements) {
+                element.stride_words = static_cast<uint32_t>(cursor);
+              }
+              std::vector<uint32_t> packed_ucode(ucode.dword_count);
+              for (uint32_t i = 0; i < ucode.dword_count; ++i) {
+                packed_ucode[i] = HostFromBe(ucode.dwords[i]);
+              }
+              if (broken_bond::gfx::PatchVertexDeclaration(
+                      packed_ucode.data(), uint32_t(packed_ucode.size()), semantics.data(),
+                      uint32_t(semantics.size()), packed_elements.data(),
+                      uint32_t(packed_elements.size()), reason)) {
+                rex::graphics::SpirvShader patched(rex::graphics::xenos::ShaderType::kVertex, 0,
+                                                  packed_ucode.data(), packed_ucode.size(),
+                                                  std::endian::native);
+                rex::string::StringBuffer patched_disassembly;
+                patched.AnalyzeUcode(patched_disassembly);
+                rex::graphics::SpirvShaderTranslator::Modification modification(
+                    translator.GetDefaultVertexShaderModification(0));
+                modification.vertex.interpolator_mask = 1;
+                rex::graphics::Shader::Translation& packed_translation =
+                    *patched.GetOrCreateTranslation(modification.value);
+                if (translator.TranslateAnalyzedShader(packed_translation)) {
+                  const std::vector<uint8_t>& again = packed_translation.translated_binary();
+                  if (again.size() >= 4 && again.size() % 4 == 0) {
+                    TranslateStats::GuestDraw draw;
+                    draw.vertex = true;
+                    draw.declare_test = true;
+                    draw.words.assign(reinterpret_cast<const uint32_t*>(again.data()),
+                                      reinterpret_cast<const uint32_t*>(again.data() + again.size()));
+                    broken_bond::gfx::VertexStream stream;
+                    stream.fetch_constant = fetch_constant;
+                    stream.stride_words = static_cast<uint32_t>(cursor);
+                    stream.index_register = 0;
+                    stream.attribute_count = static_cast<uint32_t>(packed_elements.size());
+                    for (uint32_t i = 0; i < stream.attribute_count; ++i) {
+                      stream.attributes[i].offset_words = packed_elements[i].offset_words;
+                      stream.attributes[i].components = 4;
+                      stream.attributes[i].short4 = packed_elements[i].format == 26;
+                      stream.attributes[i].is_float = packed_elements[i].format == 38;
+                    }
+                    draw.streams.push_back(stream);
+                    stats.guest_packed.push_back(std::move(draw));
+                  }
+                }
+              }
+            }
+          }
         }
       }
       if (stage.vertex && stage.images == 0 && stage.samplers == 0 &&
@@ -2515,6 +2620,8 @@ int main(int argc, char** argv) {
     broken_bond::gfx::Device device;
     const bool guest_open = device.Open(guest_reason);
     uint32_t guest_draws = 0;
+    uint32_t pack_seen = 0;
+    uint32_t pack_bad = 0;
     constexpr uint32_t kGuestSize = 8;
     std::vector<uint32_t> link_fragment;
     const auto draw_batch = [&](const std::vector<TranslateStats::GuestDraw>& batch,
@@ -2605,6 +2712,12 @@ int main(int argc, char** argv) {
         if (fragment.declare_test) {
           std::cout << " other_changed " << other_changed;
         }
+        if (std::string(kind) == "guest_pack") {
+          ++pack_seen;
+          if (!second || changed != kGuestSize * kGuestSize || other_changed != 0) {
+            ++pack_bad;
+          }
+        }
         if (drawn.size() >= 4) {
           std::cout << " first " << int(drawn[0]) << " " << int(drawn[1]) << " " << int(drawn[2])
                     << " " << int(drawn[3]);
@@ -2666,6 +2779,10 @@ int main(int argc, char** argv) {
     draw_batch(translated.guest_interpolated, "guest_interp");
     draw_batch(translated.guest_vertices, "guest_vert");
     draw_batch(translated.guest_declared, "guest_decl");
+    draw_batch(translated.guest_packed, "guest_pack");
+    if (pack_seen == 0 || pack_bad != 0) {
+      guest_draw_failed = 1;
+    }
     draw_batch(translated.guest_short, "guest_short");
     uint32_t link_full = 0;
     if (!guest_open || link_fragment.empty() || translated.guest_declared.empty()) {
