@@ -1828,6 +1828,8 @@ void TranslateShader(rex::graphics::SpirvShaderTranslator& translator, uint32_t 
                 stream.attributes[0].offset_words = 0;
                 stream.attributes[0].components = 4;
                 stream.attributes[0].short4 = true;
+                stream.short_scale = 2;
+                stream.short_w_scale = 1;
                 draw.streams.push_back(stream);
                 stats.guest_short.push_back(std::move(draw));
               }
@@ -2549,6 +2551,15 @@ int main(int argc, char** argv) {
           second = device.DrawGuestFragment(fragment.words.data(), fragment.words.size(), kGuestSize,
                                             kGuestSize, 0, 0, 0, false, 0.f, true, swapped.data(),
                                             uint32_t(swapped.size()), other, guest_reason);
+        } else if (fragment.vertex && !fragment.streams.empty() &&
+                   fragment.streams[0].attribute_count > 0 &&
+                   fragment.streams[0].attributes[0].short4) {
+          std::vector<broken_bond::gfx::VertexStream> scaled = fragment.streams;
+          scaled[0].short_scale = 4;
+          scaled[0].short_w_scale = 2;
+          second = device.DrawGuestFragment(fragment.words.data(), fragment.words.size(), kGuestSize,
+                                            kGuestSize, 0, 0, 0, false, 0.f, true, scaled.data(),
+                                            uint32_t(scaled.size()), other, guest_reason);
         } else if (!fragment.vertex && fragment.interpolate) {
           second = device.DrawGuestFragment(fragment.words.data(), fragment.words.size(), kGuestSize,
                                             kGuestSize, 0, 0, 0, true, 0.f, false, nullptr, 0, other,

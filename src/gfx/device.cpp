@@ -1292,11 +1292,13 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
                                  ? int32_t(base) + attribute.offset_words
                                  : int32_t(base + vertex * stream.stride_words) + attribute.offset_words;
           if (attribute.short4 && a == stream.triangle_attribute) {
+            const int32_t scale = stream.short_scale == 0 ? 1 : stream.short_scale;
+            const int32_t w_scale = stream.short_w_scale == 0 ? scale : stream.short_w_scale;
             const int16_t packed[4] = {
-                static_cast<int16_t>(triangle[vertex][0]),
-                static_cast<int16_t>(triangle[vertex][1]),
-                static_cast<int16_t>(triangle[vertex][2]),
-                static_cast<int16_t>(triangle[vertex][3]),
+                static_cast<int16_t>(triangle[vertex][0] * float(scale)),
+                static_cast<int16_t>(triangle[vertex][1] * float(scale)),
+                static_cast<int16_t>(triangle[vertex][2] * float(scale)),
+                static_cast<int16_t>(w_scale),
             };
             if (at < 0 || uint32_t(at) + 2 > kDwords) {
               continue;

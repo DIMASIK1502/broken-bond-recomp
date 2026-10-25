@@ -29,6 +29,10 @@ struct VertexStream {
   uint32_t index_register = 0xFFFFFFFFu;
   // Which attribute receives the covering triangle. The others stay zero.
   uint32_t triangle_attribute = 0;
+  // For a short4 position, xyz is multiplied by short_scale and w by short_w_scale.
+  // short_w_scale 0 uses short_scale, so both grow together.
+  int32_t short_scale = 1;
+  int32_t short_w_scale = 0;
   VertexAttribute attributes[8]{};
   uint32_t attribute_count = 0;
 };

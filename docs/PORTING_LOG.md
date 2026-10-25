@@ -571,8 +571,12 @@ position is often a signed `SHORT4` whose w holds 32767/scale, and
 `FLOAT2`, `FLOAT3`) keep w at 1. Eight single-fetch position shaders were
 patched to signed integer `SHORT4` (format 26, stride 2) with that w set to
 1. Each one matched its float4 draw: the same coverage, 64 or 32 pixels, and
-the same first pixel. The declaration is still not the mesh the game binds,
-and EDRAM is still absent.
+the same first pixel. Doubling xyz and w together left those images
+unchanged. Two encodings of the same ratio, xyz scaled by 2 with w = 1 and
+xyz scaled by 4 with w = 2, matched on all 64 pixels of all eight shaders,
+while that ratio itself changed the picture: partial covers became full and
+a green value moved from 89 to 105. The drawn position is xyz/w. The
+declaration is still not the mesh the game binds, and EDRAM is still absent.
 
 `GetTiledAddressLowerBound3D` masks Z with `~kTextureTileDepth` (`~4`) rather
 than `~(kTextureTileDepth - 1)`. On 300 of 600 tile corners, Z = 4 and
