@@ -206,4 +206,13 @@ bool ReadDeviceDrawFile(const std::string& path, std::vector<uint8_t>& image, ui
   return true;
 }
 
+uint32_t DeviceDrawStreamBytes(const std::vector<uint8_t>& image) {
+  if (image.size() < 1920u) {
+    return 0;
+  }
+  const uint8_t* bytes = image.data() + 1916u;
+  return (uint32_t(bytes[0]) << 24) | (uint32_t(bytes[1]) << 16) | (uint32_t(bytes[2]) << 8) |
+         uint32_t(bytes[3]);
+}
+
 }  // namespace broken_bond::host

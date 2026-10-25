@@ -1,5 +1,7 @@
 #include "gfx/device_shadow.h"
 
+#include <cstring>
+
 namespace broken_bond::gfx {
 namespace {
 
@@ -127,6 +129,38 @@ bool ReadDeviceDeclaration(const uint8_t* guest, size_t guest_bytes, uint32_t de
     elements.push_back(out);
   }
   return true;
+}
+
+bool ReadDeviceFloats(const uint8_t* guest, size_t guest_bytes, uint32_t device,
+                      std::vector<float>& floats, std::string& reason) {
+  constexpr uint32_t kFloat4s = 512u;
+  floats.resize(kFloat4s * 4u);
+  for (uint32_t i = 0; i < kFloat4s * 4u; ++i) {
+    uint32_t bits = 0;
+    if (!LoadBe(guest, guest_bytes, device + 1920u + i * 4u, bits, reason)) {
+      return false;
+    }
+    float value = 0.f;
+    std::memcpy(&value, &bits, sizeof(value));
+    floats[i] = value;
+  }
+  return true;
+}
+
+bool ReadDeviceTexture(const uint8_t* guest, size_t guest_bytes, uint32_t device, uint32_t slot,
+                       TextureFetch& out, std::string& reason) {
+  if (slot >= 32u) {
+    reason = "texture slot is above 31";
+    return false;
+  }
+  uint32_t words[6] = {};
+  const uint32_t fetch = device + 1152u + slot * 24u;
+  for (uint32_t i = 0; i < 6u; ++i) {
+    if (!LoadBe(guest, guest_bytes, fetch + i * 4u, words[i], reason)) {
+      return false;
+    }
+  }
+  return ReadTextureFetch(words, out, reason);
 }
 
 }  // namespace broken_bond::gfx

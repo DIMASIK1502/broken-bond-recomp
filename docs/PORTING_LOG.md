@@ -717,8 +717,18 @@ format 6 at dword 2 with stride 4.
 stream 0, and both microcode blobs into one image and rewrites the pointers.
 A scattered guest image round-trips through `device-draw.bin` back into the
 same readers: 8 stream bytes, format 26, 8 vertex-shader bytes, and 4
-pixel-shader bytes. `--dump_device_draw` writes that file once from the
-flush before a draw. It stays off unless the flag is set.
+pixel-shader bytes. The same image keeps the 512 float4 constants at
+device+1920: a 1.0 followed by a 2.0 comes back. Texture slot 0 is the six
+dwords at device+1152, and a 48×32 pitch-64 `k_8_8_8_8` fetch written there
+is read back. `--dump_device_draw` stays off unless the flag is set. It
+waits until stream 0 has bytes. The boot snapshot had an empty stream, so
+that file is not a mesh: two elements, format 57 (`k_32_32_32_FLOAT`,
+position) and format 37 (`k_32_32_FLOAT`, texcoord at byte 12), both with
+the signed and integer bits set, 156 vertex-shader bytes and 72
+pixel-shader bytes, and float constant 0 equal to 1. Those 156 bytes are
+vertex shader 1 in this dump's `xeshader.sdb` (`g_mWorldViewProj`) and the
+72 bytes are pixel shader 2775 (`g_TextureSampler`, `g_vConstantColor`).
+The four non-zero constants are the diagonal of that matrix, each 1.
 
 `GetTiledAddressLowerBound3D` masks Z with `~kTextureTileDepth` (`~4`) rather
 than `~(kTextureTileDepth - 1)`. On 300 of 600 tile corners, Z = 4 and

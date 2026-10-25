@@ -28,4 +28,8 @@ bool WriteDeviceDrawFile(const std::string& path, const std::vector<uint8_t>& im
 bool ReadDeviceDrawFile(const std::string& path, std::vector<uint8_t>& image, uint32_t& image_device,
                         std::string& reason);
 
+// Byte count of stream 0 stored in the compact image. Zero when the image is
+// too small to hold that dword.
+uint32_t DeviceDrawStreamBytes(const std::vector<uint8_t>& image);
+
 }  // namespace broken_bond::host

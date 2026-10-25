@@ -37,7 +37,7 @@ int Fail(const std::string& reason) {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
   broken_bond::gfx::Device device;
   std::string reason;
   if (!device.Open(reason)) {
@@ -486,6 +486,7 @@ int main() {
   store_be(live, kLiveDevice + 1916u, 8u);
   live[(kLiveDevice + 12528u) & 0x1FFFFFFFu] = 5;
   store_be(live, kLiveDevice + 1920u, 0x3F800000u);
+  store_be(live, kLiveDevice + 1924u, 0x40000000u);
   store_be(live, 0xC0020000u + 24u, 1u);
   store_be16(live, 0xC0020000u + 52u, 0);
   store_be16(live, 0xC0020000u + 54u, 0);
@@ -554,6 +555,71 @@ int main() {
       packed_pixel_bytes[2] != 0xEF || packed_pixel_bytes[3] != 0x01) {
     return Fail("repacked pixel microcode bytes did not match");
   }
+  std::vector<float> packed_floats;
+  if (broken_bond::host::DeviceDrawStreamBytes({}) != 0u ||
+      broken_bond::host::DeviceDrawStreamBytes(loaded) != 8u ||
+      !broken_bond::gfx::ReadDeviceFloats(loaded.data(), loaded.size(), loaded_device,
+                                          packed_floats, reason) ||
+      packed_floats.size() != 2048u || packed_floats[0] != 1.f || packed_floats[1] != 2.f) {
+    return Fail(reason.empty() ? "repacked float constants did not round-trip" : reason);
+  }
   std::cout << "  repack_ok 1\n";
+  std::cout << "  floats_ok 1\n";
+
+  uint32_t shadow_fetch_words[6] = {};
+  std::vector<uint8_t> fetch_guest(0x2000, 0);
+  constexpr uint32_t kFetchDevice = 0xC0000000u;
+  broken_bond::gfx::TextureFetch shadow_fetch;
+  if (!broken_bond::gfx::WriteRgba8Fetch(shadow_fetch_words, 48, 32, 64, false, 2, reason)) {
+    return Fail(reason.empty() ? "fetch constant was not written" : reason);
+  }
+  for (uint32_t i = 0; i < 6u; ++i) {
+    store_be(fetch_guest, kFetchDevice + 1152u + i * 4u, shadow_fetch_words[i]);
+  }
+  if (!broken_bond::gfx::ReadDeviceTexture(fetch_guest.data(), fetch_guest.size(), kFetchDevice, 0,
+                                           shadow_fetch, reason) ||
+      shadow_fetch.width != 48u || shadow_fetch.height != 32u || shadow_fetch.pitch != 64u ||
+      shadow_fetch.endian != 2u || shadow_fetch.format != 6u || shadow_fetch.tiled) {
+    return Fail(reason.empty() ? "texture fetch in the device shadow did not match" : reason);
+  }
+  std::cout << "  fetch_shadow_ok 1\n";
+
+  if (argc > 1) {
+    std::vector<uint8_t> snapshot;
+    uint32_t snapshot_device = 0;
+    broken_bond::gfx::DeviceDraw snapshot_draw;
+    std::vector<uint8_t> snapshot_stream;
+    std::vector<broken_bond::gfx::VertexElement> snapshot_elements;
+    broken_bond::gfx::ShaderMicrocode snapshot_vertex;
+    broken_bond::gfx::ShaderMicrocode snapshot_pixel;
+    std::vector<uint8_t> snapshot_vertex_bytes;
+    std::vector<uint8_t> snapshot_pixel_bytes;
+    std::vector<float> snapshot_floats;
+    if (!broken_bond::host::ReadDeviceDrawFile(argv[1], snapshot, snapshot_device, reason) ||
+        !broken_bond::gfx::ReadDeviceDraw(snapshot.data(), snapshot.size(), snapshot_device,
+                                          snapshot_draw, snapshot_stream, reason) ||
+        !broken_bond::gfx::ReadDeviceDeclaration(snapshot.data(), snapshot.size(), snapshot_device,
+                                                 snapshot_elements, reason) ||
+        !broken_bond::gfx::ReadVertexShaderMicrocode(
+            snapshot.data(), snapshot.size(), snapshot_draw.vertex_shader, snapshot_vertex,
+            snapshot_vertex_bytes, reason) ||
+        !broken_bond::gfx::ReadPixelShaderMicrocode(
+            snapshot.data(), snapshot.size(), snapshot_draw.pixel_shader, snapshot_pixel,
+            snapshot_pixel_bytes, reason) ||
+        !broken_bond::gfx::ReadDeviceFloats(snapshot.data(), snapshot.size(), snapshot_device,
+                                            snapshot_floats, reason)) {
+      return Fail(reason.empty() ? "device draw snapshot was not read" : reason);
+    }
+    std::cout << "  snapshot_ok 1 stream " << snapshot_draw.stream_bytes << " vs "
+              << snapshot_vertex_bytes.size() << " ps " << snapshot_pixel_bytes.size()
+              << " decl " << snapshot_elements.size() << " float0 " << snapshot_floats[0] << "\n";
+    for (size_t i = 0; i < snapshot_elements.size(); ++i) {
+      const broken_bond::gfx::VertexElement& element = snapshot_elements[i];
+      std::cout << "  decl " << i << " format " << element.format << " usage " << element.usage
+                << " index " << element.usage_index << " offset " << element.offset_words
+                << " stride " << element.stride_words << " signed " << element.signed_components
+                << " integer " << element.integer_components << "\n";
+    }
+  }
   return 0;
 }

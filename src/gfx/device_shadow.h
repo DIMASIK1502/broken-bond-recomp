@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "gfx/texture.h"
 #include "gfx/vertex_semantic.h"
 
 namespace broken_bond::gfx {
@@ -37,5 +38,14 @@ bool ReadDeviceDraw(const uint8_t* guest, size_t guest_bytes, uint32_t device, D
 // stride_words is the byte at device+12528 plus the element's stream.
 bool ReadDeviceDeclaration(const uint8_t* guest, size_t guest_bytes, uint32_t device,
                            std::vector<VertexElement>& elements, std::string& reason);
+
+// 512 float4 constants at device+1920. Each dword is a big-endian IEEE value.
+bool ReadDeviceFloats(const uint8_t* guest, size_t guest_bytes, uint32_t device,
+                      std::vector<float>& floats, std::string& reason);
+
+// Texture fetch slot is the six dwords at device+1152 plus slot*24. Slot 31
+// shares its last two dwords with vertex fetch constant 95.
+bool ReadDeviceTexture(const uint8_t* guest, size_t guest_bytes, uint32_t device, uint32_t slot,
+                       TextureFetch& out, std::string& reason);
 
 }  // namespace broken_bond::gfx

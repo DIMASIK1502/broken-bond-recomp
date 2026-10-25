@@ -16,7 +16,7 @@
 #include "host/device_repack.h"
 
 REXCVAR_DEFINE_BOOL(dump_device_draw, false, "Game",
-                    "Write the first draw's device shadow to device-draw.bin");
+                    "Write the first draw that has a vertex stream to device-draw.bin");
 
 namespace {
 
@@ -136,8 +136,23 @@ void MaybeDumpDeviceDraw(uint32_t device, uint8_t* base) {
   std::vector<uint8_t> image;
   uint32_t image_device = 0;
   std::string reason;
-  if (!broken_bond::host::RepackDeviceDraw(live, device, image, image_device, reason) ||
-      !broken_bond::host::WriteDeviceDrawFile("device-draw.bin", image, image_device, reason)) {
+  if (!broken_bond::host::RepackDeviceDraw(live, device, image, image_device, reason)) {
+    static bool logged = false;
+    if (!logged) {
+      logged = true;
+      REXLOG_INFO("device draw dump waiting: {}", reason);
+    }
+    return;
+  }
+  if (broken_bond::host::DeviceDrawStreamBytes(image) == 0) {
+    static bool logged = false;
+    if (!logged) {
+      logged = true;
+      REXLOG_INFO("device draw dump waiting: vertex stream is empty");
+    }
+    return;
+  }
+  if (!broken_bond::host::WriteDeviceDrawFile("device-draw.bin", image, image_device, reason)) {
     static bool logged = false;
     if (!logged) {
       logged = true;
