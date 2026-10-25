@@ -112,7 +112,7 @@ extern "C" void __imp__sub_821AE158(PPCContext& __restrict ctx, uint8_t* base);
 struct LiveGuestBytes : broken_bond::host::GuestBytes {
   uint8_t* base = nullptr;
   bool Read(uint32_t address, void* dst, size_t bytes) const override {
-    if (base == nullptr || bytes == 0 || bytes > (1u << 20) ||
+    if (base == nullptr || bytes == 0 || bytes > (8u << 20) ||
         static_cast<uint64_t>(address) + bytes > 0x100000000ull) {
       return false;
     }
@@ -137,6 +137,15 @@ void MaybeDumpDeviceDraw(uint32_t device, uint8_t* base) {
   uint32_t image_device = 0;
   std::string reason;
   if (!broken_bond::host::RepackDeviceDraw(live, device, image, image_device, reason)) {
+    // Empty and oversized streams return before the copy. A failed copy of a
+    // stream that fit is the only path that can repeat real work.
+    static std::atomic<int> copies{0};
+    if (reason.rfind("vertex stream is ", 0) != 0 &&
+        copies.fetch_add(1, std::memory_order_relaxed) > 32) {
+      g_draw_dumped.store(true, std::memory_order_relaxed);
+      REXLOG_INFO("device draw dump stopped");
+      return;
+    }
     static bool logged = false;
     if (!logged) {
       logged = true;

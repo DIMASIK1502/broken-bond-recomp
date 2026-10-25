@@ -721,7 +721,14 @@ pixel-shader bytes. The same image keeps the 512 float4 constants at
 device+1920: a 1.0 followed by a 2.0 comes back. Texture slot 0 is the six
 dwords at device+1152, and a 48×32 pitch-64 `k_8_8_8_8` fetch written there
 is read back. `--dump_device_draw` stays off unless the flag is set. It
-waits until stream 0 has bytes. The boot snapshot had an empty stream, so
+waits until stream 0 has bytes. An empty or oversized stream is rejected
+from two dwords, before any copy, and a stream that fits is kept up to 8 MB.
+Only a copy that fails counts, and 32 of those stop the dump. A boot run
+reported a stream above the previous 1 MB cap, so that draw was skipped. A
+read offset past the current XMA buffer used to return without moving, and
+the mixer then logged `Invalid packet index` on every callback until the
+title sound stuck. That offset now swaps the buffer once. The boot snapshot
+had an empty stream, so
 that file is not a mesh: two elements, format 57 (`k_32_32_32_FLOAT`,
 position) and format 37 (`k_32_32_FLOAT`, texcoord at byte 12), both with
 the signed and integer bits set, 156 vertex-shader bytes and 72
@@ -733,7 +740,7 @@ vertex shader fetches position and texcoord from `vf0` (fetch constant 95)
 at stride 5, divides xyz by the fetched w, and dots that with `c0`–`c3`
 swizzled `zxyw`. The pixel shader samples `tf0` and multiplies by `c12`.
 The translator pads a 3-float fetch with 0, so the draw loads a fourth
-float of 1 for that w. All 64 pixels of the 8×8 target come back
+float of 1 for that w. Every pixel of a 1280×512 target comes back
 255, 10, 10, 255.
 
 `GetTiledAddressLowerBound3D` masks Z with `~kTextureTileDepth` (`~4`) rather

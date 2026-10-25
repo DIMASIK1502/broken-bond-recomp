@@ -15,6 +15,7 @@ constexpr uint32_t kPsAt = 0x5000u;
 constexpr uint32_t kPsBytes = 0x200u;
 constexpr uint32_t kPayloadAt = 0x6000u;
 constexpr uint32_t kMaxBlob = 1u << 20;
+constexpr uint32_t kMaxStream = 8u << 20;
 
 bool ReadExact(const GuestBytes& live, uint32_t address, void* dst, size_t bytes,
                std::string& reason) {
@@ -100,8 +101,10 @@ bool RepackDeviceDraw(const GuestBytes& live, uint32_t device, std::vector<uint8
     reason = "device draw is missing a shader";
     return false;
   }
-  if (stream_bytes > kMaxBlob) {
-    reason = "vertex stream is larger than 1 MB";
+  // An empty or oversized stream is decided from two dwords. The copy below
+  // stays off the draw until a stream actually fits.
+  if (stream_bytes == 0 || stream_bytes > kMaxStream) {
+    reason = "vertex stream is " + std::to_string(stream_bytes) + " bytes";
     return false;
   }
   uint32_t decl_count = 0;
@@ -194,7 +197,7 @@ bool ReadDeviceDrawFile(const std::string& path, std::vector<uint8_t>& image, ui
   uint32_t bytes = 0;
   if (!in || !in.read(reinterpret_cast<char*>(&magic), 4) ||
       !in.read(reinterpret_cast<char*>(&image_device), 4) ||
-      !in.read(reinterpret_cast<char*>(&bytes), 4) || magic != 0x31445242u || bytes > (3u << 20)) {
+      !in.read(reinterpret_cast<char*>(&bytes), 4) || magic != 0x31445242u || bytes > (12u << 20)) {
     reason = "device draw file is not a snapshot";
     return false;
   }

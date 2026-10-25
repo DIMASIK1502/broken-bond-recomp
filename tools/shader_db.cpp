@@ -2116,33 +2116,35 @@ int DrawBootPair(const std::vector<uint8_t>& file, const std::vector<ShaderRecor
     std::cerr << reason << "\n";
     return 1;
   }
-  constexpr uint32_t kSize = 8;
+  constexpr uint32_t kWidth = 1280;
+  constexpr uint32_t kHeight = 512;
   std::vector<uint8_t> pixels;
-  if (!device.DrawGuestFragment(vertex_words.data(), vertex_words.size(), kSize, kSize,
+  if (!device.DrawGuestFragment(vertex_words.data(), vertex_words.size(), kWidth, kHeight,
                                 image_count, sampler_count, 1, false, 0.f, true, &stream, 1,
                                 pixels, reason, pixel_words.data(), pixel_words.size())) {
     std::cerr << reason << "\n";
     return 1;
   }
-  uint32_t covered = 0;
-  int first[4] = {0, 0, 0, 0};
+  uint32_t matched = 0;
+  int other[4] = {0, 0, 0, 0};
+  bool saw_other = false;
   for (size_t i = 0; i + 3 < pixels.size(); i += 4) {
-    if (pixels[i] == 255 && pixels[i + 1] == 0 && pixels[i + 2] == 255 && pixels[i + 3] == 255) {
+    if (pixels[i] == 255 && pixels[i + 1] == 10 && pixels[i + 2] == 10 && pixels[i + 3] == 255) {
+      ++matched;
       continue;
     }
-    if (covered == 0) {
-      first[0] = pixels[i];
-      first[1] = pixels[i + 1];
-      first[2] = pixels[i + 2];
-      first[3] = pixels[i + 3];
+    if (!saw_other) {
+      saw_other = true;
+      other[0] = pixels[i];
+      other[1] = pixels[i + 1];
+      other[2] = pixels[i + 2];
+      other[3] = pixels[i + 3];
     }
-    ++covered;
   }
   std::cout << "boot_pair mask " << mask << " images " << image_count << " samplers "
-            << sampler_count << " covered " << covered << " first " << first[0] << " " << first[1]
-            << " " << first[2] << " " << first[3] << "\n";
-  if (covered != kSize * kSize || first[0] != 255 || first[1] != 10 || first[2] != 10 ||
-      first[3] != 255) {
+            << sampler_count << " matched " << matched << " other " << other[0] << " " << other[1]
+            << " " << other[2] << " " << other[3] << "\n";
+  if (matched != kWidth * kHeight) {
     const std::string_view vertex_text = vertex_disassembly.to_string_view();
     const std::string_view pixel_text = pixel_disassembly.to_string_view();
     std::cout << std::string(vertex_text.data(), vertex_text.size()) << "\n";
