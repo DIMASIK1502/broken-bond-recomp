@@ -132,7 +132,77 @@ bool TranslatePair(Device& device, std::vector<uint32_t>& patched,
   return true;
 }
 
+bool RetainedShaderKey(const uint8_t* image, size_t image_bytes, uint32_t image_device, uint64_t& key,
+                       std::string& reason) {
+  if (image == nullptr || image_bytes < 12492u) {
+    reason = "host draw image is short";
+    return false;
+  }
+  const uint32_t device = image_device & 0x1FFFFFFFu;
+  if (static_cast<uint64_t>(device) + 12700u > image_bytes) {
+    reason = "host draw image is short";
+    return false;
+  }
+  const uint32_t vertex_shader = LoadBe(image, device + 12696u);
+  const uint32_t pixel_shader = LoadBe(image, device + 12692u);
+  std::vector<VertexElement> elements;
+  ShaderMicrocode vertex_ucode;
+  ShaderMicrocode pixel_ucode;
+  std::vector<uint8_t> vertex_raw;
+  std::vector<uint8_t> pixel_raw;
+  if (!ReadDeviceDeclaration(image, image_bytes, image_device, elements, reason) ||
+      !ReadVertexShaderMicrocode(image, image_bytes, vertex_shader, vertex_ucode, vertex_raw,
+                                 reason) ||
+      !ReadPixelShaderMicrocode(image, image_bytes, pixel_shader, pixel_ucode, pixel_raw, reason)) {
+    if (reason.empty()) {
+      reason = "host draw was not read";
+    }
+    return false;
+  }
+  if (vertex_raw.size() < 12 || vertex_raw.size() % 4 != 0 || pixel_raw.size() < 12 ||
+      elements.empty()) {
+    reason = "host draw is missing a shader, a declaration, or vertices";
+    return false;
+  }
+  const uint32_t vertex_object = vertex_shader & 0x1FFFFFFFu;
+  int marker = -1;
+  if (vertex_object + 0x800u <= image_bytes) {
+    for (uint32_t at = vertex_object; at + 4u <= vertex_object + 0x800u; at += 4u) {
+      if (LoadBe(image, at) == 0x290u) {
+        marker = static_cast<int>(at);
+        break;
+      }
+    }
+  }
+  if (marker < 0) {
+    reason = "host vertex shader has no semantic marker";
+    return false;
+  }
+  key = 14695981039346656037ull;
+  key = Mix(key, vertex_raw.data(), vertex_raw.size());
+  key = Mix(key, pixel_raw.data(), pixel_raw.size());
+  for (const VertexElement& element : elements) {
+    uint32_t packed = element.format ^ (element.usage << 8) ^ (element.usage_index << 16);
+    key = Mix(key, reinterpret_cast<const uint8_t*>(&packed), sizeof(packed));
+  }
+  return true;
+}
+
+bool ShaderKeyIsCached(uint64_t key) {
+  return g_translated.find(key) != g_translated.end();
+}
+
 }  // namespace
+
+bool RetainedShaderCached(const uint8_t* image, size_t image_bytes, uint32_t image_device,
+                          bool& cached, std::string& reason) {
+  uint64_t key = 0;
+  if (!RetainedShaderKey(image, image_bytes, image_device, key, reason)) {
+    return false;
+  }
+  cached = ShaderKeyIsCached(key);
+  return true;
+}
 
 bool SubmitRetainedDraw(Device& device, const uint8_t* image, size_t image_bytes,
                         uint32_t image_device, bool allow_new, bool sample, RetainedDrawInfo& info,
@@ -209,12 +279,9 @@ bool SubmitRetainedDraw(Device& device, const uint8_t* image, size_t image_bytes
     reason = "host vertex shader has no semantic marker";
     return false;
   }
-  uint64_t key = 14695981039346656037ull;
-  key = Mix(key, vertex_raw.data(), vertex_raw.size());
-  key = Mix(key, pixel_raw.data(), pixel_raw.size());
-  for (const VertexElement& element : elements) {
-    uint32_t packed = element.format ^ (element.usage << 8) ^ (element.usage_index << 16);
-    key = Mix(key, reinterpret_cast<const uint8_t*>(&packed), sizeof(packed));
+  uint64_t key = 0;
+  if (!RetainedShaderKey(image, image_bytes, image_device, key, reason)) {
+    return false;
   }
   const auto found = g_translated.find(key);
   info.from_cache = found != g_translated.end();

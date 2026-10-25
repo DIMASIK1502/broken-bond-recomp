@@ -837,6 +837,13 @@ Over five seconds the host submits about 750 draws, all from the cache
 after the first window, across 32 shaders. The retained image covers
 492257 pixels in about 450 colors. One surface, pitch 160, is still
 skipped. The window is still the Xenos present.
+A shader that is past the translation cap no longer spends a draw slot.
+The cap is 96 pairs. Six draws that actually reach the GPU are submitted
+per present, and the title stays at 30 Hz: about 900 draws in five
+seconds, from the cache after the first window, across 25 shaders. The
+retained image still covers 492257 pixels. Sixteen draws that reach the
+GPU cover the same pixels and the present falls to about 18 Hz. Pitch
+160 is still the only skip. The window is still the Xenos present.
 
 `GetTiledAddressLowerBound3D` masks Z with `~kTextureTileDepth` (`~4`) rather
 than `~(kTextureTileDepth - 1)`. On 300 of 600 tile corners, Z = 4 and

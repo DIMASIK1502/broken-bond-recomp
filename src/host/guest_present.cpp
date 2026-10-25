@@ -135,13 +135,14 @@ struct LiveGuestBytes : broken_bond::host::GuestBytes {
 
 std::atomic<bool> g_draw_dumped{false};
 std::unique_ptr<broken_bond::gfx::Device> g_host;
-int g_host_budget = 16;
+int g_host_budget = 6;
 
 struct HostCounters {
   int submitted = 0;
   int cached = 0;
   int skipped = 0;
   int deferred = 0;
+  int capped = 0;
   int unique = 0;
   std::chrono::steady_clock::time_point window = std::chrono::steady_clock::now();
 };
@@ -185,13 +186,14 @@ void HostLog() {
     colors = uint32_t(seen.size());
   }
   REXLOG_INFO(
-      "host frame 5s: submitted={} cached={} skipped={} deferred={} unique={} covered={} colors={}",
+      "host frame 5s: submitted={} cached={} skipped={} deferred={} capped={} unique={} covered={} colors={}",
       g_host_counts.submitted, g_host_counts.cached, g_host_counts.skipped, g_host_counts.deferred,
-      g_host_counts.unique, covered, colors);
+      g_host_counts.capped, g_host_counts.unique, covered, colors);
   g_host_counts.submitted = 0;
   g_host_counts.cached = 0;
   g_host_counts.skipped = 0;
   g_host_counts.deferred = 0;
+  g_host_counts.capped = 0;
 }
 
 void SubmitHostSpan(uint32_t device, const broken_bond::host::DrawSpan& span, uint8_t* base) {
@@ -203,12 +205,33 @@ void SubmitHostSpan(uint32_t device, const broken_bond::host::DrawSpan& span, ui
     HostLog();
     return;
   }
-  --g_host_budget;
   LiveGuestBytes live;
   live.base = base;
+  std::vector<uint8_t> identity;
+  uint32_t identity_device = 0;
+  std::string reason;
+  if (!broken_bond::host::RepackDeviceDraw(live, device, identity, identity_device, reason, span,
+                                           false)) {
+    ++g_host_counts.skipped;
+    HostNote(reason.empty() ? "host draw was not packed" : reason);
+    HostLog();
+    return;
+  }
+  bool shader_cached = false;
+  if (!broken_bond::gfx::RetainedShaderCached(identity.data(), identity.size(), identity_device,
+                                             shader_cached, reason)) {
+    ++g_host_counts.skipped;
+    HostNote(reason.empty() ? "host shader was not read" : reason);
+    HostLog();
+    return;
+  }
+  if (!shader_cached && g_host_counts.unique >= 96) {
+    ++g_host_counts.capped;
+    HostLog();
+    return;
+  }
   std::vector<uint8_t> image;
   uint32_t image_device = 0;
-  std::string reason;
   if (!broken_bond::host::RepackDeviceDraw(live, device, image, image_device, reason, span)) {
     ++g_host_counts.skipped;
     HostNote(reason.empty() ? "host draw was not packed" : reason);
@@ -217,7 +240,7 @@ void SubmitHostSpan(uint32_t device, const broken_bond::host::DrawSpan& span, ui
   }
   broken_bond::gfx::RetainedDrawInfo info;
   if (!broken_bond::gfx::SubmitRetainedDraw(*g_host, image.data(), image.size(), image_device,
-                                           g_host_counts.unique < 32, false, info, reason)) {
+                                           !shader_cached, false, info, reason)) {
     if (reason.rfind("deferred", 0) == 0) {
       ++g_host_counts.deferred;
     } else {
@@ -227,6 +250,7 @@ void SubmitHostSpan(uint32_t device, const broken_bond::host::DrawSpan& span, ui
     HostLog();
     return;
   }
+  --g_host_budget;
   ++g_host_counts.submitted;
   if (info.from_cache) {
     ++g_host_counts.cached;
@@ -488,7 +512,7 @@ void MaybeDumpDeviceDraw(uint32_t device, uint8_t* base) {
 REX_HOOK_RAW(sub_821B1DD0) {
   NoteSwapCaller(static_cast<uint32_t>(ctx.lr));
   if (g_host) {
-    g_host_budget = 16;
+    g_host_budget = 6;
   }
   __imp__sub_821B1DD0(ctx, base);
 }

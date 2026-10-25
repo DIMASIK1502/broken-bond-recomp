@@ -215,7 +215,8 @@ bool DescribeTexture(const GuestBytes& live, uint32_t device, SlotTexture& out, 
 }
 
 bool RepackDeviceDraw(const GuestBytes& live, uint32_t device, std::vector<uint8_t>& image,
-                      uint32_t& image_device, std::string& reason, const DrawSpan& span) {
+                      uint32_t& image_device, std::string& reason, const DrawSpan& span,
+                      bool include_mesh) {
   uint32_t vertex_shader = 0;
   uint32_t pixel_shader = 0;
   uint32_t declaration = 0;
@@ -224,7 +225,7 @@ bool RepackDeviceDraw(const GuestBytes& live, uint32_t device, std::vector<uint8
   if (!LoadBe(live, device + 12696u, vertex_shader, reason) ||
       !LoadBe(live, device + 12692u, pixel_shader, reason) ||
       !LoadBe(live, device + 11820u, declaration, reason) ||
-      !LoadBe(live, device + 1912u, stream_packed, reason)) {
+      (include_mesh && !LoadBe(live, device + 1912u, stream_packed, reason))) {
     return false;
   }
   if (vertex_shader == 0 || pixel_shader == 0) {
@@ -232,7 +233,9 @@ bool RepackDeviceDraw(const GuestBytes& live, uint32_t device, std::vector<uint8
     return false;
   }
   uint64_t stream_skip = 0;
-  if (span.vertex_count == 0) {
+  if (!include_mesh) {
+    stream_bytes = 0;
+  } else if (span.vertex_count == 0) {
     // device+1916 is the buffer end minus the offset. On this title that is
     // the arena leftover, hundreds of megabytes, not the indices of the draw.
     if (!LoadBe(live, device + 1916u, stream_bytes, reason)) {
@@ -256,20 +259,23 @@ bool RepackDeviceDraw(const GuestBytes& live, uint32_t device, std::vector<uint8
     }
     stream_bytes = static_cast<uint32_t>(bytes);
   }
-  // An oversized value is rejected before the copy.
-  if (stream_bytes == 0 || stream_bytes > kMaxStream) {
-    reason = "vertex stream is " + std::to_string(stream_bytes) + " bytes";
-    return false;
-  }
-  if (span.index_bytes > kMaxStream || (span.index_bytes != 0 && span.index_size != 2u &&
-                                        span.index_size != 4u)) {
-    reason = "index list is " + std::to_string(span.index_bytes) + " bytes";
-    return false;
-  }
-  const uint64_t stream_address = uint64_t(stream_packed) + 0xC0000000ull + stream_skip;
-  if (stream_address > 0xFFFFFFFFull) {
-    reason = "vertex stream is outside guest memory";
-    return false;
+  uint64_t stream_address = 0;
+  if (include_mesh) {
+    // An oversized value is rejected before the copy.
+    if (stream_bytes == 0 || stream_bytes > kMaxStream) {
+      reason = "vertex stream is " + std::to_string(stream_bytes) + " bytes";
+      return false;
+    }
+    if (span.index_bytes > kMaxStream || (span.index_bytes != 0 && span.index_size != 2u &&
+                                          span.index_size != 4u)) {
+      reason = "index list is " + std::to_string(span.index_bytes) + " bytes";
+      return false;
+    }
+    stream_address = uint64_t(stream_packed) + 0xC0000000ull + stream_skip;
+    if (stream_address > 0xFFFFFFFFull) {
+      reason = "vertex stream is outside guest memory";
+      return false;
+    }
   }
   uint32_t decl_count = 0;
   if (declaration != 0 && !LoadBe(live, declaration + 24u, decl_count, reason)) {
@@ -296,16 +302,17 @@ bool RepackDeviceDraw(const GuestBytes& live, uint32_t device, std::vector<uint8
   }
 
   SlotTexture texture;
-  if (!DescribeTexture(live, device, texture, reason)) {
+  if (include_mesh && !DescribeTexture(live, device, texture, reason)) {
     return false;
   }
   const uint32_t decl_bytes = declaration == 0 ? 0u : 52u + decl_count * 12u;
   const uint32_t pixel_ucode_at = (kPayloadAt + vertex_ucode_bytes + 15u) & ~15u;
   const uint32_t stream_at = (pixel_ucode_at + pixel_ucode_bytes + 15u) & ~15u;
   const uint32_t index_at = (stream_at + stream_bytes + 15u) & ~15u;
-  const uint32_t tail = span.index_bytes == 0 ? stream_at + stream_bytes : index_at + span.index_bytes;
+  const uint32_t tail = !include_mesh || span.index_bytes == 0 ? stream_at + stream_bytes
+                                                              : index_at + span.index_bytes;
   const uint32_t texture_at = (tail + 15u) & ~15u;
-  const uint32_t image_bytes = texture.bytes == 0 ? tail : texture_at + texture.bytes;
+  const uint32_t image_bytes = !include_mesh || texture.bytes == 0 ? tail : texture_at + texture.bytes;
   image.assign(image_bytes, 0);
   if (!ReadExact(live, device, image.data(), kDeviceBytes, reason) ||
       (decl_bytes != 0 &&
@@ -314,13 +321,14 @@ bool RepackDeviceDraw(const GuestBytes& live, uint32_t device, std::vector<uint8
       !ReadExact(live, pixel_shader, image.data() + kPsAt, kPsBytes, reason) ||
       !ReadExact(live, vertex_ucode, image.data() + kPayloadAt, vertex_ucode_bytes, reason) ||
       !ReadExact(live, pixel_ucode, image.data() + pixel_ucode_at, pixel_ucode_bytes, reason) ||
-      !ReadExact(live, static_cast<uint32_t>(stream_address), image.data() + stream_at, stream_bytes,
-                 reason) ||
-      (span.index_bytes != 0 &&
+      (include_mesh &&
+       !ReadExact(live, static_cast<uint32_t>(stream_address), image.data() + stream_at, stream_bytes,
+                  reason)) ||
+      (include_mesh && span.index_bytes != 0 &&
        !ReadExact(live, span.index_address, image.data() + index_at, span.index_bytes, reason))) {
     return false;
   }
-  if (texture.bytes != 0 &&
+  if (include_mesh && texture.bytes != 0 &&
       !live.Read(texture.guest, image.data() + texture_at, texture.bytes)) {
     reason = "texture is outside guest memory";
     return false;

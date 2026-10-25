@@ -33,8 +33,12 @@ struct DrawSpan {
 // image_device is the guest address of the device inside image. Shader
 // pointers, the declaration, stream 0, and both microcode blobs are moved
 // next to it and the shadow words are rewritten to match.
+// include_mesh copies the vertex stream, the index list, and one texture.
+// A false value keeps the shaders and the declaration, which is enough to
+// tell whether the pair is already translated.
 bool RepackDeviceDraw(const GuestBytes& live, uint32_t device, std::vector<uint8_t>& image,
-                      uint32_t& image_device, std::string& reason, const DrawSpan& span = {});
+                      uint32_t& image_device, std::string& reason, const DrawSpan& span = {},
+                      bool include_mesh = true);
 
 // Little-endian file: magic, image_device, byte count, then the image.
 bool WriteDeviceDrawFile(const std::string& path, const std::vector<uint8_t>& image,

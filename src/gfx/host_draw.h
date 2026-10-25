@@ -27,4 +27,9 @@ bool SubmitRetainedDraw(Device& device, const uint8_t* image, size_t image_bytes
                         uint32_t image_device, bool allow_new, bool sample, RetainedDrawInfo& info,
                         std::string& reason);
 
+// True when this shader pair is already in the translation cache. The image
+// only needs the shaders and the declaration. A read failure returns false.
+bool RetainedShaderCached(const uint8_t* image, size_t image_bytes, uint32_t image_device,
+                          bool& cached, std::string& reason);
+
 }  // namespace broken_bond::gfx
