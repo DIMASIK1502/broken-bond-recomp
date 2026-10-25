@@ -135,7 +135,7 @@ struct LiveGuestBytes : broken_bond::host::GuestBytes {
 
 std::atomic<bool> g_draw_dumped{false};
 std::unique_ptr<broken_bond::gfx::Device> g_host;
-int g_host_budget = 40;
+int g_host_budget = 64;
 int g_host_learn = 1;
 std::unordered_set<uint64_t> g_host_seen;
 
@@ -211,7 +211,7 @@ void SubmitHostSpan(uint32_t device, const broken_bond::host::DrawSpan& span, ui
     return;
   }
   const bool room = g_host_budget > 0;
-  const bool learn = g_host_learn > 0 && g_host_counts.unique < 96;
+  const bool learn = g_host_learn > 0 && g_host_counts.unique < 128;
   if (!room && !learn) {
     ++g_host_counts.deferred;
     HostLog();
@@ -255,7 +255,7 @@ void SubmitHostSpan(uint32_t device, const broken_bond::host::DrawSpan& span, ui
     HostLog();
     return;
   }
-  if (!shader_cached && g_host_counts.unique >= 96) {
+  if (!shader_cached && g_host_counts.unique >= 128) {
     ++g_host_counts.capped;
     HostLog();
     return;
@@ -564,7 +564,7 @@ void MaybeDumpDeviceDraw(uint32_t device, uint8_t* base) {
 REX_HOOK_RAW(sub_821B1DD0) {
   NoteSwapCaller(static_cast<uint32_t>(ctx.lr));
   if (g_host) {
-    g_host_budget = 40;
+    g_host_budget = 64;
     g_host_learn = 1;
     g_host->RestartRetainedFrame();
   }

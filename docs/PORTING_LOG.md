@@ -878,6 +878,14 @@ Title frames cover about 1200 to 2500 pixels. Some frames cover about
 51000 to 54000. A few samples are a cleared frame. Heavier frames leave
 a short 24 Hz tail, and the present stays near 33 ms. The slot is 40.
 The window is still the Xenos present.
+Descriptor sets stay alive until the draw's fence signals, and the shared
+buffer is zeroed only where the previous draw on that set left bytes.
+Sixty-four draws are admitted per present, and 128 shaders can be kept.
+The title stays at 30 Hz: about 9600 draws in five seconds, all from the
+cache, 128 shaders. Some frames cover the whole 1280×512 target, 655360
+pixels, in about 700 to 900 colors. Other frames cover about 2000 to
+52000. Draws past the shader cap and past the slot are still left out.
+The window is still the Xenos present.
 
 `GetTiledAddressLowerBound3D` masks Z with `~kTextureTileDepth` (`~4`) rather
 than `~(kTextureTileDepth - 1)`. On 300 of 600 tile corners, Z = 4 and

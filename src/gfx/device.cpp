@@ -44,6 +44,7 @@ struct Device::Vulkan {
   DrawScratch* scratch_ring[2] = {};
   VkFence scratch_fence[2] = {};
   VkCommandBuffer scratch_command[2] = {};
+  VkDescriptorPool scratch_descriptors[2] = {};
   bool scratch_pending[2] = {};
   uint32_t scratch_next = 0;
   // Pipelines and texture images are reused across draws.
@@ -93,6 +94,10 @@ struct Device::Vulkan {
         if (scratch_fence[i] != VK_NULL_HANDLE) {
           vkDestroyFence(device, scratch_fence[i], nullptr);
           scratch_fence[i] = VK_NULL_HANDLE;
+        }
+        if (scratch_descriptors[i] != VK_NULL_HANDLE) {
+          vkDestroyDescriptorPool(device, scratch_descriptors[i], nullptr);
+          scratch_descriptors[i] = VK_NULL_HANDLE;
         }
         DestroyDrawScratch(device, scratch_ring[i]);
       }
@@ -383,6 +388,7 @@ struct DrawScratch {
   void* upload_map = nullptr;
   VkDeviceSize index_capacity = 0;
   VkDeviceSize upload_capacity = 0;
+  VkDeviceSize shared_dirty = 0;
 };
 
 void DestroyDrawScratch(VkDevice device, DrawScratch*& scratch) {
@@ -1608,6 +1614,7 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
   VkPipelineLayout layout = VK_NULL_HANDLE;
   VkPipeline pipeline = VK_NULL_HANDLE;
   VkDescriptorPool pool = VK_NULL_HANDLE;
+  bool keep_pool = false;
   VkDescriptorSet sets[4] = {};
   uint32_t draw_indices = 0;
   const uint16_t* draw_index_values = nullptr;
@@ -1684,7 +1691,7 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
         vkDestroyShaderModule(device, vertex_module, nullptr);
       }
     }
-    if (pool != VK_NULL_HANDLE) {
+    if (!keep_pool && pool != VK_NULL_HANDLE) {
       vkDestroyDescriptorPool(device, pool, nullptr);
     }
   };
@@ -1873,14 +1880,34 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
       cleanup();
       return false;
     }
-    if (vulkan_->scratch_fence[i] != VK_NULL_HANDLE) {
-      continue;
+    if (vulkan_->scratch_fence[i] == VK_NULL_HANDLE) {
+      VkFenceCreateInfo fence_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+      if (vkCreateFence(device, &fence_info, nullptr, &vulkan_->scratch_fence[i]) != VK_SUCCESS) {
+        reason = "guest draw fence failed";
+        cleanup();
+        return false;
+      }
     }
-    VkFenceCreateInfo fence_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-    if (vkCreateFence(device, &fence_info, nullptr, &vulkan_->scratch_fence[i]) != VK_SUCCESS) {
-      reason = "guest draw fence failed";
-      cleanup();
-      return false;
+    if (vulkan_->scratch_descriptors[i] == VK_NULL_HANDLE) {
+      VkDescriptorPoolSize sizes[4]{};
+      sizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+      sizes[0].descriptorCount = 1;
+      sizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+      sizes[1].descriptorCount = 5;
+      sizes[2].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+      sizes[2].descriptorCount = 16;
+      sizes[3].type = VK_DESCRIPTOR_TYPE_SAMPLER;
+      sizes[3].descriptorCount = 8;
+      VkDescriptorPoolCreateInfo descriptor_pool_info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+      descriptor_pool_info.maxSets = 4;
+      descriptor_pool_info.poolSizeCount = 4;
+      descriptor_pool_info.pPoolSizes = sizes;
+      if (vkCreateDescriptorPool(device, &descriptor_pool_info, nullptr,
+                                 &vulkan_->scratch_descriptors[i]) != VK_SUCCESS) {
+        reason = "guest descriptor pool failed";
+        cleanup();
+        return false;
+      }
     }
   }
   if (vulkan_->scratch_pending[scratch_slot]) {
@@ -1897,15 +1924,21 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
     vkFreeCommandBuffers(device, vulkan_->pool, 1, &vulkan_->scratch_command[scratch_slot]);
     vulkan_->scratch_command[scratch_slot] = VK_NULL_HANDLE;
   }
+  if (vkResetDescriptorPool(device, vulkan_->scratch_descriptors[scratch_slot], 0) != VK_SUCCESS) {
+    reason = "guest descriptor pool failed";
+    cleanup();
+    return false;
+  }
   DrawScratch& scratch = *vulkan_->scratch_ring[scratch_slot];
   Buffer& shared = scratch.shared;
   Buffer (&constants)[4] = scratch.constants;
   Buffer& vertex_floats = scratch.vertex_floats;
   Buffer& index_buffer = scratch.index_buffer;
   Buffer& texture_upload = scratch.texture_upload;
-  // Shaders keep temporary values in this shared buffer. Clear it, and the
-  // uniform ranges, so one draw cannot see the previous draw's values.
-  std::memset(scratch.shared_map, 0, size_t(kVertexBytes));
+  // The shared buffer is zeroed when it is mapped. A draw zeros only the
+  // tail left by the previous draw on this set. Uniform ranges are still
+  // cleared so one draw cannot see the previous draw's constants.
+  VkDeviceSize shared_used = 0;
   std::memset(scratch.constant_map[0], 0, size_t(kUniformBytes));
   std::memset(scratch.constant_map[1], 0, size_t(kUniformBytes));
   std::memset(scratch.constant_map[2], 0, size_t(kUniformBytes));
@@ -2030,6 +2063,7 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
         if (stride_bytes == 0 || stream.byte_count < stride_bytes * 3u ||
             stream.byte_count % stride_bytes != 0 || cursor + stream.byte_count / 4u > kDwords) {
           reason = "vertex stream does not fit the draw";
+          scratch.shared_dirty = kVertexBytes;
           cleanup();
           return false;
         }
@@ -2083,12 +2117,19 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
       if (!EnsureScratchBytes(vulkan_->physical, device, index_buffer, scratch.index_map,
                               scratch.index_capacity, index_bytes, VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
                               reason)) {
+        scratch.shared_dirty = kVertexBytes;
         cleanup();
         return false;
       }
       std::memcpy(scratch.index_map, draw_index_values, size_t(index_bytes));
     }
+    shared_used = VkDeviceSize(cursor) * 4u;
   }
+  if (shared_used < scratch.shared_dirty) {
+    std::memset(static_cast<uint8_t*>(scratch.shared_map) + size_t(shared_used), 0,
+                size_t(scratch.shared_dirty - shared_used));
+  }
+  scratch.shared_dirty = shared_used;
 
   if (image_count != 0) {
     std::vector<uint8_t> pixels(size_t(tex_w) * tex_h * 4);
@@ -2204,31 +2245,8 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
     }
   }
 
-  VkDescriptorPoolSize pool_sizes[4]{};
-  pool_sizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  pool_sizes[0].descriptorCount = 1;
-  pool_sizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-  pool_sizes[1].descriptorCount = uniform_count;
-  uint32_t pool_count = 2;
-  if (image_count != 0) {
-    pool_sizes[pool_count].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-    pool_sizes[pool_count].descriptorCount = image_count;
-    ++pool_count;
-  }
-  if (sampler_count != 0) {
-    pool_sizes[pool_count].type = VK_DESCRIPTOR_TYPE_SAMPLER;
-    pool_sizes[pool_count].descriptorCount = sampler_count;
-    ++pool_count;
-  }
-  VkDescriptorPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-  pool_info.maxSets = 4;
-  pool_info.poolSizeCount = pool_count;
-  pool_info.pPoolSizes = pool_sizes;
-  if (vkCreateDescriptorPool(device, &pool_info, nullptr, &pool) != VK_SUCCESS) {
-    reason = "guest descriptor pool failed";
-    cleanup();
-    return false;
-  }
+  pool = vulkan_->scratch_descriptors[scratch_slot];
+  keep_pool = true;
   VkDescriptorSetAllocateInfo allocate{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
   allocate.descriptorPool = pool;
   allocate.descriptorSetCount = 4;
