@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "gfx/device.h"
+#include "gfx/device_shadow.h"
 #include "gfx/edram.h"
 #include "gfx/shader_object.h"
 #include "gfx/texture.h"
@@ -396,5 +397,37 @@ int main() {
                                : reason);
   }
   std::cout << "  pixel_ucode_ok 1\n";
+
+  std::vector<uint8_t> device_guest(0xC000, 0);
+  constexpr uint32_t kDevice = 0xC0008000u;
+  store_be(device_guest, kDevice + 12696u, 0xAABBCCDDu);
+  store_be(device_guest, kDevice + 12692u, 0x11223344u);
+  store_be(device_guest, kDevice + 10368u, 0x00020500u);
+  store_be(device_guest, kDevice + 10548u, 0x11111111u);
+  store_be(device_guest, kDevice + 10552u, 0x22222222u);
+  store_be(device_guest, kDevice + 10568u, 0x33333333u);
+  device_guest[(kDevice + 12528u) & 0x1FFFFFFFu] = 2;
+  store_be(device_guest, kDevice + 1912u, 0x4000u);
+  store_be(device_guest, kDevice + 1916u, 8u);
+  for (uint32_t i = 0; i < 8; ++i) {
+    device_guest[0x4000u + i] = static_cast<uint8_t>(i + 1u);
+  }
+  broken_bond::gfx::DeviceDraw draw;
+  std::vector<uint8_t> stream;
+  if (!broken_bond::gfx::ReadDeviceDraw(device_guest.data(), device_guest.size(), kDevice, draw,
+                                        stream, reason) ||
+      draw.vertex_shader != 0xAABBCCDDu || draw.pixel_shader != 0x11223344u ||
+      draw.surface_info != 0x00020500u || draw.depth_control != 0x11111111u ||
+      draw.blend_control != 0x22222222u || draw.mode_cntl != 0x33333333u ||
+      draw.stream_stride_dwords != 2u || draw.stream_address != 0xC0004000u ||
+      draw.stream_bytes != 8u || stream.size() != 8u) {
+    return Fail(reason.empty() ? "device shadow did not return stream 0" : reason);
+  }
+  for (uint32_t i = 0; i < 8; ++i) {
+    if (stream[i] != static_cast<uint8_t>(i + 1u)) {
+      return Fail("vertex stream bytes did not match");
+    }
+  }
+  std::cout << "  device_draw_ok 1\n";
   return 0;
 }

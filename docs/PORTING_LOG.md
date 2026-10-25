@@ -695,6 +695,16 @@ way, except the low bit of the sum is dropped before the pack; the packet
 then sets that bit on the stored word. The header's dword at +44 is the
 byte count. A sum of `0x1235` is read from `0xC0001234`.
 
+`sub_821A47B0` writes stream 0 as vertex fetch constant 95. That is the two
+dwords at device+1912: the packed address without `0xC0000000`, then the
+byte count. The stride in dwords is the byte at device+12528. The vertex
+shader pointer is at device+12696, the pixel shader at device+12692,
+`RB_SURFACE_INFO` at device+10368, `RB_DEPTHCONTROL` at device+10548,
+`RB_BLENDCONTROL0` at device+10552, and `PA_SU_SC_MODE_CNTL` at
+device+10568. A packed address of `0x4000` and a count of 8 come back as
+`0xC0004000` and those 8 bytes, with stride 2. This reads a guest image of
+the shadow, not the live device.
+
 `GetTiledAddressLowerBound3D` masks Z with `~kTextureTileDepth` (`~4`) rather
 than `~(kTextureTileDepth - 1)`. On 300 of 600 tile corners, Z = 4 and
 Z = 12, it returns the previous 4 slices. For every block it stayed at or

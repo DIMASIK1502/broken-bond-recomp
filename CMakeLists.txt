@@ -98,6 +98,7 @@ if(EXISTS "${BROKEN_BOND_VULKAN_SDK}/Lib/vulkan-1.lib" AND
    EXISTS "${BROKEN_BOND_REXGLUE_SOURCE}/src/graphics/pipeline/texture/conversion.cpp")
     add_library(broken_bond_gfx STATIC
         src/gfx/device.cpp
+        src/gfx/device_shadow.cpp
         src/gfx/edram.cpp
         src/gfx/guest_stage.cpp
         src/gfx/shader_object.cpp
