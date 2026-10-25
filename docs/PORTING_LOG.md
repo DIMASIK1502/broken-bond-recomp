@@ -867,6 +867,17 @@ shaders. Title frames still cover about 1500 to 3800 pixels. Some frames
 cover about 52000. Forty draws once covered all 655360 pixels and frames
 of about 300000, and the present slipped toward 24 Hz, so the slot stays
 at 32. The window is still the Xenos present.
+The CPU fills one set of draw buffers while the GPU reads the other.
+A live draw signals a fence and does not wait for the queue. A readback
+draw still waits. The offline replay is unchanged: 182122 pixels after
+the first snapshot and 442981 after the eighth, 238 colors, first pixel
+186, 137, 125, 0. Forty-eight draws per present reach a full 655360-pixel
+frame and frames of about 48000, and the present falls to about 24 Hz.
+Forty draws hold 30 Hz: about 6000 draws in five seconds, 96 shaders.
+Title frames cover about 1200 to 2500 pixels. Some frames cover about
+51000 to 54000. A few samples are a cleared frame. Heavier frames leave
+a short 24 Hz tail, and the present stays near 33 ms. The slot is 40.
+The window is still the Xenos present.
 
 `GetTiledAddressLowerBound3D` masks Z with `~kTextureTileDepth` (`~4`) rather
 than `~(kTextureTileDepth - 1)`. On 300 of 600 tile corners, Z = 4 and

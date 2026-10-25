@@ -40,8 +40,12 @@ struct Device::Vulkan {
   uint32_t frame_width = 0;
   uint32_t frame_height = 0;
   bool frame_restart = false;
-  // Vertex and uniform bytes stay mapped for the life of the device.
-  DrawScratch* scratch = nullptr;
+  // Two mapped buffer sets. The CPU fills one while the GPU reads the other.
+  DrawScratch* scratch_ring[2] = {};
+  VkFence scratch_fence[2] = {};
+  VkCommandBuffer scratch_command[2] = {};
+  bool scratch_pending[2] = {};
+  uint32_t scratch_next = 0;
   // Pipelines and texture images are reused across draws.
   DrawCache* draw_cache = nullptr;
 
@@ -81,7 +85,17 @@ struct Device::Vulkan {
     if (device != VK_NULL_HANDLE) {
       vkDeviceWaitIdle(device);
       ReleaseFrameImages();
-      DestroyDrawScratch(device, scratch);
+      for (uint32_t i = 0; i < 2; ++i) {
+        if (scratch_command[i] != VK_NULL_HANDLE && pool != VK_NULL_HANDLE) {
+          vkFreeCommandBuffers(device, pool, 1, &scratch_command[i]);
+          scratch_command[i] = VK_NULL_HANDLE;
+        }
+        if (scratch_fence[i] != VK_NULL_HANDLE) {
+          vkDestroyFence(device, scratch_fence[i], nullptr);
+          scratch_fence[i] = VK_NULL_HANDLE;
+        }
+        DestroyDrawScratch(device, scratch_ring[i]);
+      }
       DestroyDrawCache(device, draw_cache);
     }
     if (pool != VK_NULL_HANDLE) {
@@ -1853,11 +1867,37 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
   constexpr VkDeviceSize kVertexBytes = (8u << 20) + 4096u;
   constexpr VkMemoryPropertyFlags kHost =
       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-  if (!EnsureDrawScratch(vulkan_->physical, device, vulkan_->scratch, reason)) {
-    cleanup();
-    return false;
+  uint32_t scratch_slot = vulkan_->scratch_next;
+  for (uint32_t i = 0; i < 2; ++i) {
+    if (!EnsureDrawScratch(vulkan_->physical, device, vulkan_->scratch_ring[i], reason)) {
+      cleanup();
+      return false;
+    }
+    if (vulkan_->scratch_fence[i] != VK_NULL_HANDLE) {
+      continue;
+    }
+    VkFenceCreateInfo fence_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    if (vkCreateFence(device, &fence_info, nullptr, &vulkan_->scratch_fence[i]) != VK_SUCCESS) {
+      reason = "guest draw fence failed";
+      cleanup();
+      return false;
+    }
   }
-  DrawScratch& scratch = *vulkan_->scratch;
+  if (vulkan_->scratch_pending[scratch_slot]) {
+    if (vkWaitForFences(device, 1, &vulkan_->scratch_fence[scratch_slot], VK_TRUE, UINT64_MAX) !=
+            VK_SUCCESS ||
+        vkResetFences(device, 1, &vulkan_->scratch_fence[scratch_slot]) != VK_SUCCESS) {
+      reason = "guest draw fence failed";
+      cleanup();
+      return false;
+    }
+    vulkan_->scratch_pending[scratch_slot] = false;
+  }
+  if (vulkan_->scratch_command[scratch_slot] != VK_NULL_HANDLE) {
+    vkFreeCommandBuffers(device, vulkan_->pool, 1, &vulkan_->scratch_command[scratch_slot]);
+    vulkan_->scratch_command[scratch_slot] = VK_NULL_HANDLE;
+  }
+  DrawScratch& scratch = *vulkan_->scratch_ring[scratch_slot];
   Buffer& shared = scratch.shared;
   Buffer (&constants)[4] = scratch.constants;
   Buffer& vertex_floats = scratch.vertex_floats;
@@ -2625,11 +2665,30 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
   VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
   submit.commandBufferCount = 1;
   submit.pCommandBuffers = &command;
-  if (vkQueueSubmit(vulkan_->queue, 1, &submit, VK_NULL_HANDLE) != VK_SUCCESS ||
-      vkQueueWaitIdle(vulkan_->queue) != VK_SUCCESS) {
+  const VkFence signal = readback_pixels ? VK_NULL_HANDLE : vulkan_->scratch_fence[scratch_slot];
+  if (vkQueueSubmit(vulkan_->queue, 1, &submit, signal) != VK_SUCCESS) {
     reason = "guest draw submit failed";
     cleanup();
     return false;
+  }
+  if (readback_pixels) {
+    if (vkQueueWaitIdle(vulkan_->queue) != VK_SUCCESS) {
+      reason = "guest draw submit failed";
+      cleanup();
+      return false;
+    }
+    for (uint32_t i = 0; i < 2; ++i) {
+      if (!vulkan_->scratch_pending[i]) {
+        continue;
+      }
+      vkResetFences(device, 1, &vulkan_->scratch_fence[i]);
+      vulkan_->scratch_pending[i] = false;
+    }
+  } else {
+    vulkan_->scratch_command[scratch_slot] = command;
+    command = VK_NULL_HANDLE;
+    vulkan_->scratch_pending[scratch_slot] = true;
+    vulkan_->scratch_next ^= 1u;
   }
   if (readback_pixels) {
     void* read = nullptr;
