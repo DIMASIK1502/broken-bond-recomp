@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "gfx/device.h"
+#include "host/device_repack.h"
 #include "gfx/device_shadow.h"
 #include "gfx/edram.h"
 #include "gfx/shader_object.h"
@@ -464,5 +465,95 @@ int main() {
     return Fail(reason.empty() ? "vertex declaration did not match the shadow" : reason);
   }
   std::cout << "  declaration_ok 1\n";
+
+  struct VectorBytes : broken_bond::host::GuestBytes {
+    const std::vector<uint8_t>* memory = nullptr;
+    bool Read(uint32_t address, void* dst, size_t bytes) const override {
+      const uint32_t physical = address & 0x1FFFFFFFu;
+      if (memory == nullptr || static_cast<uint64_t>(physical) + bytes > memory->size()) {
+        return false;
+      }
+      std::memcpy(dst, memory->data() + physical, bytes);
+      return true;
+    }
+  };
+  std::vector<uint8_t> live(0x40000, 0);
+  constexpr uint32_t kLiveDevice = 0xC0010000u;
+  store_be(live, kLiveDevice + 11820u, 0xC0020000u);
+  store_be(live, kLiveDevice + 12696u, 0xC0024000u);
+  store_be(live, kLiveDevice + 12692u, 0xC0028000u);
+  store_be(live, kLiveDevice + 1912u, 0x30000u);
+  store_be(live, kLiveDevice + 1916u, 8u);
+  live[(kLiveDevice + 12528u) & 0x1FFFFFFFu] = 5;
+  store_be(live, kLiveDevice + 1920u, 0x3F800000u);
+  store_be(live, 0xC0020000u + 24u, 1u);
+  store_be16(live, 0xC0020000u + 52u, 0);
+  store_be16(live, 0xC0020000u + 54u, 0);
+  store_be(live, 0xC0020000u + 56u, 0x31Au);
+  store_be(live, 0xC0024000u + 32u, 0);
+  store_be(live, 0xC0024000u + 896u, 0x100u);
+  store_be(live, 0xC0024100u + 872u, 0x34000u);
+  store_be(live, 0xC0024100u + 876u, 8u);
+  for (uint32_t i = 0; i < 8; ++i) {
+    live[0x34000u + i] = static_cast<uint8_t>(0x40u + i);
+  }
+  store_be(live, 0xC0028000u + 24u, 0);
+  store_be(live, 0xC0028000u + 64u, 0x40u);
+  store_be(live, 0xC0028040u + 40u, 0x38001u);
+  store_be(live, 0xC0028040u + 44u, 4u);
+  live[0x38000] = 0xAB;
+  live[0x38001] = 0xCD;
+  live[0x38002] = 0xEF;
+  live[0x38003] = 0x01;
+  for (uint32_t i = 0; i < 8; ++i) {
+    live[0x30000u + i] = static_cast<uint8_t>(0x50u + i);
+  }
+  VectorBytes live_bytes;
+  live_bytes.memory = &live;
+  std::vector<uint8_t> packed;
+  uint32_t packed_device = 0;
+  const std::string snapshot = "device-draw-test.bin";
+  std::vector<uint8_t> loaded;
+  uint32_t loaded_device = 0;
+  if (!broken_bond::host::RepackDeviceDraw(live_bytes, kLiveDevice, packed, packed_device, reason) ||
+      !broken_bond::host::WriteDeviceDrawFile(snapshot, packed, packed_device, reason) ||
+      !broken_bond::host::ReadDeviceDrawFile(snapshot, loaded, loaded_device, reason)) {
+    return Fail(reason.empty() ? "device draw snapshot was not written" : reason);
+  }
+  broken_bond::gfx::DeviceDraw packed_draw;
+  std::vector<uint8_t> packed_stream;
+  std::vector<broken_bond::gfx::VertexElement> packed_elements;
+  broken_bond::gfx::ShaderMicrocode packed_vertex;
+  broken_bond::gfx::ShaderMicrocode packed_pixel;
+  std::vector<uint8_t> packed_vertex_bytes;
+  std::vector<uint8_t> packed_pixel_bytes;
+  if (!broken_bond::gfx::ReadDeviceDraw(loaded.data(), loaded.size(), loaded_device, packed_draw,
+                                        packed_stream, reason) ||
+      !broken_bond::gfx::ReadDeviceDeclaration(loaded.data(), loaded.size(), loaded_device,
+                                               packed_elements, reason) ||
+      !broken_bond::gfx::ReadVertexShaderMicrocode(loaded.data(), loaded.size(),
+                                                   packed_draw.vertex_shader, packed_vertex,
+                                                   packed_vertex_bytes, reason) ||
+      !broken_bond::gfx::ReadPixelShaderMicrocode(loaded.data(), loaded.size(),
+                                                  packed_draw.pixel_shader, packed_pixel,
+                                                  packed_pixel_bytes, reason) ||
+      packed_draw.stream_bytes != 8u || packed_stream.size() != 8u ||
+      packed_draw.stream_stride_dwords != 5u || packed_elements.size() != 1u ||
+      packed_elements[0].format != 26u || !packed_elements[0].signed_components ||
+      packed_vertex.byte_count != 8u || packed_pixel.byte_count != 4u ||
+      packed_vertex_bytes.size() != 8u || packed_pixel_bytes.size() != 4u) {
+    return Fail(reason.empty() ? "repacked device draw did not round-trip" : reason);
+  }
+  for (uint32_t i = 0; i < 8; ++i) {
+    if (packed_stream[i] != static_cast<uint8_t>(0x50u + i) ||
+        packed_vertex_bytes[i] != static_cast<uint8_t>(0x40u + i)) {
+      return Fail("repacked stream or vertex microcode bytes did not match");
+    }
+  }
+  if (packed_pixel_bytes[0] != 0xAB || packed_pixel_bytes[1] != 0xCD ||
+      packed_pixel_bytes[2] != 0xEF || packed_pixel_bytes[3] != 0x01) {
+    return Fail("repacked pixel microcode bytes did not match");
+  }
+  std::cout << "  repack_ok 1\n";
   return 0;
 }

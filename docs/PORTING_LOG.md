@@ -713,6 +713,13 @@ stride comes from the byte at device+12528 plus the stream. Two elements
 come back as format 26 at dword 0 with stride 5, signed and integer, and
 format 6 at dword 2 with stride 4.
 
+`RepackDeviceDraw` copies that shadow, both shader objects, the declaration,
+stream 0, and both microcode blobs into one image and rewrites the pointers.
+A scattered guest image round-trips through `device-draw.bin` back into the
+same readers: 8 stream bytes, format 26, 8 vertex-shader bytes, and 4
+pixel-shader bytes. `--dump_device_draw` writes that file once from the
+flush before a draw. It stays off unless the flag is set.
+
 `GetTiledAddressLowerBound3D` masks Z with `~kTextureTileDepth` (`~4`) rather
 than `~(kTextureTileDepth - 1)`. On 300 of 600 tile corners, Z = 4 and
 Z = 12, it returns the previous 4 slices. For every block it stayed at or

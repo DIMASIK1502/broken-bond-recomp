@@ -16,6 +16,7 @@ set(BROKENBOND_SOURCES
     src/broken_bond_app.cpp
     src/compat/xusbcam.cpp
     src/host/boot_flags.cpp
+    src/host/device_repack.cpp
     src/host/guest_present.cpp
 )
 
@@ -117,7 +118,7 @@ if(EXISTS "${BROKEN_BOND_VULKAN_SDK}/Lib/vulkan-1.lib" AND
         "${BROKEN_BOND_VULKAN_SDK}/Lib/vulkan-1.lib")
     target_compile_options(broken_bond_gfx PRIVATE -Wno-unused-variable -Wno-unused-function)
 
-    add_executable(host_gfx tools/host_gfx.cpp)
+    add_executable(host_gfx tools/host_gfx.cpp src/host/device_repack.cpp)
     target_link_libraries(host_gfx PRIVATE broken_bond_gfx)
 endif()
 

@@ -1,13 +1,22 @@
 #include <atomic>
 #include <chrono>
+#include <cstdint>
+#include <cstring>
+#include <string>
 #include <thread>
+#include <vector>
 
+#include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/perf/counter.h>
 #include <rex/system/xthread.h>
 
 #include "generated/default/broken_bond_init.h"
 #include "broken_bond_app.h"
+#include "host/device_repack.h"
+
+REXCVAR_DEFINE_BOOL(dump_device_draw, false, "Game",
+                    "Write the first draw's device shadow to device-draw.bin");
 
 namespace {
 
@@ -98,10 +107,57 @@ void SampleLoop() {
 }  // namespace
 
 extern "C" void __imp__sub_821B1DD0(PPCContext& __restrict ctx, uint8_t* base);
+extern "C" void __imp__sub_821AE158(PPCContext& __restrict ctx, uint8_t* base);
+
+struct LiveGuestBytes : broken_bond::host::GuestBytes {
+  uint8_t* base = nullptr;
+  bool Read(uint32_t address, void* dst, size_t bytes) const override {
+    if (base == nullptr || bytes == 0 || bytes > (1u << 20) ||
+        static_cast<uint64_t>(address) + bytes > 0x100000000ull) {
+      return false;
+    }
+    const uint8_t* src = base + address;
+    if (address >= 0xE0000000u) {
+      src += 0x1000u;
+    }
+    std::memcpy(dst, src, bytes);
+    return true;
+  }
+};
+
+std::atomic<bool> g_draw_dumped{false};
+
+void MaybeDumpDeviceDraw(uint32_t device, uint8_t* base) {
+  if (!REXCVAR_GET(dump_device_draw) || g_draw_dumped.load(std::memory_order_relaxed)) {
+    return;
+  }
+  LiveGuestBytes live;
+  live.base = base;
+  std::vector<uint8_t> image;
+  uint32_t image_device = 0;
+  std::string reason;
+  if (!broken_bond::host::RepackDeviceDraw(live, device, image, image_device, reason) ||
+      !broken_bond::host::WriteDeviceDrawFile("device-draw.bin", image, image_device, reason)) {
+    static bool logged = false;
+    if (!logged) {
+      logged = true;
+      REXLOG_INFO("device draw dump waiting: {}", reason);
+    }
+    return;
+  }
+  g_draw_dumped.store(true, std::memory_order_relaxed);
+  REXLOG_INFO("device draw dumped: {} bytes at {:08X} -> device-draw.bin", image.size(),
+              image_device);
+}
 
 REX_HOOK_RAW(sub_821B1DD0) {
   NoteSwapCaller(static_cast<uint32_t>(ctx.lr));
   __imp__sub_821B1DD0(ctx, base);
+}
+
+REX_HOOK_RAW(sub_821AE158) {
+  MaybeDumpDeviceDraw(static_cast<uint32_t>(ctx.r3.u32), base);
+  __imp__sub_821AE158(ctx, base);
 }
 
 void BrokenBondApp::OnPostLaunchModule(rex::system::XThread*) {
