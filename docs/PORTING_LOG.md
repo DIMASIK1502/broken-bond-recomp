@@ -853,7 +853,10 @@ draws in five seconds, all from the cache. One frame of those draws
 covers about 1900 pixels in 165 colors. The earlier 492257-pixel image
 was carried over from before the clear. Skips now also name a missing
 semantic marker, a missing shader, and surface pitches 320 and 640.
-The window is still the Xenos present.
+A shader that fails to draw is remembered by its address, so the next
+present does not pack it again. After the cache is full the title stays
+at 30 Hz: about 900 draws in five seconds, 96 shaders, and one frame
+covers about 1800 pixels. The window is still the Xenos present.
 
 `GetTiledAddressLowerBound3D` masks Z with `~kTextureTileDepth` (`~4`) rather
 than `~(kTextureTileDepth - 1)`. On 300 of 600 tile corners, Z = 4 and

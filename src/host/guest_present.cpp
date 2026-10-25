@@ -236,6 +236,9 @@ void SubmitHostSpan(uint32_t device, const broken_bond::host::DrawSpan& span, ui
   std::string reason;
   if (!broken_bond::host::RepackDeviceDraw(live, device, identity, identity_device, reason, span,
                                            false)) {
+    if (have_address) {
+      g_host_seen.insert(address_key);
+    }
     ++g_host_counts.skipped;
     HostNote(reason.empty() ? "host draw was not packed" : reason);
     HostLog();
@@ -244,6 +247,9 @@ void SubmitHostSpan(uint32_t device, const broken_bond::host::DrawSpan& span, ui
   bool shader_cached = false;
   if (!broken_bond::gfx::RetainedShaderCached(identity.data(), identity.size(), identity_device,
                                              shader_cached, reason)) {
+    if (have_address) {
+      g_host_seen.insert(address_key);
+    }
     ++g_host_counts.skipped;
     HostNote(reason.empty() ? "host shader was not read" : reason);
     HostLog();
@@ -266,6 +272,9 @@ void SubmitHostSpan(uint32_t device, const broken_bond::host::DrawSpan& span, ui
   std::vector<uint8_t> image;
   uint32_t image_device = 0;
   if (!broken_bond::host::RepackDeviceDraw(live, device, image, image_device, reason, span)) {
+    if (have_address) {
+      g_host_seen.insert(address_key);
+    }
     ++g_host_counts.skipped;
     HostNote(reason.empty() ? "host draw was not packed" : reason);
     HostLog();
@@ -274,6 +283,9 @@ void SubmitHostSpan(uint32_t device, const broken_bond::host::DrawSpan& span, ui
   broken_bond::gfx::RetainedDrawInfo info;
   if (!broken_bond::gfx::SubmitRetainedDraw(*g_host, image.data(), image.size(), image_device,
                                            !shader_cached, false, info, reason)) {
+    if (have_address) {
+      g_host_seen.insert(address_key);
+    }
     if (reason.rfind("deferred", 0) == 0) {
       ++g_host_counts.deferred;
     } else {
