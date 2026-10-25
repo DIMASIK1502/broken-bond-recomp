@@ -101,8 +101,10 @@ bool RepackDeviceDraw(const GuestBytes& live, uint32_t device, std::vector<uint8
     reason = "device draw is missing a shader";
     return false;
   }
-  // An empty or oversized stream is decided from two dwords. The copy below
-  // stays off the draw until a stream actually fits.
+  // device+1916 is the buffer end minus the offset. On this title that is
+  // the arena leftover, hundreds of megabytes, not the indices of the draw.
+  // The draw count is num_indices in the initiator, so an oversized value
+  // is rejected before the copy.
   if (stream_bytes == 0 || stream_bytes > kMaxStream) {
     reason = "vertex stream is " + std::to_string(stream_bytes) + " bytes";
     return false;

@@ -742,7 +742,11 @@ swizzled `zxyw`. The pixel shader samples `tf0` and multiplies by `c12`.
 The translator pads a 3-float fetch with 0, so the draw loads a fourth
 float of 1 for that w. Every pixel of a 1280×512 target comes back
 255, 10, 10, 255. The same three vertices can be passed in as stream bytes,
-and every pixel still comes back that color.
+and every pixel still comes back that color. The shared vertex buffer is
+8 MB. The dword at device+1916 is the buffer end minus the offset. A title
+run left about 272 MB there, and the value changed on every draw, so it is
+the arena leftover rather than the mesh. The draw's own count is
+`num_indices`, the high 16 bits of `VGT_DRAW_INITIATOR`.
 
 `GetTiledAddressLowerBound3D` masks Z with `~kTextureTileDepth` (`~4`) rather
 than `~(kTextureTileDepth - 1)`. On 300 of 600 tile corners, Z = 4 and
