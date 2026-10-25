@@ -644,7 +644,24 @@ then copies the 24 bytes at surface+28. It rewrites the low 6 bits of the
 dword at surface+32 from 50 to 6 (`k_8_8_8_8_AS_16_16_16_16` to `k_8_8_8_8`)
 and from 7 to 54 (`k_2_10_10_10` to `k_2_10_10_10_AS_16_16_16_16`). A
 1280×512 4×MSAA 32-bit color target is 10 MB, the whole EDRAM, so the depth
-base shares those tiles. The host still does not read them.
+base shares those tiles. The host still does not read them. `sub_8219E530`
+binds sampler `s`: the texture pointer is at device+12544+4*s, and the six
+dwords at device+1152+24*s are the fetch constant. The object already holds
+those words. Dword 0 at object+28 keeps the type, the component signs, the
+pitch in bits 22:30, and the tiled bit 31; the clamps stay in the shadow.
+Dword 1 at object+32 keeps the format in bits 0:5, the endian in bits 6:7,
+and the guest base address in the bits the same GPU packing keeps; bit 11
+stays from the sampler. Dword 2 at object+36 is the size. Dword 3 at
+object+40 keeps the number format, the swizzle, and the exponent; the
+filters stay in the shadow. Dword 4 at object+44 keeps the mip range in bits
+2:9, then the byte at device+11950+s raises the minimum and the byte at
+device+11976+s lowers the maximum. Dword 5 at object+48 keeps the dimension
+in bits 9:10, packed mips in bit 11, and the guest mip address. The call ORs
+its mask into device+24. `sub_821AE158` sends the low half of that qword
+through `sub_821B5D68`, which copies each dirty run of 24 bytes to
+`SHADER_CONSTANT_FETCH` at register `0x4800` plus 6 per slot. Bit 31 of that
+mask is slot 0, and `sub_825FABE0` binds that slot from its object. The host
+still does not sample the shadow.
 
 `GetTiledAddressLowerBound3D` masks Z with `~kTextureTileDepth` (`~4`) rather
 than `~(kTextureTileDepth - 1)`. On 300 of 600 tile corners, Z = 4 and
