@@ -256,7 +256,19 @@ bool PatchVertexDeclaration(uint32_t* dwords, uint32_t dword_count,
           return false;
         }
         const VertexElement& element = *by_instruction[instruction];
-        dwords[at + 1] = (dwords[at + 1] & ~(0x3Fu << 16)) | ((element.format & 0x3Fu) << 16);
+        uint32_t word1 = dwords[at + 1];
+        word1 = (word1 & ~(0x3Fu << 16)) | ((element.format & 0x3Fu) << 16);
+        if (element.signed_components) {
+          word1 |= 1u << 12;
+        } else {
+          word1 &= ~(1u << 12);
+        }
+        if (element.integer_components) {
+          word1 |= 1u << 13;
+        } else {
+          word1 &= ~(1u << 13);
+        }
+        dwords[at + 1] = word1;
         const uint32_t offset = static_cast<uint32_t>(element.offset_words) & 0x7FFFFFu;
         dwords[at + 2] = (dwords[at + 2] & ~0x7FFFFF00u) | (offset << 8);
         dwords[at + 2] = (dwords[at + 2] & ~0xFFu) | (element.stride_words & 0xFFu);

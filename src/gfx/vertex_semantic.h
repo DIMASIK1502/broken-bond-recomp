@@ -26,6 +26,8 @@ struct VertexElement {
   uint32_t format = 0;
   int32_t offset_words = 0;
   uint32_t stride_words = 0;
+  bool signed_components = false;
+  bool integer_components = false;
 };
 
 const char* VertexUsageName(uint32_t usage);

@@ -534,6 +534,7 @@ struct TranslateStats {
   std::vector<GuestDraw> guest_interpolated;
   std::vector<GuestDraw> guest_vertices;
   std::vector<GuestDraw> guest_declared;
+  std::vector<GuestDraw> guest_short;
   uint32_t guest_textured_seen = 0;
   uint32_t guest_interpolated_seen = 0;
   uint32_t guest_vertex_seen = 0;
@@ -1770,6 +1771,70 @@ void TranslateShader(rex::graphics::SpirvShaderTranslator& translator, uint32_t 
           }
         }
       }
+      if (stage.vertex && stage.images == 0 && stage.samplers == 0 &&
+          (shader.writes_interpolators() & 1u) != 0 && shader.memexport_eM_written() == 0 &&
+          shader.vertex_bindings().size() == 1 && shader.vertex_bindings()[0].attributes.size() == 1 &&
+          stats.guest_short.size() < 8 && object != nullptr) {
+        const rex::graphics::Shader::VertexBinding::Attribute& attribute =
+            shader.vertex_bindings()[0].attributes[0];
+        const bool index_x = attribute.fetch_instr.operand_count > 0 &&
+                             attribute.fetch_instr.operands[0].storage_source ==
+                                 rex::graphics::InstructionStorageSource::kRegister &&
+                             attribute.fetch_instr.operands[0].storage_index == 0 &&
+                             !attribute.fetch_instr.operands[0].is_negated &&
+                             attribute.fetch_instr.operands[0].components[0] ==
+                                 rex::graphics::SwizzleSource::kX;
+        std::vector<broken_bond::gfx::VertexFetchSemantic> semantics;
+        std::string reason;
+        if (index_x &&
+            broken_bond::gfx::ReadVertexFetchSemantics(object, object_size, semantics, reason) &&
+            semantics.size() == 1 && semantics[0].usage == 0 && semantics[0].usage_index == 0) {
+          broken_bond::gfx::VertexElement element;
+          element.usage = 0;
+          element.format = 26;
+          element.offset_words = 0;
+          element.stride_words = 2;
+          element.signed_components = true;
+          element.integer_components = true;
+          std::vector<uint32_t> patched_ucode(ucode.dword_count);
+          for (uint32_t i = 0; i < ucode.dword_count; ++i) {
+            patched_ucode[i] = HostFromBe(ucode.dwords[i]);
+          }
+          if (broken_bond::gfx::PatchVertexDeclaration(
+                  patched_ucode.data(), uint32_t(patched_ucode.size()), semantics.data(), 1,
+                  &element, 1, reason)) {
+            rex::graphics::SpirvShader patched(rex::graphics::xenos::ShaderType::kVertex, 0,
+                                              patched_ucode.data(), patched_ucode.size(),
+                                              std::endian::native);
+            rex::string::StringBuffer patched_disassembly;
+            patched.AnalyzeUcode(patched_disassembly);
+            rex::graphics::SpirvShaderTranslator::Modification modification(
+                translator.GetDefaultVertexShaderModification(0));
+            modification.vertex.interpolator_mask = 1;
+            rex::graphics::Shader::Translation& shortened =
+                *patched.GetOrCreateTranslation(modification.value);
+            if (translator.TranslateAnalyzedShader(shortened)) {
+              const std::vector<uint8_t>& again = shortened.translated_binary();
+              if (again.size() >= 4 && again.size() % 4 == 0) {
+                TranslateStats::GuestDraw draw;
+                draw.vertex = true;
+                draw.words.assign(reinterpret_cast<const uint32_t*>(again.data()),
+                                  reinterpret_cast<const uint32_t*>(again.data() + again.size()));
+                broken_bond::gfx::VertexStream stream;
+                stream.fetch_constant = shader.vertex_bindings()[0].fetch_constant;
+                stream.stride_words = 2;
+                stream.index_register = 0;
+                stream.attribute_count = 1;
+                stream.attributes[0].offset_words = 0;
+                stream.attributes[0].components = 4;
+                stream.attributes[0].short4 = true;
+                draw.streams.push_back(stream);
+                stats.guest_short.push_back(std::move(draw));
+              }
+            }
+          }
+        }
+      }
 #endif
       ++stats.ok;
       stats.spirv_bytes += binary.size();
@@ -2590,6 +2655,7 @@ int main(int argc, char** argv) {
     draw_batch(translated.guest_interpolated, "guest_interp");
     draw_batch(translated.guest_vertices, "guest_vert");
     draw_batch(translated.guest_declared, "guest_decl");
+    draw_batch(translated.guest_short, "guest_short");
     uint32_t link_full = 0;
     if (!guest_open || link_fragment.empty() || translated.guest_declared.empty()) {
       std::cout << "guest_link missing\n";

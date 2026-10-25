@@ -565,8 +565,14 @@ linked to the guest pixel shader that copies interpolator 0 unchanged
 (255,64,127,255 from the constant vertex stage, then 0,64,127,255). Each
 linked draw matched the passthrough fragment on all 64 pixels, including the
 shader that writes white and the seven that write black. Location 0 of the
-vertex stage is interpolator 0 of the pixel stage. The declaration is still
-the synthetic float4, and EDRAM is still absent.
+vertex stage is interpolator 0 of the pixel stage. `vscommon.hlsl` says a
+position is often a signed `SHORT4` whose w holds 32767/scale, and
+`DecompressPosition` divides by w. Uncompressed positions (`SHORT2N`,
+`FLOAT2`, `FLOAT3`) keep w at 1. Eight single-fetch position shaders were
+patched to signed integer `SHORT4` (format 26, stride 2) with that w set to
+1. Each one matched its float4 draw: the same coverage, 64 or 32 pixels, and
+the same first pixel. The declaration is still not the mesh the game binds,
+and EDRAM is still absent.
 
 `GetTiledAddressLowerBound3D` masks Z with `~kTextureTileDepth` (`~4`) rather
 than `~(kTextureTileDepth - 1)`. On 300 of 600 tile corners, Z = 4 and

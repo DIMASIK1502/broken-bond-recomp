@@ -1,5 +1,6 @@
 #include "gfx/device.h"
 
+#include <cstdint>
 #include <cstring>
 #include <vector>
 
@@ -1287,12 +1288,26 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
       for (uint32_t vertex = 0; vertex < 3; ++vertex) {
         for (uint32_t a = 0; a < stream.attribute_count && a < 8; ++a) {
           const VertexAttribute& attribute = stream.attributes[a];
-          if (!attribute.is_float || attribute.components == 0 || a != stream.triangle_attribute) {
-            continue;
-          }
           const int32_t at = stream.stride_words == 0
                                  ? int32_t(base) + attribute.offset_words
                                  : int32_t(base + vertex * stream.stride_words) + attribute.offset_words;
+          if (attribute.short4 && a == stream.triangle_attribute) {
+            const int16_t packed[4] = {
+                static_cast<int16_t>(triangle[vertex][0]),
+                static_cast<int16_t>(triangle[vertex][1]),
+                static_cast<int16_t>(triangle[vertex][2]),
+                static_cast<int16_t>(triangle[vertex][3]),
+            };
+            if (at < 0 || uint32_t(at) + 2 > kDwords) {
+              continue;
+            }
+            memory[at] = (uint32_t(uint16_t(packed[1])) << 16) | uint16_t(packed[0]);
+            memory[at + 1] = (uint32_t(uint16_t(packed[3])) << 16) | uint16_t(packed[2]);
+            continue;
+          }
+          if (!attribute.is_float || attribute.components == 0 || a != stream.triangle_attribute) {
+            continue;
+          }
           if (at < 0 || uint32_t(at) + attribute.components > kDwords) {
             continue;
           }

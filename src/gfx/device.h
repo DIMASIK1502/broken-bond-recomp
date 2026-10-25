@@ -19,6 +19,8 @@ struct VertexAttribute {
   int32_t offset_words = 0;
   uint32_t components = 0;
   bool is_float = false;
+  // Four signed integer shorts packed into two dwords: x,y then z,w.
+  bool short4 = false;
 };
 
 struct VertexStream {
