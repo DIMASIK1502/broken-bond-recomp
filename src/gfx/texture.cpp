@@ -266,6 +266,10 @@ bool LevelLayoutFor(uint32_t format, LevelLayout& out) {
     out = {4u, 8u, 3u};
     return true;
   }
+  if (format == static_cast<uint32_t>(rex::graphics::xenos::TextureFormat::k_DXT4_5)) {
+    out = {4u, 16u, 4u};
+    return true;
+  }
   return false;
 }
 
@@ -318,6 +322,42 @@ void DecodeDxt1Block(const uint8_t* block, uint8_t* linear, uint32_t width, uint
   }
 }
 
+void DecodeDxt5Block(const uint8_t* block, uint8_t* linear, uint32_t width, uint32_t height,
+                     uint32_t x0, uint32_t y0) {
+  DecodeDxt1Block(block + 8, linear, width, height, x0, y0);
+  const uint32_t alpha0 = block[0];
+  const uint32_t alpha1 = block[1];
+  uint8_t alpha[8];
+  alpha[0] = static_cast<uint8_t>(alpha0);
+  alpha[1] = static_cast<uint8_t>(alpha1);
+  if (alpha0 > alpha1) {
+    for (uint32_t i = 1; i <= 6u; ++i) {
+      alpha[i + 1] = static_cast<uint8_t>(((7u - i) * alpha0 + i * alpha1) / 7u);
+    }
+  } else {
+    for (uint32_t i = 1; i <= 4u; ++i) {
+      alpha[i + 1] = static_cast<uint8_t>(((5u - i) * alpha0 + i * alpha1) / 5u);
+    }
+    alpha[6] = 0;
+    alpha[7] = 255;
+  }
+  uint64_t indices = 0;
+  for (uint32_t i = 0; i < 6u; ++i) {
+    indices |= uint64_t(block[2u + i]) << (8u * i);
+  }
+  for (uint32_t py = 0; py < 4u; ++py) {
+    for (uint32_t px = 0; px < 4u; ++px) {
+      const uint32_t x = x0 + px;
+      const uint32_t y = y0 + py;
+      if (x >= width || y >= height) {
+        continue;
+      }
+      const uint32_t index = (indices >> ((py * 4u + px) * 3u)) & 7u;
+      linear[(static_cast<size_t>(y) * width + x) * 4u + 3u] = alpha[index];
+    }
+  }
+}
+
 void SwapBlock(uint8_t* block, uint32_t bytes, uint32_t endian) {
   for (uint32_t at = 0; at + 4u <= bytes; at += 4u) {
     uint32_t word = 0;
@@ -354,7 +394,7 @@ bool LoadGuestTextureRgba8(uint32_t format, uint32_t width, uint32_t height, uin
                            std::vector<uint8_t>& linear, std::string& reason) {
   LevelLayout level;
   if (!LevelLayoutFor(format, level) || endian > 3u || guest == nullptr) {
-    reason = guest == nullptr ? "empty texture" : "texture format is not RGBA8 or DXT1";
+    reason = guest == nullptr ? "empty texture" : "texture format is not RGBA8, DXT1, or DXT5";
     if (endian > 3u) {
       reason = "texture endian is out of range";
     }
@@ -386,7 +426,7 @@ bool LoadGuestTextureRgba8(uint32_t format, uint32_t width, uint32_t height, uin
   } else {
     const rex::graphics::FormatInfo* info = rex::graphics::FormatInfo::Get(format);
     if (info == nullptr || info->bytes_per_block() != level.bytes_per_block) {
-      reason = "DXT1 is not an 8-byte block";
+      reason = "compressed block size does not match the format";
       return false;
     }
     rex::graphics::texture_conversion::UntileInfo untile{};
@@ -405,7 +445,11 @@ bool LoadGuestTextureRgba8(uint32_t format, uint32_t width, uint32_t height, uin
     for (uint32_t bx = 0; bx < width_blocks; ++bx) {
       uint8_t* block = blocks.data() + (static_cast<size_t>(by) * width_blocks + bx) * level.bytes_per_block;
       SwapBlock(block, level.bytes_per_block, endian);
-      DecodeDxt1Block(block, linear.data(), width, height, bx * level.block, by * level.block);
+      if (format == static_cast<uint32_t>(rex::graphics::xenos::TextureFormat::k_DXT4_5)) {
+        DecodeDxt5Block(block, linear.data(), width, height, bx * level.block, by * level.block);
+      } else {
+        DecodeDxt1Block(block, linear.data(), width, height, bx * level.block, by * level.block);
+      }
     }
   }
   return true;

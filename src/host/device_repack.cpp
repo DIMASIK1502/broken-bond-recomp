@@ -35,6 +35,10 @@ bool LevelLayoutFor(uint32_t format, LevelLayout& out) {
     out = {4u, 8u, 3u};
     return true;
   }
+  if (format == static_cast<uint32_t>(rex::graphics::xenos::TextureFormat::k_DXT4_5)) {
+    out = {4u, 16u, 4u};
+    return true;
+  }
   return false;
 }
 

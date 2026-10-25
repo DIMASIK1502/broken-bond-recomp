@@ -48,12 +48,13 @@ bool LoadFetchRgba8(const uint32_t words[6], const uint8_t* guest, size_t guest_
                     std::vector<uint8_t>& linear, std::string& reason);
 
 // Bytes of one 2D base level, using the SDK tile bound. format 6 is
-// k_8_8_8_8 and format 18 is k_DXT1. Zero when the pitch does not cover it.
+// k_8_8_8_8, format 18 is k_DXT1, and format 20 is k_DXT4_5. Zero when the
+// pitch does not cover it.
 uint32_t GuestTextureBytes(uint32_t format, uint32_t width, uint32_t height, uint32_t pitch,
                            bool tiled);
 
-// guest is the raw base level. format 18 is decoded from DXT1 after the
-// fetch endian swap. linear comes back tightly packed RGBA8.
+// guest is the raw base level. format 18 is DXT1 and format 20 is DXT5,
+// decoded after the fetch endian swap. linear comes back tightly packed RGBA8.
 bool LoadGuestTextureRgba8(uint32_t format, uint32_t width, uint32_t height, uint32_t pitch,
                            uint32_t endian, bool tiled, const uint8_t* guest, size_t guest_bytes,
                            std::vector<uint8_t>& linear, std::string& reason);

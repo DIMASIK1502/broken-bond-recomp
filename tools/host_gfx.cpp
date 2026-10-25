@@ -651,6 +651,53 @@ int main(int argc, char** argv) {
       decoded[0] != 255 || decoded[1] != 0 || decoded[2] != 0 || decoded[3] != 255) {
     return Fail(reason.empty() ? "k8in16 DXT1 did not decode to red" : reason);
   }
+  const uint32_t dxt5_bytes = broken_bond::host::TextureCopyBytes(20, 4, 4, 4, false);
+  if (dxt5_bytes != 16u || dxt5_bytes != broken_bond::gfx::GuestTextureBytes(20, 4, 4, 4, false) ||
+      broken_bond::host::TextureCopyBytes(20, 32, 32, 32, true) == 0u ||
+      broken_bond::host::TextureCopyBytes(20, 32, 32, 32, true) !=
+          broken_bond::gfx::GuestTextureBytes(20, 32, 32, 32, true)) {
+    return Fail("DXT5 copy size does not match the block");
+  }
+  uint8_t dxt5[16] = {};
+  dxt5[0] = 255;
+  dxt5[1] = 0;
+  dxt5[8] = 0x00;
+  dxt5[9] = 0xF8;
+  dxt5[10] = 0x1F;
+  dxt5[11] = 0x00;
+  if (!broken_bond::gfx::LoadGuestTextureRgba8(20, 4, 4, 4, 0, false, dxt5, 16, decoded, reason) ||
+      decoded.size() != 64u || decoded[0] != 255 || decoded[1] != 0 || decoded[2] != 0 ||
+      decoded[3] != 255) {
+    return Fail(reason.empty() ? "DXT5 did not decode to opaque red" : reason);
+  }
+  dxt5[0] = 0;
+  dxt5[1] = 255;
+  uint64_t alpha_bits = 0;
+  for (uint32_t i = 0; i < 16u; ++i) {
+    alpha_bits |= 6ull << (3u * i);
+  }
+  for (uint32_t i = 0; i < 6u; ++i) {
+    dxt5[2u + i] = static_cast<uint8_t>(alpha_bits >> (8u * i));
+  }
+  if (!broken_bond::gfx::LoadGuestTextureRgba8(20, 4, 4, 4, 0, false, dxt5, 16, decoded, reason) ||
+      decoded[0] != 255 || decoded[3] != 0) {
+    return Fail(reason.empty() ? "DXT5 alpha 6 did not decode to zero" : reason);
+  }
+  uint8_t dxt5_swapped[16];
+  dxt5[0] = 255;
+  dxt5[1] = 0;
+  for (uint32_t i = 2; i < 8u; ++i) {
+    dxt5[i] = 0;
+  }
+  for (uint32_t i = 0; i < 16u; i += 2u) {
+    dxt5_swapped[i] = dxt5[i + 1];
+    dxt5_swapped[i + 1] = dxt5[i];
+  }
+  if (!broken_bond::gfx::LoadGuestTextureRgba8(20, 4, 4, 4, 1, false, dxt5_swapped, 16, decoded,
+                                              reason) ||
+      decoded[0] != 255 || decoded[1] != 0 || decoded[2] != 0 || decoded[3] != 255) {
+    return Fail(reason.empty() ? "k8in16 DXT5 did not decode to opaque red" : reason);
+  }
   std::vector<uint8_t> tiled_guest(dxt_small, 0);
   const uint32_t tiled_block = static_cast<uint32_t>(
       rex::graphics::texture_util::GetTiledOffset2D(1, 0, 8, 3));

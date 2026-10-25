@@ -291,7 +291,7 @@ bool SubmitRetainedDraw(Device& device, const uint8_t* image, size_t image_bytes
   const bool texture_tail = texture_bytes != 0 && texture_offset <= image_bytes &&
                             texture_bytes <= image_bytes - texture_offset &&
                             texture_offset + texture_bytes == image_bytes &&
-                            (texture_format == 6u || texture_format == 18u);
+                            (texture_format == 6u || texture_format == 18u || texture_format == 20u);
   if (program->image_count != 0 && !texture_tail) {
     reason = texture_format == 0 ? "host texture is absent"
                                  : "host texture format is " + std::to_string(texture_format);

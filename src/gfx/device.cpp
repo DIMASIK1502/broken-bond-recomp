@@ -601,7 +601,7 @@ bool DecodeRaster(const Device::RasterState& raster, uint32_t width, DecodedRast
   rex::graphics::reg::RB_SURFACE_INFO surface{};
   surface.value = raster.surface_info;
   if (surface.surface_pitch != width) {
-    reason = "surface pitch does not match the draw width";
+    reason = "surface pitch is " + std::to_string(surface.surface_pitch);
     return false;
   }
   switch (static_cast<uint32_t>(surface.msaa_samples)) {

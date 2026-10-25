@@ -828,6 +828,15 @@ title still presents at 30 Hz. Over five seconds the host submits about
 The retained 1280×512 image then covers 378344 pixels in 53 colors. Format
 20 and a surface whose pitch is not the draw width are skipped. The window
 is still the Xenos present.
+Format 20 is `k_DXT4_5`: a 4×4 block of 16 bytes, tiled with a byte-size
+log of 4. The color half is the DXT1 block and the first eight bytes are
+the DXT5 alpha. The same layout is what the guest copy counts, so those
+bytes now reach the upload. Sixteen draws are submitted per present, and
+a shader is still translated at most 32 times. The title stays at 30 Hz.
+Over five seconds the host submits about 750 draws, all from the cache
+after the first window, across 32 shaders. The retained image covers
+492257 pixels in about 450 colors. One surface, pitch 160, is still
+skipped. The window is still the Xenos present.
 
 `GetTiledAddressLowerBound3D` masks Z with `~kTextureTileDepth` (`~4`) rather
 than `~(kTextureTileDepth - 1)`. On 300 of 600 tile corners, Z = 4 and
