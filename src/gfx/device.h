@@ -73,7 +73,8 @@ class Device {
                      std::vector<uint8_t>& out, std::string& reason);
 
   // Words from the device shadow. surface_info is RB_SURFACE_INFO: pitch in
-  // bits 0:13 must equal the draw width, and MSAA bits 16:17 must be 1x.
+  // bits 0:13 must equal the draw width. MSAA bits 16:17 are 1x, 2x, or 4x.
+  // A multisampled target is resolved to one sample before the readback.
   // depth_control is RB_DEPTHCONTROL, blend_control is RB_BLENDCONTROL0, and
   // mode_cntl is PA_SU_SC_MODE_CNTL. The clear color is what shows through
   // when the triangle is culled, blended away, or rejected by the depth test.

@@ -542,17 +542,32 @@ struct DecodedRaster {
   VkBlendFactor dst_alpha = VK_BLEND_FACTOR_ZERO;
   VkBlendOp color_op = VK_BLEND_OP_ADD;
   VkBlendOp alpha_op = VK_BLEND_OP_ADD;
+  VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
 };
 
 bool DecodeRaster(const Device::RasterState& raster, uint32_t width, DecodedRaster& out,
-                  std::string& reason) {
+                  std::string& reason, bool multisample = false) {
   rex::graphics::reg::RB_SURFACE_INFO surface{};
   surface.value = raster.surface_info;
   if (surface.surface_pitch != width) {
     reason = "surface pitch does not match the draw width";
     return false;
   }
-  if (static_cast<uint32_t>(surface.msaa_samples) != 0) {
+  switch (static_cast<uint32_t>(surface.msaa_samples)) {
+    case 0:
+      out.samples = VK_SAMPLE_COUNT_1_BIT;
+      break;
+    case 1:
+      out.samples = VK_SAMPLE_COUNT_2_BIT;
+      break;
+    case 2:
+      out.samples = VK_SAMPLE_COUNT_4_BIT;
+      break;
+    default:
+      reason = "surface MSAA is not 1x, 2x, or 4x";
+      return false;
+  }
+  if (!multisample && out.samples != VK_SAMPLE_COUNT_1_BIT) {
     reason = "surface MSAA is not 1x";
     return false;
   }
@@ -611,7 +626,7 @@ bool Device::DrawTexturedRgba8(const uint8_t* pixels, uint32_t width, uint32_t h
     return false;
   }
   DecodedRaster decoded;
-  if (fixed_state != nullptr && !DecodeRaster(*fixed_state, width, decoded, reason)) {
+  if (fixed_state != nullptr && !DecodeRaster(*fixed_state, width, decoded, reason, true)) {
     return false;
   }
 
@@ -699,6 +714,7 @@ bool Device::DrawTexturedRgba8(const uint8_t* pixels, uint32_t width, uint32_t h
   Buffer readback{};
   Image texture{};
   Image target{};
+  Image resolve{};
   Image depth{};
   VkImageView texture_view = VK_NULL_HANDLE;
   VkImageView target_view = VK_NULL_HANDLE;
@@ -748,13 +764,14 @@ bool Device::DrawTexturedRgba8(const uint8_t* pixels, uint32_t width, uint32_t h
       vkDestroyImageView(device, depth_view, nullptr);
     }
     DestroyImage(device, depth);
+    DestroyImage(device, resolve);
     DestroyImage(device, target);
     DestroyImage(device, texture);
     DestroyBuffer(device, readback);
     DestroyBuffer(device, source);
   };
 
-  auto make_image = [&](VkImageUsageFlags usage, Image& image) {
+  auto make_image = [&](VkImageUsageFlags usage, Image& image, VkSampleCountFlagBits samples) {
     VkImageCreateInfo info{};
     info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     info.imageType = VK_IMAGE_TYPE_2D;
@@ -762,7 +779,7 @@ bool Device::DrawTexturedRgba8(const uint8_t* pixels, uint32_t width, uint32_t h
     info.extent = {width, height, 1};
     info.mipLevels = 1;
     info.arrayLayers = 1;
-    info.samples = VK_SAMPLE_COUNT_1_BIT;
+    info.samples = samples;
     info.tiling = VK_IMAGE_TILING_OPTIMAL;
     info.usage = usage;
     info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -799,8 +816,13 @@ bool Device::DrawTexturedRgba8(const uint8_t* pixels, uint32_t width, uint32_t h
       !MakeBuffer(vulkan_->physical, device, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                   readback, reason) ||
-      !make_image(VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, texture) ||
-      !make_image(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, target)) {
+      !make_image(VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, texture,
+                  VK_SAMPLE_COUNT_1_BIT) ||
+      !make_image(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, target,
+                  decoded.samples) ||
+      (decoded.samples != VK_SAMPLE_COUNT_1_BIT &&
+       !make_image(VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, resolve,
+                   VK_SAMPLE_COUNT_1_BIT))) {
     cleanup();
     return false;
   }
@@ -812,7 +834,7 @@ bool Device::DrawTexturedRgba8(const uint8_t* pixels, uint32_t width, uint32_t h
     depth_info.extent = {width, height, 1};
     depth_info.mipLevels = 1;
     depth_info.arrayLayers = 1;
-    depth_info.samples = VK_SAMPLE_COUNT_1_BIT;
+    depth_info.samples = decoded.samples;
     depth_info.tiling = VK_IMAGE_TILING_OPTIMAL;
     depth_info.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
     depth_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -1000,7 +1022,7 @@ bool Device::DrawTexturedRgba8(const uint8_t* pixels, uint32_t width, uint32_t h
   raster.lineWidth = 1.0f;
   VkPipelineMultisampleStateCreateInfo multisample{};
   multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-  multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+  multisample.rasterizationSamples = decoded.samples;
   VkPipelineColorBlendAttachmentState attachment{};
   attachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
                               VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
@@ -1165,7 +1187,38 @@ bool Device::DrawTexturedRgba8(const uint8_t* pixels, uint32_t width, uint32_t h
   to_copy.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
   vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &to_copy);
-  vkCmdCopyImageToBuffer(command, target.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback.buffer,
+  VkImage copy_source = target.image;
+  if (decoded.samples != VK_SAMPLE_COUNT_1_BIT) {
+    VkImageMemoryBarrier to_resolve{};
+    to_resolve.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    to_resolve.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_resolve.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_resolve.image = resolve.image;
+    to_resolve.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    to_resolve.subresourceRange.levelCount = 1;
+    to_resolve.subresourceRange.layerCount = 1;
+    to_resolve.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    to_resolve.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    to_resolve.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &to_resolve);
+    VkImageResolve region{};
+    region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.srcSubresource.layerCount = 1;
+    region.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.dstSubresource.layerCount = 1;
+    region.extent = {width, height, 1};
+    vkCmdResolveImage(command, target.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, resolve.image,
+                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    to_resolve.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    to_resolve.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    to_resolve.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    to_resolve.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                         0, nullptr, 0, nullptr, 1, &to_resolve);
+    copy_source = resolve.image;
+  }
+  vkCmdCopyImageToBuffer(command, copy_source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback.buffer,
                          1, &copy);
   if (vkEndCommandBuffer(command) != VK_SUCCESS) {
     reason = "vkEndCommandBuffer failed";

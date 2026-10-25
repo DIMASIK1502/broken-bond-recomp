@@ -675,6 +675,13 @@ clear. A surface that is not 1x MSAA is rejected. A guest pass fragment on a
 255,64,127,255, depth Never leaves the magenta clear, and culling the back
 face leaves that clear. The live device shadow is still not sampled.
 
+A 1280×512 4× 32-bit color surface is 32×64 EDRAM tiles, all 2048, so a
+depth surface of the same size aliases it at every base, including a base of
+100. One 40×8 4× tile does not alias the next tile. The host draw accepts
+1×, 2×, and 4× and resolves a multisampled target before the readback. The
+resolved 1280×512 4× picture matches the source on every pixel. The bytes
+inside an EDRAM tile are still not read.
+
 `GetTiledAddressLowerBound3D` masks Z with `~kTextureTileDepth` (`~4`) rather
 than `~(kTextureTileDepth - 1)`. On 300 of 600 tile corners, Z = 4 and
 Z = 12, it returns the previous 4 slices. For every block it stayed at or

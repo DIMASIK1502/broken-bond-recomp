@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "gfx/device.h"
+#include "gfx/edram.h"
 #include "gfx/texture.h"
 
 #include <rex/graphics/registers.h>
@@ -269,5 +270,63 @@ int main() {
     }
   }
   std::cout << "  guest_raster_ok 1\n";
+
+  broken_bond::gfx::EdramSurface native;
+  native.pitch_pixels = 1280;
+  native.height_pixels = 512;
+  native.msaa = static_cast<uint32_t>(rex::graphics::xenos::MsaaSamples::k4X);
+  broken_bond::gfx::EdramSpan native_span;
+  if (!broken_bond::gfx::EdramSpanFor(native, native_span, reason) ||
+      native_span.pitch_tiles != 32 || native_span.height_tiles != 64 ||
+      native_span.tile_count != 2048) {
+    return Fail(reason.empty() ? "native 1280x512 4x is not the whole EDRAM" : reason);
+  }
+  broken_bond::gfx::EdramSurface native_depth = native;
+  native_depth.base_tiles = 100;
+  bool overlap = false;
+  if (!broken_bond::gfx::EdramTilesOverlap(native, native_depth, overlap, reason) || !overlap) {
+    return Fail(reason.empty() ? "native depth does not alias the color target" : reason);
+  }
+  broken_bond::gfx::EdramSurface one_tile;
+  one_tile.pitch_pixels = 40;
+  one_tile.height_pixels = 8;
+  one_tile.msaa = native.msaa;
+  broken_bond::gfx::EdramSurface next_tile = one_tile;
+  next_tile.base_tiles = 1;
+  if (!broken_bond::gfx::EdramTilesOverlap(one_tile, next_tile, overlap, reason) || overlap) {
+    return Fail(reason.empty() ? "adjacent EDRAM tiles were treated as one" : reason);
+  }
+  std::cout << "  edram_alias_ok 1\n";
+
+  constexpr uint32_t kFrameWidth = 1280;
+  constexpr uint32_t kFrameHeight = 512;
+  std::vector<uint8_t> frame(static_cast<size_t>(kFrameWidth) * kFrameHeight * 4u);
+  for (uint32_t y = 0; y < kFrameHeight; ++y) {
+    for (uint32_t x = 0; x < kFrameWidth; ++x) {
+      uint8_t* pixel = frame.data() + (static_cast<size_t>(y) * kFrameWidth + x) * 4u;
+      pixel[0] = static_cast<uint8_t>(x);
+      pixel[1] = static_cast<uint8_t>(y);
+      pixel[2] = static_cast<uint8_t>(x + y);
+      pixel[3] = 255;
+    }
+  }
+  broken_bond::gfx::Device::RasterState frame_state;
+  rex::graphics::reg::RB_SURFACE_INFO frame_surface{};
+  frame_surface.surface_pitch = kFrameWidth;
+  frame_surface.msaa_samples = rex::graphics::xenos::MsaaSamples::k4X;
+  frame_state.surface_info = frame_surface.value;
+  rex::graphics::reg::RB_BLENDCONTROL frame_blend{};
+  frame_blend.color_srcblend = rex::graphics::xenos::BlendFactor::kOne;
+  frame_blend.color_destblend = rex::graphics::xenos::BlendFactor::kZero;
+  frame_blend.alpha_srcblend = rex::graphics::xenos::BlendFactor::kOne;
+  frame_blend.alpha_destblend = rex::graphics::xenos::BlendFactor::kZero;
+  frame_state.blend_control = frame_blend.value;
+  std::vector<uint8_t> frame_drawn;
+  if (!device.DrawTexturedRgba8(frame.data(), kFrameWidth, kFrameHeight, frame_drawn, reason,
+                                &frame_state) ||
+      frame_drawn != frame) {
+    return Fail(reason.empty() ? "4x resolve of 1280x512 does not match" : reason);
+  }
+  std::cout << "  frame_resolve_ok 1\n";
   return 0;
 }
