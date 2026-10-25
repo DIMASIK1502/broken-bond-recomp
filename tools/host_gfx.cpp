@@ -10,6 +10,9 @@
 #include "gfx/device.h"
 #include "gfx/texture.h"
 
+#include <rex/graphics/registers.h>
+#include <rex/graphics/xenos.h>
+
 namespace {
 
 // Vertex stage that only writes gl_Position. SPIR-V 1.5, Vulkan 1.2.
@@ -79,6 +82,72 @@ int main() {
     return Fail("drawn image does not match the texture");
   }
   std::cout << "  draw_ok 1\n";
+
+  broken_bond::gfx::Device::RasterState state;
+  rex::graphics::reg::RB_SURFACE_INFO surface{};
+  surface.surface_pitch = kPitch;
+  state.surface_info = surface.value;
+  rex::graphics::reg::PA_SU_SC_MODE_CNTL mode{};
+  mode.cull_front = 1;
+  state.mode_cntl = mode.value;
+  std::vector<uint8_t> culled;
+  if (!device.DrawTexturedRgba8(linear.data(), kPitch, kHeight, culled, reason, &state)) {
+    return Fail(reason);
+  }
+  for (uint8_t byte : culled) {
+    if (byte != 0) {
+      return Fail("front cull still drew the triangle");
+    }
+  }
+  mode.cull_front = 0;
+  state.mode_cntl = mode.value;
+  rex::graphics::reg::RB_BLENDCONTROL blend{};
+  blend.color_srcblend = rex::graphics::xenos::BlendFactor::kZero;
+  blend.color_destblend = rex::graphics::xenos::BlendFactor::kOne;
+  blend.alpha_srcblend = rex::graphics::xenos::BlendFactor::kZero;
+  blend.alpha_destblend = rex::graphics::xenos::BlendFactor::kOne;
+  state.blend_control = blend.value;
+  state.clear_red = 1.f;
+  state.clear_blue = 1.f;
+  state.clear_alpha = 1.f;
+  std::vector<uint8_t> blended;
+  if (!device.DrawTexturedRgba8(linear.data(), kPitch, kHeight, blended, reason, &state)) {
+    return Fail(reason);
+  }
+  for (size_t i = 0; i + 3 < blended.size(); i += 4) {
+    if (blended[i] != 255 || blended[i + 1] != 0 || blended[i + 2] != 255 || blended[i + 3] != 255) {
+      return Fail("dest-one blend did not keep the clear color");
+    }
+  }
+  blend.color_srcblend = rex::graphics::xenos::BlendFactor::kOne;
+  blend.color_destblend = rex::graphics::xenos::BlendFactor::kZero;
+  blend.alpha_srcblend = rex::graphics::xenos::BlendFactor::kOne;
+  blend.alpha_destblend = rex::graphics::xenos::BlendFactor::kZero;
+  state.blend_control = blend.value;
+  state.clear_red = 0.f;
+  state.clear_blue = 0.f;
+  state.clear_alpha = 0.f;
+  rex::graphics::reg::RB_DEPTHCONTROL depth{};
+  depth.z_enable = 1;
+  depth.zfunc = rex::graphics::xenos::CompareFunction::kLess;
+  state.depth_control = depth.value;
+  std::vector<uint8_t> depth_pass;
+  if (!device.DrawTexturedRgba8(linear.data(), kPitch, kHeight, depth_pass, reason, &state) ||
+      depth_pass != linear) {
+    return Fail(reason.empty() ? "depth less did not draw the image" : reason);
+  }
+  depth.zfunc = rex::graphics::xenos::CompareFunction::kNever;
+  state.depth_control = depth.value;
+  std::vector<uint8_t> depth_fail;
+  if (!device.DrawTexturedRgba8(linear.data(), kPitch, kHeight, depth_fail, reason, &state)) {
+    return Fail(reason);
+  }
+  for (uint8_t byte : depth_fail) {
+    if (byte != 0) {
+      return Fail("depth never still drew the triangle");
+    }
+  }
+  std::cout << "  raster_ok 1\n";
 
   constexpr uint32_t kFetchWidth = 48;
   constexpr uint32_t kFetchHeight = 32;

@@ -4,6 +4,7 @@
 #include <cstring>
 #include <vector>
 
+#include <rex/graphics/registers.h>
 #include <rex/graphics/xenos.h>
 #include <vulkan/vulkan.h>
 
@@ -452,8 +453,151 @@ bool Device::ReadbackRgba8(const uint8_t* pixels, uint32_t width, uint32_t heigh
   return ok;
 }
 
+namespace {
+
+bool MapBlendFactor(uint32_t factor, VkBlendFactor& out) {
+  switch (factor) {
+    case 0:
+      out = VK_BLEND_FACTOR_ZERO;
+      return true;
+    case 1:
+      out = VK_BLEND_FACTOR_ONE;
+      return true;
+    case 4:
+      out = VK_BLEND_FACTOR_SRC_COLOR;
+      return true;
+    case 5:
+      out = VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR;
+      return true;
+    case 6:
+      out = VK_BLEND_FACTOR_SRC_ALPHA;
+      return true;
+    case 7:
+      out = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+      return true;
+    case 8:
+      out = VK_BLEND_FACTOR_DST_COLOR;
+      return true;
+    case 9:
+      out = VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR;
+      return true;
+    case 10:
+      out = VK_BLEND_FACTOR_DST_ALPHA;
+      return true;
+    case 11:
+      out = VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA;
+      return true;
+    case 12:
+      out = VK_BLEND_FACTOR_CONSTANT_COLOR;
+      return true;
+    case 13:
+      out = VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR;
+      return true;
+    case 14:
+      out = VK_BLEND_FACTOR_CONSTANT_ALPHA;
+      return true;
+    case 15:
+      out = VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA;
+      return true;
+    case 16:
+      out = VK_BLEND_FACTOR_SRC_ALPHA_SATURATE;
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool MapBlendOp(uint32_t op, VkBlendOp& out) {
+  switch (op) {
+    case 0:
+      out = VK_BLEND_OP_ADD;
+      return true;
+    case 1:
+      out = VK_BLEND_OP_SUBTRACT;
+      return true;
+    case 2:
+      out = VK_BLEND_OP_MIN;
+      return true;
+    case 3:
+      out = VK_BLEND_OP_MAX;
+      return true;
+    case 4:
+      out = VK_BLEND_OP_REVERSE_SUBTRACT;
+      return true;
+    default:
+      return false;
+  }
+}
+
+struct DecodedRaster {
+  bool depth = false;
+  bool depth_write = false;
+  VkCompareOp depth_op = VK_COMPARE_OP_ALWAYS;
+  VkCullModeFlags cull = VK_CULL_MODE_NONE;
+  VkFrontFace front = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+  bool blend = false;
+  VkBlendFactor src_color = VK_BLEND_FACTOR_ONE;
+  VkBlendFactor dst_color = VK_BLEND_FACTOR_ZERO;
+  VkBlendFactor src_alpha = VK_BLEND_FACTOR_ONE;
+  VkBlendFactor dst_alpha = VK_BLEND_FACTOR_ZERO;
+  VkBlendOp color_op = VK_BLEND_OP_ADD;
+  VkBlendOp alpha_op = VK_BLEND_OP_ADD;
+};
+
+bool DecodeRaster(const Device::RasterState& raster, uint32_t width, DecodedRaster& out,
+                  std::string& reason) {
+  rex::graphics::reg::RB_SURFACE_INFO surface{};
+  surface.value = raster.surface_info;
+  if (surface.surface_pitch != width) {
+    reason = "surface pitch does not match the draw width";
+    return false;
+  }
+  if (static_cast<uint32_t>(surface.msaa_samples) != 0) {
+    reason = "surface MSAA is not 1x";
+    return false;
+  }
+  rex::graphics::reg::PA_SU_SC_MODE_CNTL mode{};
+  mode.value = raster.mode_cntl;
+  if (mode.cull_front != 0 && mode.cull_back != 0) {
+    out.cull = VK_CULL_MODE_FRONT_AND_BACK;
+  } else if (mode.cull_front != 0) {
+    out.cull = VK_CULL_MODE_FRONT_BIT;
+  } else if (mode.cull_back != 0) {
+    out.cull = VK_CULL_MODE_BACK_BIT;
+  }
+  out.front = mode.face != 0 ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
+
+  rex::graphics::reg::RB_DEPTHCONTROL depth{};
+  depth.value = raster.depth_control;
+  out.depth = depth.z_enable != 0;
+  out.depth_write = depth.z_write_enable != 0;
+  const uint32_t compare = static_cast<uint32_t>(depth.zfunc);
+  if (compare > 7) {
+    reason = "depth compare is out of range";
+    return false;
+  }
+  out.depth_op = static_cast<VkCompareOp>(compare);
+
+  rex::graphics::reg::RB_BLENDCONTROL blend{};
+  blend.value = raster.blend_control;
+  out.blend = true;
+  if (!MapBlendFactor(static_cast<uint32_t>(blend.color_srcblend), out.src_color) ||
+      !MapBlendFactor(static_cast<uint32_t>(blend.color_destblend), out.dst_color) ||
+      !MapBlendFactor(static_cast<uint32_t>(blend.alpha_srcblend), out.src_alpha) ||
+      !MapBlendFactor(static_cast<uint32_t>(blend.alpha_destblend), out.dst_alpha) ||
+      !MapBlendOp(static_cast<uint32_t>(blend.color_comb_fcn), out.color_op) ||
+      !MapBlendOp(static_cast<uint32_t>(blend.alpha_comb_fcn), out.alpha_op)) {
+    reason = "blend factor is not a Xenos factor";
+    return false;
+  }
+  return true;
+}
+
+}  // namespace
+
 bool Device::DrawTexturedRgba8(const uint8_t* pixels, uint32_t width, uint32_t height,
-                               std::vector<uint8_t>& out, std::string& reason) {
+                               std::vector<uint8_t>& out, std::string& reason,
+                               const RasterState* fixed_state) {
   if (vulkan_ == nullptr || vulkan_->device == VK_NULL_HANDLE) {
     reason = "device is not open";
     return false;
@@ -464,6 +608,10 @@ bool Device::DrawTexturedRgba8(const uint8_t* pixels, uint32_t width, uint32_t h
   }
   if (pixels == nullptr || width == 0 || height == 0) {
     reason = "empty image";
+    return false;
+  }
+  DecodedRaster decoded;
+  if (fixed_state != nullptr && !DecodeRaster(*fixed_state, width, decoded, reason)) {
     return false;
   }
 
@@ -551,8 +699,10 @@ bool Device::DrawTexturedRgba8(const uint8_t* pixels, uint32_t width, uint32_t h
   Buffer readback{};
   Image texture{};
   Image target{};
+  Image depth{};
   VkImageView texture_view = VK_NULL_HANDLE;
   VkImageView target_view = VK_NULL_HANDLE;
+  VkImageView depth_view = VK_NULL_HANDLE;
   VkSampler sampler = VK_NULL_HANDLE;
   VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
   VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
@@ -594,6 +744,10 @@ bool Device::DrawTexturedRgba8(const uint8_t* pixels, uint32_t width, uint32_t h
     if (target_view != VK_NULL_HANDLE) {
       vkDestroyImageView(device, target_view, nullptr);
     }
+    if (depth_view != VK_NULL_HANDLE) {
+      vkDestroyImageView(device, depth_view, nullptr);
+    }
+    DestroyImage(device, depth);
     DestroyImage(device, target);
     DestroyImage(device, texture);
     DestroyBuffer(device, readback);
@@ -649,6 +803,56 @@ bool Device::DrawTexturedRgba8(const uint8_t* pixels, uint32_t width, uint32_t h
       !make_image(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, target)) {
     cleanup();
     return false;
+  }
+  if (decoded.depth) {
+    VkImageCreateInfo depth_info{};
+    depth_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    depth_info.imageType = VK_IMAGE_TYPE_2D;
+    depth_info.format = VK_FORMAT_D32_SFLOAT;
+    depth_info.extent = {width, height, 1};
+    depth_info.mipLevels = 1;
+    depth_info.arrayLayers = 1;
+    depth_info.samples = VK_SAMPLE_COUNT_1_BIT;
+    depth_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    depth_info.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    depth_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkMemoryRequirements depth_requirements{};
+    uint32_t depth_type = UINT32_MAX;
+    if (vkCreateImage(device, &depth_info, nullptr, &depth.image) != VK_SUCCESS) {
+      reason = "depth image was rejected";
+      cleanup();
+      return false;
+    }
+    vkGetImageMemoryRequirements(device, depth.image, &depth_requirements);
+    depth_type = FindMemory(vulkan_->physical, depth_requirements.memoryTypeBits,
+                            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (depth_type == UINT32_MAX) {
+      depth_type = FindMemory(vulkan_->physical, depth_requirements.memoryTypeBits, 0);
+    }
+    VkMemoryAllocateInfo depth_allocate{};
+    depth_allocate.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    depth_allocate.allocationSize = depth_requirements.size;
+    depth_allocate.memoryTypeIndex = depth_type;
+    if (depth_type == UINT32_MAX ||
+        vkAllocateMemory(device, &depth_allocate, nullptr, &depth.memory) != VK_SUCCESS ||
+        vkBindImageMemory(device, depth.image, depth.memory, 0) != VK_SUCCESS) {
+      reason = "depth memory allocation failed";
+      cleanup();
+      return false;
+    }
+    VkImageViewCreateInfo depth_view_info{};
+    depth_view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    depth_view_info.image = depth.image;
+    depth_view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    depth_view_info.format = VK_FORMAT_D32_SFLOAT;
+    depth_view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    depth_view_info.subresourceRange.levelCount = 1;
+    depth_view_info.subresourceRange.layerCount = 1;
+    if (vkCreateImageView(device, &depth_view_info, nullptr, &depth_view) != VK_SUCCESS) {
+      reason = "depth view was rejected";
+      cleanup();
+      return false;
+    }
   }
   void* mapped = nullptr;
   if (vkMapMemory(device, source.memory, 0, bytes, 0, &mapped) != VK_SUCCESS) {
@@ -791,8 +995,8 @@ bool Device::DrawTexturedRgba8(const uint8_t* pixels, uint32_t width, uint32_t h
   VkPipelineRasterizationStateCreateInfo raster{};
   raster.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
   raster.polygonMode = VK_POLYGON_MODE_FILL;
-  raster.cullMode = VK_CULL_MODE_NONE;
-  raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+  raster.cullMode = fixed_state == nullptr ? VK_CULL_MODE_NONE : decoded.cull;
+  raster.frontFace = fixed_state == nullptr ? VK_FRONT_FACE_COUNTER_CLOCKWISE : decoded.front;
   raster.lineWidth = 1.0f;
   VkPipelineMultisampleStateCreateInfo multisample{};
   multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
@@ -800,15 +1004,33 @@ bool Device::DrawTexturedRgba8(const uint8_t* pixels, uint32_t width, uint32_t h
   VkPipelineColorBlendAttachmentState attachment{};
   attachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
                               VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+  if (fixed_state != nullptr) {
+    attachment.blendEnable = decoded.blend ? VK_TRUE : VK_FALSE;
+    attachment.srcColorBlendFactor = decoded.src_color;
+    attachment.dstColorBlendFactor = decoded.dst_color;
+    attachment.colorBlendOp = decoded.color_op;
+    attachment.srcAlphaBlendFactor = decoded.src_alpha;
+    attachment.dstAlphaBlendFactor = decoded.dst_alpha;
+    attachment.alphaBlendOp = decoded.alpha_op;
+  }
   VkPipelineColorBlendStateCreateInfo blend{};
   blend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
   blend.attachmentCount = 1;
   blend.pAttachments = &attachment;
+  VkPipelineDepthStencilStateCreateInfo depth_state{};
+  depth_state.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+  depth_state.depthTestEnable = decoded.depth ? VK_TRUE : VK_FALSE;
+  depth_state.depthWriteEnable = decoded.depth_write ? VK_TRUE : VK_FALSE;
+  depth_state.depthCompareOp = decoded.depth_op;
   VkFormat color_format = VK_FORMAT_R8G8B8A8_UNORM;
+  VkFormat depth_format = VK_FORMAT_D32_SFLOAT;
   VkPipelineRenderingCreateInfo rendering_format{};
   rendering_format.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
   rendering_format.colorAttachmentCount = 1;
   rendering_format.pColorAttachmentFormats = &color_format;
+  if (decoded.depth) {
+    rendering_format.depthAttachmentFormat = depth_format;
+  }
   VkGraphicsPipelineCreateInfo pipeline_info{};
   pipeline_info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
   pipeline_info.pNext = &rendering_format;
@@ -819,6 +1041,7 @@ bool Device::DrawTexturedRgba8(const uint8_t* pixels, uint32_t width, uint32_t h
   pipeline_info.pViewportState = &viewport_state;
   pipeline_info.pRasterizationState = &raster;
   pipeline_info.pMultisampleState = &multisample;
+  pipeline_info.pDepthStencilState = decoded.depth ? &depth_state : nullptr;
   pipeline_info.pColorBlendState = &blend;
   pipeline_info.layout = pipeline_layout;
   if (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &pipeline) !=
@@ -866,6 +1089,23 @@ bool Device::DrawTexturedRgba8(const uint8_t* pixels, uint32_t width, uint32_t h
   vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                        VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                        0, 0, nullptr, 0, nullptr, 2, barriers);
+  if (decoded.depth) {
+    VkImageMemoryBarrier depth_barrier{};
+    depth_barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    depth_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    depth_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    depth_barrier.image = depth.image;
+    depth_barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    depth_barrier.subresourceRange.levelCount = 1;
+    depth_barrier.subresourceRange.layerCount = 1;
+    depth_barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    depth_barrier.newLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+    depth_barrier.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                                  VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                         VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                         &depth_barrier);
+  }
 
   VkBufferImageCopy copy{};
   copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -889,12 +1129,28 @@ bool Device::DrawTexturedRgba8(const uint8_t* pixels, uint32_t width, uint32_t h
   color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
   color.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
   color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+  if (fixed_state != nullptr) {
+    color.clearValue.color.float32[0] = fixed_state->clear_red;
+    color.clearValue.color.float32[1] = fixed_state->clear_green;
+    color.clearValue.color.float32[2] = fixed_state->clear_blue;
+    color.clearValue.color.float32[3] = fixed_state->clear_alpha;
+  }
+  VkRenderingAttachmentInfo depth_attachment{};
+  depth_attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+  depth_attachment.imageView = depth_view;
+  depth_attachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+  depth_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+  depth_attachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+  depth_attachment.clearValue.depthStencil.depth = 1.f;
   VkRenderingInfo rendering{};
   rendering.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
   rendering.renderArea = {{0, 0}, {width, height}};
   rendering.layerCount = 1;
   rendering.colorAttachmentCount = 1;
   rendering.pColorAttachments = &color;
+  if (decoded.depth) {
+    rendering.pDepthAttachment = &depth_attachment;
+  }
   vkCmdBeginRendering(command, &rendering);
   vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
   vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout, 0, 1,

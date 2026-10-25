@@ -72,9 +72,27 @@ class Device {
   bool ReadbackRgba8(const uint8_t* pixels, uint32_t width, uint32_t height,
                      std::vector<uint8_t>& out, std::string& reason);
 
+  // Words from the device shadow. surface_info is RB_SURFACE_INFO: pitch in
+  // bits 0:13 must equal the draw width, and MSAA bits 16:17 must be 1x.
+  // depth_control is RB_DEPTHCONTROL, blend_control is RB_BLENDCONTROL0, and
+  // mode_cntl is PA_SU_SC_MODE_CNTL. The clear color is what shows through
+  // when the triangle is culled, blended away, or rejected by the depth test.
+  struct RasterState {
+    uint32_t surface_info = 0;
+    uint32_t depth_control = 0;
+    uint32_t blend_control = 0;
+    uint32_t mode_cntl = 0;
+    float clear_red = 0;
+    float clear_green = 0;
+    float clear_blue = 0;
+    float clear_alpha = 0;
+  };
+
   // Draw the image onto an offscreen target with a vertex interpolator and read it back.
+  // raster, when set, applies the register words above.
   bool DrawTexturedRgba8(const uint8_t* pixels, uint32_t width, uint32_t height,
-                         std::vector<uint8_t>& out, std::string& reason);
+                         std::vector<uint8_t>& out, std::string& reason,
+                         const RasterState* fixed_state = nullptr);
 
   // Run one guest fragment module. The target is cleared to magenta. Alpha test
   // is disabled and the color scale is 1. Pixel float constants are
