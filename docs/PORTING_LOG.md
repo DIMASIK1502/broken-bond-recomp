@@ -601,14 +601,16 @@ keeps a constant 0,255,0,0 in interpolator 1. The draw writers
 by `sub_821A6050`, which stores the pointer at device+11820, and applied when
 `sub_821B6CE0` loads the shader through `sub_821B6018`. The object has a count
 at +24 and 12-byte elements at +52: uint16 stream at +0, uint16 byte offset at
-+2, a format and swizzle dword at +4, usage at +9, usage index at +10. The
++2, a format dword at +4, usage at +9, usage index at +10. The
 match compares usage and usage index with the same bit fields as the `0x290`
 table. Stream 0 is fetch constant 95. The stride in dwords is the byte at
 device+12528 plus the stream index, written by `sub_821A47B0` as the byte
 stride shifted right by 2. The microcode offset field receives that byte
-offset shifted right by 2. The low 6 bits of the dword at +4 are inserted into
-vfetch word1 bits 16:21, and a swizzle permute rewrites that word afterwards.
-EDRAM is still absent.
+offset shifted right by 2. `sub_82178218` writes that element. Bits 0:5 of the
+dword at +4 are the Xenos VertexFormat, bit 8 is signed, and bit 9 is the
+integer flag. Those three fields are what land in vfetch word1, and the
+component swizzle permute does not change them. The same function advances the
+byte cursor by 4, 8, 12, or 16 according to that dword. EDRAM is still absent.
 
 `GetTiledAddressLowerBound3D` masks Z with `~kTextureTileDepth` (`~4`) rather
 than `~(kTextureTileDepth - 1)`. On 300 of 600 tile corners, Z = 4 and
