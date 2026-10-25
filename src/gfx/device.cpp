@@ -1308,14 +1308,18 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
             memory[at + 1] = (uint32_t(uint16_t(packed[3])) << 16) | uint16_t(packed[2]);
             continue;
           }
-          if (!attribute.is_float || attribute.components == 0 || a != stream.triangle_attribute) {
+          if (!attribute.is_float || attribute.components == 0 ||
+              (a != stream.triangle_attribute && !attribute.constant_fill)) {
             continue;
           }
           if (at < 0 || uint32_t(at) + attribute.components > kDwords) {
             continue;
           }
+          const float constant_value[4] = {1.f, 0.5f, 0.25f, 1.f};
           for (uint32_t c = 0; c < attribute.components && c < 4; ++c) {
-            std::memcpy(memory + at + c, &triangle[vertex][c], sizeof(float));
+            const float value =
+                a == stream.triangle_attribute ? triangle[vertex][c] : constant_value[c];
+            std::memcpy(memory + at + c, &value, sizeof(float));
           }
         }
       }

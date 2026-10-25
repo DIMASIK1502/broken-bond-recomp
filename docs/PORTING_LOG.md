@@ -581,9 +581,12 @@ that signed integer `SHORT4` in the first two dwords, and each later semantic
 is a float4. Strides were 6, 10, and 14 for 2, 3, and 4 attributes. All eight
 covered 64 pixels when the triangle was in the position slot, and the first
 pixel matched the float4 declaration probe, including the white shader. None
-covered when the triangle sat only in the following float4. The sizes are
-still the HLSL layout, not the declaration the game binds, and EDRAM is still
-absent.
+covered when the triangle sat only in the following float4. Filling those
+float4 semantics with (1, 0.5, 0.25, 1) changed all 64 pixels for six of the
+eight. The two that stayed put write interpolator masks 7 and 63; this probe
+still exports only interpolator 0. The eight masks are 1, 3, 1, 7, 1, 3, 3,
+and 63. The sizes are still the HLSL layout, not the declaration the game
+binds, and EDRAM is still absent.
 
 `GetTiledAddressLowerBound3D` masks Z with `~kTextureTileDepth` (`~4`) rather
 than `~(kTextureTileDepth - 1)`. On 300 of 600 tile corners, Z = 4 and

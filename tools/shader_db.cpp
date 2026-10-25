@@ -527,6 +527,7 @@ struct TranslateStats {
     bool interpolate = false;
     bool vertex = false;
     bool declare_test = false;
+    uint32_t interpolators = 0;
     std::vector<broken_bond::gfx::VertexStream> streams;
   };
   std::vector<GuestDraw> guest_alu;
@@ -1868,6 +1869,7 @@ void TranslateShader(rex::graphics::SpirvShaderTranslator& translator, uint32_t 
                       stream.attributes[i].is_float = packed_elements[i].format == 38;
                     }
                     draw.streams.push_back(stream);
+                    draw.interpolators = shader.writes_interpolators();
                     stats.guest_packed.push_back(std::move(draw));
                   }
                 }
@@ -2716,6 +2718,29 @@ int main(int argc, char** argv) {
           ++pack_seen;
           if (!second || changed != kGuestSize * kGuestSize || other_changed != 0) {
             ++pack_bad;
+          }
+          std::vector<broken_bond::gfx::VertexStream> filled = fragment.streams;
+          for (broken_bond::gfx::VertexAttribute& attribute : filled[0].attributes) {
+            if (attribute.is_float) {
+              attribute.constant_fill = true;
+            }
+          }
+          std::vector<uint8_t> filled_pixels;
+          const bool fill_ok = device.DrawGuestFragment(
+              fragment.words.data(), fragment.words.size(), kGuestSize, kGuestSize, 0, 0, 0, false,
+              0.f, true, filled.data(), uint32_t(filled.size()), filled_pixels, guest_reason);
+          uint32_t fill_diff = 0;
+          if (fill_ok) {
+            for (size_t i = 0; i + 3 < drawn.size() && i + 3 < filled_pixels.size(); i += 4) {
+              if (drawn[i] != filled_pixels[i] || drawn[i + 1] != filled_pixels[i + 1] ||
+                  drawn[i + 2] != filled_pixels[i + 2] || drawn[i + 3] != filled_pixels[i + 3]) {
+                ++fill_diff;
+              }
+            }
+          }
+          std::cout << " interp " << fragment.interpolators << " fill_diff " << fill_diff;
+          if (!fill_ok) {
+            std::cout << " fill_failed " << guest_reason;
           }
         }
         if (drawn.size() >= 4) {

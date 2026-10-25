@@ -21,6 +21,8 @@ struct VertexAttribute {
   bool is_float = false;
   // Four signed integer shorts packed into two dwords: x,y then z,w.
   bool short4 = false;
+  // When this float attribute is not the triangle, write (1, 0.5, 0.25, 1).
+  bool constant_fill = false;
 };
 
 struct VertexStream {
