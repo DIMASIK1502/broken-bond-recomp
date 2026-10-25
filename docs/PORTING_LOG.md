@@ -682,6 +682,15 @@ depth surface of the same size aliases it at every base, including a base of
 resolved 1280×512 4× picture matches the source on every pixel. The bytes
 inside an EDRAM tile are still not read.
 
+The vertex shader object copied by `sub_821B6CE0` keeps a dword at +872.
+Bit 0x20 selects the dword at +904; otherwise the dword at +896 is the
+offset from the object to the microcode header. The header's dword at +872
+plus the object's dword at +32 is packed the same way as a texture address,
+then `0xC0000000` is added, and that guest address is what the copy reads.
+The header's dword at +876 is the byte count. A sum of `0x1234` lands at
+`0xC0001234`. A sum of `0xE0000000` on the alternate slot lands at
+`0xC0001000`. The pixel shader object is not read this way.
+
 `GetTiledAddressLowerBound3D` masks Z with `~kTextureTileDepth` (`~4`) rather
 than `~(kTextureTileDepth - 1)`. On 300 of 600 tile corners, Z = 4 and
 Z = 12, it returns the previous 4 slices. For every block it stayed at or

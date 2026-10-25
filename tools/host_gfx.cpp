@@ -9,6 +9,7 @@
 
 #include "gfx/device.h"
 #include "gfx/edram.h"
+#include "gfx/shader_object.h"
 #include "gfx/texture.h"
 
 #include <rex/graphics/registers.h>
@@ -328,5 +329,52 @@ int main() {
     return Fail(reason.empty() ? "4x resolve of 1280x512 does not match" : reason);
   }
   std::cout << "  frame_resolve_ok 1\n";
+
+  auto store_be = [](std::vector<uint8_t>& memory, uint32_t address, uint32_t value) {
+    uint8_t* slot = memory.data() + (address & 0x1FFFFFFFu);
+    slot[0] = static_cast<uint8_t>(value >> 24);
+    slot[1] = static_cast<uint8_t>(value >> 16);
+    slot[2] = static_cast<uint8_t>(value >> 8);
+    slot[3] = static_cast<uint8_t>(value);
+  };
+  std::vector<uint8_t> shader_guest(0x3000, 0);
+  constexpr uint32_t kShader = 0xC0002000u;
+  store_be(shader_guest, kShader + 32u, 0x1000u);
+  store_be(shader_guest, kShader + 896u, 0x100u);
+  store_be(shader_guest, kShader + 0x100u + 872u, 0x234u);
+  store_be(shader_guest, kShader + 0x100u + 876u, 8u);
+  for (uint32_t i = 0; i < 8; ++i) {
+    shader_guest[0x1234u + i] = static_cast<uint8_t>(0x10u + i);
+  }
+  broken_bond::gfx::ShaderMicrocode microcode;
+  std::vector<uint8_t> microcode_bytes;
+  if (!broken_bond::gfx::ReadVertexShaderMicrocode(shader_guest.data(), shader_guest.size(),
+                                                   kShader, microcode, microcode_bytes, reason) ||
+      microcode.guest_address != 0xC0001234u || microcode.byte_count != 8u ||
+      microcode_bytes.size() != 8u) {
+    return Fail(reason.empty() ? "vertex shader microcode address was not 0xC0001234" : reason);
+  }
+  for (uint32_t i = 0; i < 8; ++i) {
+    if (microcode_bytes[i] != static_cast<uint8_t>(0x10u + i)) {
+      return Fail("vertex shader microcode bytes did not match");
+    }
+  }
+  store_be(shader_guest, kShader + 32u, 0);
+  store_be(shader_guest, kShader + 872u, 0x20u);
+  store_be(shader_guest, kShader + 904u, 0x200u);
+  store_be(shader_guest, kShader + 0x200u + 872u, 0xE0000000u);
+  store_be(shader_guest, kShader + 0x200u + 876u, 4u);
+  shader_guest[0x1000] = 0xAB;
+  shader_guest[0x1001] = 0xCD;
+  shader_guest[0x1002] = 0xEF;
+  shader_guest[0x1003] = 0x01;
+  if (!broken_bond::gfx::ReadVertexShaderMicrocode(shader_guest.data(), shader_guest.size(),
+                                                   kShader, microcode, microcode_bytes, reason) ||
+      microcode.guest_address != 0xC0001000u || microcode_bytes.size() != 4u ||
+      microcode_bytes[0] != 0xAB || microcode_bytes[1] != 0xCD || microcode_bytes[2] != 0xEF ||
+      microcode_bytes[3] != 0x01) {
+    return Fail(reason.empty() ? "alternate shader slot did not land at 0xC0001000" : reason);
+  }
+  std::cout << "  shader_ucode_ok 1\n";
   return 0;
 }
