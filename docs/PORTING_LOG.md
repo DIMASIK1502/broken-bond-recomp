@@ -627,8 +627,24 @@ device+10368, `VGT_MAX_VTX_INDX` at device+10444, `SQ_PROGRAM_CNTL` at
 device+10528, `RB_DEPTHCONTROL` at device+10548, `RB_BLENDCONTROL0` at
 device+10552, `RB_COLORCONTROL` at device+10556, and `PA_SU_SC_MODE_CNTL` at
 device+10568. `sub_825FABE0` is one caller that fills the declaration, both
-shaders, and stream 0 from a single object before this flush. EDRAM is still
-absent.
+shaders, and stream 0 from a single object before this flush. Color target
+`i` is bound by `sub_821A49E8`: the surface pointer is at device+12440+4*i,
+and the dword at surface+28 is `RB_COLOR_INFO` (device+10372 for target 0;
+later targets skip the depth slot). Depth is bound by `sub_821A4D30` at
+device+12456, and its dword at +28 is `RB_DEPTH_INFO` (device+10376). Both
+info words keep the EDRAM tile base in bits 0:11 plus bit 11. `sub_821A1D80`
+copies surface+24 to `RB_SURFACE_INFO` (device+10368) for color target 0, or
+for the depth surface when that target is empty. Pitch is bits 0:13 and MSAA
+is bits 16:17, where 2 is 4x. The fight present `sub_821610F0` takes the
+render object from `0x833E378C`, the device from its +16, and the surface
+from its +504. `sub_821AD328` resolves that surface: the guest address in the
+dword at surface+32 becomes the copy destination, and the packet writes
+`RB_COPY_CONTROL` (`0x2318`) and `RB_COPY_DEST_INFO` (`0x231B`). `VdSwap`
+then copies the 24 bytes at surface+28. It rewrites the low 6 bits of the
+dword at surface+32 from 50 to 6 (`k_8_8_8_8_AS_16_16_16_16` to `k_8_8_8_8`)
+and from 7 to 54 (`k_2_10_10_10` to `k_2_10_10_10_AS_16_16_16_16`). A
+1280×512 4×MSAA 32-bit color target is 10 MB, the whole EDRAM, so the depth
+base shares those tiles. The host still does not read them.
 
 `GetTiledAddressLowerBound3D` masks Z with `~kTextureTileDepth` (`~4`) rather
 than `~(kTextureTileDepth - 1)`. On 300 of 600 tile corners, Z = 4 and
