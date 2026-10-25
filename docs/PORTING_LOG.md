@@ -610,7 +610,25 @@ offset shifted right by 2. `sub_82178218` writes that element. Bits 0:5 of the
 dword at +4 are the Xenos VertexFormat, bit 8 is signed, and bit 9 is the
 integer flag. Those three fields are what land in vfetch word1, and the
 component swizzle permute does not change them. The same function advances the
-byte cursor by 4, 8, 12, or 16 according to that dword. EDRAM is still absent.
+byte cursor by 4, 8, 12, or 16 according to that dword. The `DRAW_INDX_2`
+kick in `sub_821A0D18` and `sub_821A0E70` carries none of that. Its initiator
+low byte is `0x81`: a point list with auto index, so the GPU numbers the
+vertices from zero, and the count is the top 16 bits. `sub_821AE158` flushes
+the device into the ring first. The vertex shader object is at device+12696
+(`sub_821A5E80`) and the pixel shader at device+12692 (`sub_821A5AD8`);
+`sub_821B6CE0` loads both with the declaration. Stream `s` keeps its buffer
+object at device+12460+4*s. The guest address is that object+24 plus the
+offset argument, the end is object+28, and the stride in dwords is the byte
+at device+12528+s. Five hundred twelve float4 constants sit at device+1920.
+The qword at device+0 flushes the first 256 as registers `0x4000`, and the
+qword at device+8 flushes the next 256 as registers `0x4400`. One dirty bit
+is four float4s. The packed register shadow then holds `RB_SURFACE_INFO` at
+device+10368, `VGT_MAX_VTX_INDX` at device+10444, `SQ_PROGRAM_CNTL` at
+device+10528, `RB_DEPTHCONTROL` at device+10548, `RB_BLENDCONTROL0` at
+device+10552, `RB_COLORCONTROL` at device+10556, and `PA_SU_SC_MODE_CNTL` at
+device+10568. `sub_825FABE0` is one caller that fills the declaration, both
+shaders, and stream 0 from a single object before this flush. EDRAM is still
+absent.
 
 `GetTiledAddressLowerBound3D` masks Z with `~kTextureTileDepth` (`~4`) rather
 than `~(kTextureTileDepth - 1)`. On 300 of 600 tile corners, Z = 4 and
