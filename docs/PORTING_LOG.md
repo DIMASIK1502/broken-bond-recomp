@@ -778,7 +778,32 @@ draw stays 1×. Depth control 7341926 is greater-equal with the test and
 the write enabled; against a depth clear of 1 it covers 0 pixels. Clearing
 only the depth-enable bit covers 123879, and the blend word 1 writes alpha
 0. Clearing the cull bits and leaving the depth test on still covers 0.
-The window was closed after the new snapshot.
+The window was closed after the new snapshot. A later title run kept the
+first eight textured triangle draws whose pixel microcode differed, including
+draws of three or more vertices, and the window was closed after that set.
+`sub_821AE158` does not write a snapshot: that entry has no vertex count, so
+the stream dword is the arena leftover. One of the eight fetches position as
+three floats and divides xyz by w. The translator pads the missing w with 0,
+so the host inserts a fourth float of 1 and retargets that element to float4.
+With the insert, fetch endian 2 covers 64862 pixels and endian 0 covers 63055.
+Every covered pixel is 0, 0, 0, 255. That is pixel constant `c0`, and the
+color lerp is saturated onto it, so a compare against the stand-in differs
+by 0. Another draw in the set is an indexed mesh of 71 vertices and 120
+16-bit indices, 456 bytes of vertex microcode and 192 of pixel microcode.
+Its slot 0 is 2D `k_DXT1`, 512×256, pitch 512, tiled, endian `k8in16`,
+65544 bytes, 484 colors, first texel 76, 75, 76, 255. Fetch endian 1 covers
+321377 pixels of the 1280×512 target, rows 259 through 511, in 827 colors.
+The first covered pixel is 1, 61, 21, 64. Red of the covered pixels runs
+0–41, green is 61 on every one of them, and blue runs 0–92. Replacing the
+decoded image with the stand-in changes 964080 bytes, so the sampled texels
+are in the color. Endian 2 of the same mesh covers 26 pixels. The surface
+word is again 335676672, so the draw stays 1×. Depth control is 7341926,
+the same greater-equal test; with the test enabled the coverage is 0.
+Clearing only the depth-enable bit covers the same 321377 pixels, the first
+of them 1, 61, 21, 0, in 911 colors. Blend word 1 writes that alpha 0.
+Clearing the cull bits and leaving the depth test on still covers 0.
+Two other draws in the set carry a 16-wide DXT1 image. The guest fetch
+describes width in 32-texel units, so those two are not uploaded.
 
 `GetTiledAddressLowerBound3D` masks Z with `~kTextureTileDepth` (`~4`) rather
 than `~(kTextureTileDepth - 1)`. On 300 of 600 tile corners, Z = 4 and

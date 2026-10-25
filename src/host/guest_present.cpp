@@ -16,7 +16,7 @@
 #include "host/device_repack.h"
 
 REXCVAR_DEFINE_BOOL(dump_device_draw, false, "Game",
-                    "Write the first triangle draw's own vertices to device-draw.bin");
+                    "Write up to eight textured triangle draws with different pixel shaders");
 
 namespace {
 
@@ -179,18 +179,65 @@ void WriteDump(const LiveGuestBytes& live, uint32_t device, const broken_bond::h
     NoteDumpWait("vertex stream is empty");
     return;
   }
-  if (!broken_bond::host::WriteDeviceDrawFile("device-draw.bin", image, image_device, reason)) {
+  broken_bond::host::DeviceDrawIndexInfo indices;
+  broken_bond::host::ReadDeviceDrawIndices(image, indices);
+  auto load_be = [&](uint32_t at) {
+    const uint8_t* bytes = image.data() + at;
+    return (uint32_t(bytes[0]) << 24) | (uint32_t(bytes[1]) << 16) | (uint32_t(bytes[2]) << 8) |
+           uint32_t(bytes[3]);
+  };
+  const uint32_t texture_bytes = image.size() >= 12464u ? load_be(12460u) : 0u;
+  const uint32_t texture_format = image.size() >= 12468u ? load_be(12464u) : 0u;
+  if (texture_bytes == 0) {
+    NoteDumpWait(texture_format == 0 ? "texture is absent"
+                                     : "texture format is " + std::to_string(texture_format));
+    return;
+  }
+  // Pixel microcode sits at the offset stored in the pixel-shader header.
+  const uint32_t pixel_at = image.size() >= 0x50B0u ? load_be(0x50A8u) : 0u;
+  const uint32_t pixel_bytes = image.size() >= 0x50B0u ? load_be(0x50ACu) : 0u;
+  if (pixel_bytes == 0 || pixel_at > image.size() || pixel_bytes > image.size() - pixel_at) {
+    NoteDumpWait("pixel shader is absent");
+    return;
+  }
+  uint64_t pixel_hash = 14695981039346656037ull;
+  for (uint32_t i = 0; i < pixel_bytes; ++i) {
+    pixel_hash ^= image[pixel_at + i];
+    pixel_hash *= 1099511628211ull;
+  }
+  static std::vector<uint64_t> seen;
+  static int repeats = 0;
+  static int attempts = 0;
+  if (++attempts > 400) {
+    g_draw_dumped.store(true, std::memory_order_relaxed);
+    REXLOG_INFO("device draw dump stopped after {} shaders", seen.size());
+    return;
+  }
+  for (uint64_t saved : seen) {
+    if (saved == pixel_hash) {
+      if (++repeats > 96 && !seen.empty()) {
+        g_draw_dumped.store(true, std::memory_order_relaxed);
+        REXLOG_INFO("device draw dump stopped after {} shaders", seen.size());
+      }
+      return;
+    }
+  }
+  repeats = 0;
+  const std::string path = "device-draw-" + std::to_string(seen.size()) + ".bin";
+  if (!broken_bond::host::WriteDeviceDrawFile(path, image, image_device, reason)) {
     NoteDumpWait(reason);
     return;
   }
-  g_draw_dumped.store(true, std::memory_order_relaxed);
-  broken_bond::host::DeviceDrawIndexInfo indices;
-  broken_bond::host::ReadDeviceDrawIndices(image, indices);
   broken_bond::host::DeviceDrawTexture texture;
   broken_bond::host::ReadDeviceDrawTexture(image, texture);
-  REXLOG_INFO("device draw dumped: {} bytes, stream {}, indices {}, texture {} -> device-draw.bin",
-              image.size(), broken_bond::host::DeviceDrawStreamBytes(image), indices.bytes,
-              texture.bytes);
+  REXLOG_INFO(
+      "device draw dumped: {} bytes, stream {}, indices {}, texture {} slot {}, pixel {} -> {}",
+      image.size(), broken_bond::host::DeviceDrawStreamBytes(image), indices.bytes, texture.bytes,
+      texture.slot, pixel_bytes, path);
+  seen.push_back(pixel_hash);
+  if (seen.size() >= 8u) {
+    g_draw_dumped.store(true, std::memory_order_relaxed);
+  }
 }
 
 void MaybeDumpAuto(uint32_t device, uint32_t prim, uint32_t vertex_start, uint32_t vertex_count,
@@ -198,7 +245,7 @@ void MaybeDumpAuto(uint32_t device, uint32_t prim, uint32_t vertex_start, uint32
   if (!REXCVAR_GET(dump_device_draw) || g_draw_dumped.load(std::memory_order_relaxed)) {
     return;
   }
-  if (!TrianglePrimitive(prim) || vertex_count < 64u) {
+  if (!TrianglePrimitive(prim) || vertex_count < 3u) {
     NoteDumpWait("vertex count is " + std::to_string(vertex_count));
     return;
   }
@@ -215,7 +262,7 @@ void MaybeDumpIndexed(uint32_t device, uint32_t prim, uint32_t base_vertex, uint
   if (!REXCVAR_GET(dump_device_draw) || g_draw_dumped.load(std::memory_order_relaxed)) {
     return;
   }
-  if (!TrianglePrimitive(prim) || index_count < 64u) {
+  if (!TrianglePrimitive(prim) || index_count < 3u) {
     NoteDumpWait("vertex count is " + std::to_string(index_count));
     return;
   }
@@ -263,50 +310,10 @@ void MaybeDumpIndexed(uint32_t device, uint32_t prim, uint32_t base_vertex, uint
 }
 
 void MaybeDumpDeviceDraw(uint32_t device, uint8_t* base) {
-  if (!REXCVAR_GET(dump_device_draw) || g_draw_dumped.load(std::memory_order_relaxed)) {
-    return;
-  }
-  LiveGuestBytes live;
-  live.base = base;
-  std::vector<uint8_t> image;
-  uint32_t image_device = 0;
-  std::string reason;
-  if (!broken_bond::host::RepackDeviceDraw(live, device, image, image_device, reason)) {
-    // Empty and oversized streams return before the copy. A failed copy of a
-    // stream that fit is the only path that can repeat real work.
-    static std::atomic<int> copies{0};
-    if (reason.rfind("vertex stream is ", 0) != 0 &&
-        copies.fetch_add(1, std::memory_order_relaxed) > 32) {
-      g_draw_dumped.store(true, std::memory_order_relaxed);
-      REXLOG_INFO("device draw dump stopped");
-      return;
-    }
-    static bool logged = false;
-    if (!logged) {
-      logged = true;
-      REXLOG_INFO("device draw dump waiting: {}", reason);
-    }
-    return;
-  }
-  if (broken_bond::host::DeviceDrawStreamBytes(image) == 0) {
-    static bool logged = false;
-    if (!logged) {
-      logged = true;
-      REXLOG_INFO("device draw dump waiting: vertex stream is empty");
-    }
-    return;
-  }
-  if (!broken_bond::host::WriteDeviceDrawFile("device-draw.bin", image, image_device, reason)) {
-    static bool logged = false;
-    if (!logged) {
-      logged = true;
-      REXLOG_INFO("device draw dump waiting: {}", reason);
-    }
-    return;
-  }
-  g_draw_dumped.store(true, std::memory_order_relaxed);
-  REXLOG_INFO("device draw dumped: {} bytes at {:08X} -> device-draw.bin", image.size(),
-              image_device);
+  // This entry has no vertex count, so the stream dword is the arena leftover.
+  // The counted draws in sub_821AE5D0 and sub_821AE9C0 own the snapshot.
+  (void)device;
+  (void)base;
 }
 
 REX_HOOK_RAW(sub_821B1DD0) {

@@ -70,8 +70,9 @@ bool IndexRange(const uint8_t* indices, uint32_t byte_count, uint32_t index_size
 uint32_t TextureCopyBytes(uint32_t format, uint32_t width, uint32_t height, uint32_t pitch,
                           bool tiled);
 
-// Slot 0's base level, appended after the index list. bytes is zero when the
-// draw had no 2D texture, or when these dwords are not a texture tail.
+// One 2D base level, appended after the index list. slot is the fetch
+// constant it came from. bytes is zero when the draw had no RGBA8 or DXT1
+// image, or when these dwords are not a texture tail.
 struct DeviceDrawTexture {
   uint32_t offset = 0;
   uint32_t bytes = 0;
@@ -81,6 +82,7 @@ struct DeviceDrawTexture {
   uint32_t pitch = 0;
   uint32_t endian = 0;
   uint32_t tiled = 0;
+  uint32_t slot = 0;
 };
 
 bool ReadDeviceDrawTexture(const std::vector<uint8_t>& image, DeviceDrawTexture& out);

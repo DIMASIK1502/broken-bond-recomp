@@ -2226,15 +2226,28 @@ int DrawMesh(const char* path) {
   const uint32_t index_bytes = LoadBe(image, 12440u);
   const uint32_t index_size = LoadBe(image, 12444u);
   const uint32_t index_first = LoadBe(image, 12448u);
-  if (index_size != 2u || index_bytes < 6u || index_bytes % 2u != 0 ||
-      uint64_t(index_at) + index_bytes > image.size()) {
-    Fail("mesh snapshot index list is not 16-bit");
-  }
-  std::vector<uint16_t> indices(index_bytes / 2u);
-  for (uint32_t i = 0; i < indices.size(); ++i) {
-    const uint32_t at = index_at + i * 2u;
-    uint16_t index = uint16_t((uint32_t(image[at]) << 8) | uint32_t(image[at + 1]));
-    indices[i] = index >= index_first ? uint16_t(index - index_first) : index;
+  std::vector<uint16_t> indices;
+  if (index_bytes != 0) {
+    if ((index_size != 2u && index_size != 4u) || index_bytes < index_size ||
+        (index_bytes % index_size) != 0 || uint64_t(index_at) + index_bytes > image.size()) {
+      Fail("mesh snapshot index list is not 16-bit or 32-bit");
+    }
+    indices.resize(index_bytes / index_size);
+    for (uint32_t i = 0; i < indices.size(); ++i) {
+      const uint32_t at = index_at + i * index_size;
+      uint32_t index = index_size == 2u
+                           ? (uint32_t(image[at]) << 8) | uint32_t(image[at + 1])
+                           : LoadBe(image, at);
+      if (index == 0xFFFFu || index == 0xFFFFFFFFu) {
+        index = 0;
+      } else if (index >= index_first) {
+        index -= index_first;
+      }
+      if (index > 0xFFFFu) {
+        Fail("mesh snapshot index does not fit in 16 bits");
+      }
+      indices[i] = static_cast<uint16_t>(index);
+    }
   }
   const uint32_t vertex_object = draw.vertex_shader & 0x1FFFFFFFu;
   int marker = -1;
@@ -2270,6 +2283,22 @@ int DrawMesh(const char* path) {
     uint32_t loaded = 0;
     std::memcpy(&loaded, vertex_raw.data() + i * 4u, 4u);
     patched[i] = HostFromBe(loaded);
+  }
+  // A 3-float position fetch is padded with w = 0 by the translator. This
+  // shader divides xyz by that w, and the GPU supplies 1, so the draw inserts
+  // a fourth float of 1 ahead of the later elements.
+  const bool pad_position_w = !elements.empty() && elements[0].format == 57u;
+  if (pad_position_w) {
+    elements[0].format = 38;
+    for (broken_bond::gfx::VertexElement& element : elements) {
+      if (element.format == 37u || element.format == 38u || element.format == 57u) {
+        element.integer_components = false;
+      }
+      if (element.offset_words >= 3) {
+        element.offset_words += 1;
+      }
+      element.stride_words += 1;
+    }
   }
   if (!broken_bond::gfx::PatchVertexDeclaration(patched.data(), uint32_t(patched.size()),
                                                semantics.data(), uint32_t(semantics.size()),
@@ -2388,10 +2417,15 @@ int DrawMesh(const char* path) {
   if (texture_bytes == 0) {
     std::cout << "mesh texture 0\n";
   } else {
+    std::set<uint32_t> texel_set;
+    for (size_t i = 0; i + 3 < rgba.size(); i += 4) {
+      texel_set.insert((uint32_t(rgba[i]) << 16) | (uint32_t(rgba[i + 1]) << 8) |
+                       uint32_t(rgba[i + 2]));
+    }
     std::cout << "mesh texture " << texture_width_px << "x" << texture_height_px << " format "
               << texture_format << " endian " << texture_endian << " tiled " << texture_tiled
               << " bytes " << texture_bytes << " texel " << int(rgba[0]) << " " << int(rgba[1])
-              << " " << int(rgba[2]) << " " << int(rgba[3]) << "\n";
+              << " " << int(rgba[2]) << " " << int(rgba[3]) << " rgb " << texel_set.size() << "\n";
   }
   constexpr uint32_t kWidth = 1280;
   constexpr uint32_t kHeight = 512;
@@ -2400,12 +2434,35 @@ int DrawMesh(const char* path) {
   const uint32_t texture_height = rgba.empty() ? 0u : texture_height_px;
   auto draw_mesh = [&](uint32_t endian, const broken_bond::gfx::Device::RasterState* raster,
                        const char* label) {
+    std::vector<uint8_t> padded;
+    const uint8_t* vertex_bytes = stream_bytes.data();
+    uint32_t vertex_byte_count = uint32_t(stream_bytes.size());
+    uint32_t stride_words = draw.stream_stride_dwords;
+    if (pad_position_w && stride_words != 0) {
+      const uint32_t src_stride = stride_words * 4u;
+      const uint32_t verts = uint32_t(stream_bytes.size() / src_stride);
+      padded.resize(static_cast<size_t>(verts) * (src_stride + 4u));
+      const uint32_t w_bits =
+          endian == 1u ? 0x803f0000u : endian == 2u ? 0x0000803fu : 0x3f800000u;
+      for (uint32_t v = 0; v < verts; ++v) {
+        const uint8_t* src = stream_bytes.data() + static_cast<size_t>(v) * src_stride;
+        uint8_t* dst = padded.data() + static_cast<size_t>(v) * (src_stride + 4u);
+        std::memcpy(dst, src, 12);
+        std::memcpy(dst + 12, &w_bits, 4);
+        if (src_stride > 12u) {
+          std::memcpy(dst + 16, src + 12, src_stride - 12u);
+        }
+      }
+      vertex_bytes = padded.data();
+      vertex_byte_count = uint32_t(padded.size());
+      stride_words += 1u;
+    }
     broken_bond::gfx::VertexStream stream;
     stream.fetch_constant = vertex_shader.vertex_bindings()[0].fetch_constant;
-    stream.stride_words = draw.stream_stride_dwords;
-    stream.bytes = stream_bytes.data();
-    stream.byte_count = uint32_t(stream_bytes.size());
-    stream.indices = indices.data();
+    stream.stride_words = stride_words;
+    stream.bytes = vertex_bytes;
+    stream.byte_count = vertex_byte_count;
+    stream.indices = indices.empty() ? nullptr : indices.data();
     stream.index_count = uint32_t(indices.size());
     stream.endian = endian;
     std::vector<uint8_t> pixels;
@@ -2422,10 +2479,13 @@ int DrawMesh(const char* path) {
     }
     uint32_t covered = 0;
     int first[4] = {-1, -1, -1, -1};
+    std::set<uint32_t> colors;
     for (size_t i = 0; i + 3 < pixels.size(); i += 4) {
       if (pixels[i] == 255 && pixels[i + 1] == 0 && pixels[i + 2] == 255 && pixels[i + 3] == 255) {
         continue;
       }
+      colors.insert((uint32_t(pixels[i]) << 16) | (uint32_t(pixels[i + 1]) << 8) |
+                    uint32_t(pixels[i + 2]));
       if (first[0] < 0) {
         first[0] = pixels[i];
         first[1] = pixels[i + 1];
@@ -2434,9 +2494,9 @@ int DrawMesh(const char* path) {
       }
       ++covered;
     }
-    std::cout << "mesh " << label << " covered " << covered << " first " << first[0] << " "
-              << first[1] << " " << first[2] << " " << first[3] << "\n";
-    if (label[0] == 'e' && label[7] == '1' && texture_rgba != nullptr) {
+    std::cout << "mesh " << label << " covered " << covered << " rgb " << colors.size() << " first "
+              << first[0] << " " << first[1] << " " << first[2] << " " << first[3] << "\n";
+    if (label[0] == 'e' && texture_rgba != nullptr) {
       std::vector<uint8_t> plain;
       std::string plain_reason;
       if (device.DrawGuestFragment(vertex_words.data(), vertex_words.size(), kWidth, kHeight,
@@ -2454,6 +2514,9 @@ int DrawMesh(const char* path) {
       }
     }
   };
+  if (pad_position_w) {
+    draw_mesh(0u, nullptr, "endian 0");
+  }
   draw_mesh(1u, nullptr, "endian 1");
   draw_mesh(2u, nullptr, "endian 2");
   broken_bond::gfx::Device::RasterState raster;

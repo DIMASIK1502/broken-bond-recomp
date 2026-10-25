@@ -159,42 +159,54 @@ struct SlotTexture {
   uint32_t pitch = 0;
   uint32_t endian = 0;
   uint32_t tiled = 0;
+  uint32_t slot = 0;
 };
 
-bool DescribeSlot0(const GuestBytes& live, uint32_t device, SlotTexture& out, std::string& reason) {
+bool DescribeTexture(const GuestBytes& live, uint32_t device, SlotTexture& out, std::string& reason) {
   out = {};
-  uint32_t words[6] = {};
-  for (uint32_t i = 0; i < 6u; ++i) {
-    if (!LoadBe(live, device + 1152u + i * 4u, words[i], reason)) {
-      return false;
+  for (uint32_t slot = 0; slot < 32u; ++slot) {
+    uint32_t words[6] = {};
+    const uint32_t at = device + 1152u + slot * 24u;
+    for (uint32_t i = 0; i < 6u; ++i) {
+      if (!LoadBe(live, at + i * 4u, words[i], reason)) {
+        return false;
+      }
     }
-  }
-  rex::graphics::xenos::xe_gpu_texture_fetch_t fetch{};
-  std::memcpy(&fetch, words, sizeof(fetch));
-  if (fetch.type != rex::graphics::xenos::FetchConstantType::kTexture) {
+    rex::graphics::xenos::xe_gpu_texture_fetch_t fetch{};
+    std::memcpy(&fetch, words, sizeof(fetch));
+    if (fetch.type != rex::graphics::xenos::FetchConstantType::kTexture ||
+        fetch.dimension != rex::graphics::xenos::DataDimension::k2DOrStacked) {
+      continue;
+    }
+    SlotTexture candidate;
+    candidate.slot = slot;
+    candidate.format = static_cast<uint32_t>(fetch.format);
+    candidate.endian = static_cast<uint32_t>(fetch.endianness);
+    candidate.tiled = fetch.tiled != 0 ? 1u : 0u;
+    candidate.pitch = fetch.pitch << 5;
+    candidate.width = fetch.size_2d.width + 1;
+    candidate.height = fetch.size_2d.height + 1;
+    LevelLayout level;
+    if (!LevelLayoutFor(candidate.format, level)) {
+      if (out.format == 0) {
+        out.format = candidate.format;
+      }
+      continue;
+    }
+    candidate.bytes =
+        TextureCopyBytes(candidate.format, candidate.width, candidate.height, candidate.pitch,
+                         candidate.tiled != 0);
+    if (candidate.bytes == 0 || candidate.bytes > kMaxTexture) {
+      continue;
+    }
+    const uint64_t guest = (uint64_t(fetch.base_address) << 12) + 0xC0000000ull;
+    if (guest > 0xFFFFFFFFull) {
+      continue;
+    }
+    candidate.guest = static_cast<uint32_t>(guest);
+    out = candidate;
     return true;
   }
-  if (fetch.dimension != rex::graphics::xenos::DataDimension::k2DOrStacked) {
-    reason = "texture is not 2D";
-    return false;
-  }
-  out.format = static_cast<uint32_t>(fetch.format);
-  out.endian = static_cast<uint32_t>(fetch.endianness);
-  out.tiled = fetch.tiled != 0 ? 1u : 0u;
-  out.pitch = fetch.pitch << 5;
-  out.width = fetch.size_2d.width + 1;
-  out.height = fetch.size_2d.height + 1;
-  out.bytes = TextureCopyBytes(out.format, out.width, out.height, out.pitch, out.tiled != 0);
-  if (out.bytes == 0 || out.bytes > kMaxTexture) {
-    reason = "texture is " + std::to_string(out.bytes) + " bytes";
-    return false;
-  }
-  const uint64_t guest = (uint64_t(fetch.base_address) << 12) + 0xC0000000ull;
-  if (guest > 0xFFFFFFFFull) {
-    reason = "texture is outside guest memory";
-    return false;
-  }
-  out.guest = static_cast<uint32_t>(guest);
   return true;
 }
 
@@ -280,7 +292,7 @@ bool RepackDeviceDraw(const GuestBytes& live, uint32_t device, std::vector<uint8
   }
 
   SlotTexture texture;
-  if (!DescribeSlot0(live, device, texture, reason)) {
+  if (!DescribeTexture(live, device, texture, reason)) {
     return false;
   }
   const uint32_t decl_bytes = declaration == 0 ? 0u : 52u + decl_count * 12u;
@@ -328,6 +340,7 @@ bool RepackDeviceDraw(const GuestBytes& live, uint32_t device, std::vector<uint8
   StoreBe(image, 12476u, texture.pitch);
   StoreBe(image, 12480u, texture.endian);
   StoreBe(image, 12484u, texture.tiled);
+  StoreBe(image, 12488u, texture.slot);
 
   StoreBe(image, kVsAt + 32u, 0);
   StoreBe(image, kVsAt + vertex_table, 0x400u);
@@ -418,7 +431,7 @@ bool ReadDeviceDrawIndices(const std::vector<uint8_t>& image, DeviceDrawIndexInf
 
 bool ReadDeviceDrawTexture(const std::vector<uint8_t>& image, DeviceDrawTexture& out) {
   out = {};
-  if (image.size() < 12488u) {
+  if (image.size() < 12492u) {
     return false;
   }
   auto load = [&](uint32_t at) {
@@ -434,6 +447,7 @@ bool ReadDeviceDrawTexture(const std::vector<uint8_t>& image, DeviceDrawTexture&
   out.pitch = load(12476u);
   out.endian = load(12480u);
   out.tiled = load(12484u);
+  out.slot = load(12488u);
   const bool tail = out.bytes != 0 && out.offset <= image.size() &&
                     out.bytes <= image.size() - out.offset && out.offset + out.bytes == image.size();
   const bool format = out.format == 6u || out.format == 18u;
