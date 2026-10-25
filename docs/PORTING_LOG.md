@@ -728,7 +728,11 @@ the signed and integer bits set, 156 vertex-shader bytes and 72
 pixel-shader bytes, and float constant 0 equal to 1. Those 156 bytes are
 vertex shader 1 in this dump's `xeshader.sdb` (`g_mWorldViewProj`) and the
 72 bytes are pixel shader 2775 (`g_TextureSampler`, `g_vConstantColor`).
-The four non-zero constants are the diagonal of that matrix, each 1.
+The four non-zero constants are the diagonal of that matrix, each 1. The
+vertex shader fetches position and texcoord from `vf0` (fetch constant 95)
+at stride 5, divides xyz by the fetched w, and dots that with `c0`–`c3`
+swizzled `zxyw`. The pixel shader samples `tf0` and multiplies by `c12`.
+A translated draw of the pair still returns the clear color.
 
 `GetTiledAddressLowerBound3D` masks Z with `~kTextureTileDepth` (`~4`) rather
 than `~(kTextureTileDepth - 1)`. On 300 of 600 tile corners, Z = 4 and

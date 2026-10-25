@@ -1963,6 +1963,195 @@ void TranslateShader(rex::graphics::SpirvShaderTranslator& translator, uint32_t 
     }
   }
 }
+
+#if defined(BROKEN_BOND_HOST_GFX)
+int DrawBootPair(const std::vector<uint8_t>& file, const std::vector<ShaderRecord>& shaders) {
+  if (shaders.size() <= 2775u) {
+    Fail("shader database does not contain the boot pair");
+  }
+  const std::vector<uint8_t> vertex_object = InflateZlib(
+      file.data() + shaders[1].offset, shaders[1].compressed_size, shaders[1].raw_size);
+  const std::vector<uint8_t> pixel_object = InflateZlib(
+      file.data() + shaders[2775].offset, shaders[2775].compressed_size, shaders[2775].raw_size);
+  std::vector<broken_bond::gfx::VertexFetchSemantic> semantics;
+  std::string reason;
+  if (!broken_bond::gfx::ReadVertexFetchSemantics(vertex_object.data(), vertex_object.size(),
+                                                 semantics, reason)) {
+    std::cerr << reason << "\n";
+    return 1;
+  }
+  std::cout << "boot_pair fetches " << semantics.size() << "\n";
+  for (const broken_bond::gfx::VertexFetchSemantic& semantic : semantics) {
+    std::cout << "  fetch " << semantic.instruction << " "
+              << broken_bond::gfx::VertexUsageName(semantic.usage) << semantic.usage_index << "\n";
+  }
+  const UcodeSpan vertex_ucode =
+      LocateUcode(vertex_object.data(), vertex_object.size(), 0xFFFE0300u);
+  const UcodeSpan pixel_ucode = LocateUcode(pixel_object.data(), pixel_object.size(), 0xFFFF0300u);
+  broken_bond::gfx::VertexElement elements[2];
+  elements[0].usage = 0;
+  // The translator pads a 3-float fetch with 0. This shader divides by that
+  // w, and a 3-component fetch on the GPU supplies 1, so the draw loads a
+  // fourth float of 1.
+  elements[0].format = 38;
+  elements[0].offset_words = 0;
+  elements[0].stride_words = 5;
+  elements[1].usage = 5;
+  elements[1].format = 37;
+  elements[1].offset_words = 3;
+  elements[1].stride_words = 5;
+
+  HostProbe probe;
+  probe.Open();
+  rex::graphics::SpirvShaderTranslator::Features features(false);
+  if (probe.create_module != nullptr && probe.api >= VK_API_VERSION_1_2) {
+    features.spirv_version = spv::Spv_1_5;
+    features.max_storage_buffer_range = probe.storage_range;
+    features.signed_zero_inf_nan_preserve_float32 = probe.preserve;
+    features.denorm_flush_to_zero_float32 = probe.flush;
+    features.rounding_mode_rte_float32 = probe.rte;
+    features.demote_to_helper_invocation = probe.demote;
+    features.sample_rate_shading = probe.sample_rate;
+  } else {
+    features = rex::graphics::SpirvShaderTranslator::Features(true);
+  }
+  rex::graphics::SpirvShaderTranslator translator(features, false, false, false);
+
+  auto translate = [&](bool vertex, uint32_t mask, rex::graphics::SpirvShader& shader,
+                       std::vector<uint32_t>& words) -> bool {
+    rex::string::StringBuffer disassembly;
+    shader.AnalyzeUcode(disassembly);
+    const uint64_t modification_value =
+        vertex ? translator.GetDefaultVertexShaderModification(0)
+               : translator.GetDefaultPixelShaderModification(0);
+    rex::graphics::SpirvShaderTranslator::Modification modification(modification_value);
+    if (vertex) {
+      modification.vertex.interpolator_mask = mask;
+    } else {
+      modification.pixel.interpolator_mask = mask;
+    }
+    rex::graphics::Shader::Translation& translation =
+        *shader.GetOrCreateTranslation(modification.value);
+    if (!translator.TranslateAnalyzedShader(translation)) {
+      reason = "boot pair shader did not translate";
+      return false;
+    }
+    const std::vector<uint8_t>& binary = translation.translated_binary();
+    if (binary.size() < 4 || binary.size() % 4 != 0) {
+      reason = "boot pair shader is not a SPIR-V module";
+      return false;
+    }
+    words.assign(reinterpret_cast<const uint32_t*>(binary.data()),
+                 reinterpret_cast<const uint32_t*>(binary.data() + binary.size()));
+    return true;
+  };
+
+  std::vector<uint32_t> vertex_words;
+  std::vector<uint32_t> pixel_words;
+  std::vector<uint32_t> patched(vertex_ucode.dword_count);
+  for (uint32_t i = 0; i < vertex_ucode.dword_count; ++i) {
+    patched[i] = HostFromBe(vertex_ucode.dwords[i]);
+  }
+  if (!broken_bond::gfx::PatchVertexDeclaration(patched.data(), uint32_t(patched.size()),
+                                               semantics.data(), uint32_t(semantics.size()),
+                                               elements, 2, reason)) {
+    std::cerr << reason << "\n";
+    return 1;
+  }
+  rex::graphics::SpirvShader vertex_shader(rex::graphics::xenos::ShaderType::kVertex, 0,
+                                          patched.data(), uint32_t(patched.size()),
+                                          std::endian::native);
+  rex::string::StringBuffer vertex_disassembly;
+  vertex_shader.AnalyzeUcode(vertex_disassembly);
+  const uint32_t mask = vertex_shader.writes_interpolators() & 0xFFFFu;
+  if (!translate(true, mask, vertex_shader, vertex_words)) {
+    std::cerr << reason << "\n";
+    return 1;
+  }
+  rex::graphics::SpirvShader pixel_shader(rex::graphics::xenos::ShaderType::kPixel, 0,
+                                         pixel_ucode.dwords, pixel_ucode.dword_count,
+                                         std::endian::big);
+  rex::string::StringBuffer pixel_disassembly;
+  pixel_shader.AnalyzeUcode(pixel_disassembly);
+  if (!translate(false, mask, pixel_shader, pixel_words)) {
+    std::cerr << reason << "\n";
+    return 1;
+  }
+  const uint32_t image_count =
+      uint32_t(pixel_shader.GetTextureBindingsAfterTranslation().size());
+  const uint32_t sampler_count =
+      uint32_t(pixel_shader.GetSamplerBindingsAfterTranslation().size());
+  if (vertex_shader.vertex_bindings().empty()) {
+    std::cerr << "boot pair vertex shader has no fetch\n";
+    return 1;
+  }
+  broken_bond::gfx::VertexStream stream;
+  stream.fetch_constant = vertex_shader.vertex_bindings()[0].fetch_constant;
+  stream.stride_words = 5;
+  for (const rex::graphics::Shader::VertexBinding& binding : vertex_shader.vertex_bindings()) {
+    for (const rex::graphics::Shader::VertexBinding::Attribute& attribute : binding.attributes) {
+      if (stream.attribute_count >= 8) {
+        break;
+      }
+      const rex::graphics::xenos::VertexFormat format =
+          attribute.fetch_instr.attributes.data_format;
+      broken_bond::gfx::VertexAttribute& out = stream.attributes[stream.attribute_count];
+      out.offset_words = attribute.fetch_instr.attributes.offset;
+      out.is_float = format == rex::graphics::xenos::VertexFormat::k_32_32_FLOAT ||
+                     format == rex::graphics::xenos::VertexFormat::k_32_32_32_FLOAT;
+      out.components = out.is_float
+                           ? uint32_t(rex::graphics::xenos::GetVertexFormatComponentCount(format))
+                           : 0;
+      if (out.offset_words == 0) {
+        stream.triangle_attribute = stream.attribute_count;
+      } else {
+        out.constant_fill = true;
+      }
+      ++stream.attribute_count;
+    }
+  }
+  broken_bond::gfx::Device device;
+  if (!device.Open(reason)) {
+    std::cerr << reason << "\n";
+    return 1;
+  }
+  constexpr uint32_t kSize = 8;
+  std::vector<uint8_t> pixels;
+  if (!device.DrawGuestFragment(vertex_words.data(), vertex_words.size(), kSize, kSize,
+                                image_count, sampler_count, 1, false, 0.f, true, &stream, 1,
+                                pixels, reason, pixel_words.data(), pixel_words.size())) {
+    std::cerr << reason << "\n";
+    return 1;
+  }
+  uint32_t covered = 0;
+  int first[4] = {0, 0, 0, 0};
+  for (size_t i = 0; i + 3 < pixels.size(); i += 4) {
+    if (pixels[i] == 255 && pixels[i + 1] == 0 && pixels[i + 2] == 255 && pixels[i + 3] == 255) {
+      continue;
+    }
+    if (covered == 0) {
+      first[0] = pixels[i];
+      first[1] = pixels[i + 1];
+      first[2] = pixels[i + 2];
+      first[3] = pixels[i + 3];
+    }
+    ++covered;
+  }
+  std::cout << "boot_pair mask " << mask << " images " << image_count << " samplers "
+            << sampler_count << " covered " << covered << " first " << first[0] << " " << first[1]
+            << " " << first[2] << " " << first[3] << "\n";
+  if (covered == 0) {
+    const std::string_view vertex_text = vertex_disassembly.to_string_view();
+    const std::string_view pixel_text = pixel_disassembly.to_string_view();
+    std::cout << std::string(vertex_text.data(), vertex_text.size()) << "\n";
+    std::cout << std::string(pixel_text.data(), pixel_text.size()) << "\n";
+    std::cout << "fetch " << stream.fetch_constant << " attrs " << stream.attribute_count << "\n";
+    return 1;
+  }
+  std::cout << "boot_pair_ok 1\n";
+  return 0;
+}
+#endif
 #endif
 
 std::string ReadName(const uint8_t* bytes) {
@@ -2349,8 +2538,9 @@ int main(int argc, char** argv) {
     }
     std::cout.flush();
 #endif
-    if (argc != 2) {
-      std::cerr << "usage: shader_db <xeshader.sdb>\n";
+    const bool boot_pair = argc == 3 && std::string(argv[2]) == "pair";
+    if (argc != 2 && !boot_pair) {
+      std::cerr << "usage: shader_db <xeshader.sdb> [pair]\n";
       return 2;
     }
     const char* path = argv[1];
@@ -2416,6 +2606,12 @@ int main(int argc, char** argv) {
       shaders.push_back(shader);
       record += kRecord;
     }
+
+#if defined(SHADER_DB_TRANSLATE) && defined(BROKEN_BOND_HOST_GFX)
+    if (boot_pair) {
+      return DrawBootPair(file, shaders);
+    }
+#endif
 
     uint32_t vertex = 0;
     uint32_t pixel = 0;
