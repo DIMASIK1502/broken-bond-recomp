@@ -12,6 +12,23 @@
 
 namespace broken_bond::gfx {
 
+// One vertex-fetch constant and the attributes packed into it. Float attributes
+// are filled with a triangle that covers the viewport when the shader copies
+// them to the position.
+struct VertexAttribute {
+  int32_t offset_words = 0;
+  uint32_t components = 0;
+  bool is_float = false;
+};
+
+struct VertexStream {
+  uint32_t fetch_constant = 0;
+  uint32_t stride_words = 0;
+  uint32_t index_register = 0xFFFFFFFFu;
+  VertexAttribute attributes[8]{};
+  uint32_t attribute_count = 0;
+};
+
 struct DeviceInfo {
   std::string name;
   uint32_t api = 0;
@@ -49,10 +66,16 @@ class Device {
   // (1, 0.5, 0.25, 1). When image_count is not zero, every image binding sees
   // the same 32×32 RGBA8 texture and every sampler binding is nearest.
   // texture_key 0 is the gradient texel (17+x, 34+y, 51, 255). texture_key 1
-  // is the solid texel (200, 10, 20, 255).
+  // is the solid texel (200, 10, 20, 255). write_interpolator makes the vertex
+  // stage write (interpolator_x, 0.25, 0.5, 1) at location 0. guest_vertex
+  // treats words as a vertex shader and copies location 0 to the color target.
+  // streams, when guest_vertex is set, are the vertex fetches placed in shared
+  // memory. Vertex float constants are a repeated identity matrix.
   bool DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_t width,
                          uint32_t height, uint32_t image_count, uint32_t sampler_count,
-                         uint32_t texture_key, std::vector<uint8_t>& out, std::string& reason);
+                         uint32_t texture_key, bool write_interpolator, float interpolator_x,
+                         bool guest_vertex, const VertexStream* streams, uint32_t stream_count,
+                         std::vector<uint8_t>& out, std::string& reason);
 
  private:
   struct Vulkan;

@@ -8,6 +8,11 @@
 
 namespace broken_bond::gfx {
 
+extern const uint32_t kInterpolatorVertex[];
+extern const size_t kInterpolatorVertexWords;
+extern const uint32_t kPassFragment[];
+extern const size_t kPassFragmentWords;
+
 struct Device::Vulkan {
   VkInstance instance = VK_NULL_HANDLE;
   VkPhysicalDevice physical = VK_NULL_HANDLE;
@@ -936,7 +941,9 @@ bool Device::DrawTexturedRgba8(const uint8_t* pixels, uint32_t width, uint32_t h
 
 bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_t width,
                                uint32_t height, uint32_t image_count, uint32_t sampler_count,
-                               uint32_t texture_key, std::vector<uint8_t>& out, std::string& reason) {
+                               uint32_t texture_key, bool write_interpolator, float interpolator_x,
+                               bool guest_vertex, const VertexStream* streams, uint32_t stream_count,
+                               std::vector<uint8_t>& out, std::string& reason) {
   if (vulkan_ == nullptr || words == nullptr || word_count < 5 || width == 0 || height == 0 ||
       image_count > 16 || sampler_count > 8 || !info_.dynamic_rendering) {
     reason = "guest draw is missing a device, a shader, or dynamic rendering";
@@ -989,6 +996,7 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
   VkDescriptorSet sets[4] = {};
   Buffer shared{};
   Buffer constants[4]{};
+  Buffer vertex_floats{};
   Image target{};
   VkImageView target_view = VK_NULL_HANDLE;
   Image texture{};
@@ -1018,6 +1026,7 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
     for (Buffer& constant : constants) {
       DestroyBuffer(device, constant);
     }
+    DestroyBuffer(device, vertex_floats);
     DestroyBuffer(device, shared);
     if (pipeline != VK_NULL_HANDLE) {
       vkDestroyPipeline(device, pipeline, nullptr);
@@ -1042,33 +1051,57 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
   };
 
   VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-  module_info.codeSize = sizeof(kPosition);
-  module_info.pCode = kPosition;
+  if (guest_vertex) {
+    module_info.codeSize = word_count * sizeof(uint32_t);
+    module_info.pCode = words;
+  } else if (write_interpolator) {
+    module_info.codeSize = kInterpolatorVertexWords * sizeof(uint32_t);
+    module_info.pCode = kInterpolatorVertex;
+  } else {
+    module_info.codeSize = sizeof(kPosition);
+    module_info.pCode = kPosition;
+  }
   if (vkCreateShaderModule(device, &module_info, nullptr, &vertex_module) != VK_SUCCESS) {
     reason = "guest position shader failed";
     cleanup();
     return false;
   }
-  module_info.codeSize = word_count * sizeof(uint32_t);
-  module_info.pCode = words;
+  if (guest_vertex) {
+    module_info.codeSize = kPassFragmentWords * sizeof(uint32_t);
+    module_info.pCode = kPassFragment;
+  } else {
+    module_info.codeSize = word_count * sizeof(uint32_t);
+    module_info.pCode = words;
+  }
   if (vkCreateShaderModule(device, &module_info, nullptr, &fragment_module) != VK_SUCCESS) {
     reason = "guest fragment shader failed";
     cleanup();
     return false;
   }
+  const VkShaderStageFlags guest_stages =
+      guest_vertex ? (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT)
+                   : VK_SHADER_STAGE_FRAGMENT_BIT;
 
   VkDescriptorSetLayoutBinding storage{};
   storage.binding = 0;
   storage.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
   storage.descriptorCount = 1;
-  storage.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-  VkDescriptorSetLayoutBinding uniforms[4]{};
+  storage.stageFlags = guest_stages;
+  VkDescriptorSetLayoutBinding uniforms[5]{};
   const uint32_t uniform_bindings[4] = {0, 2, 3, 4};
+  uint32_t uniform_count = 4;
   for (uint32_t i = 0; i < 4; ++i) {
     uniforms[i].binding = uniform_bindings[i];
     uniforms[i].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     uniforms[i].descriptorCount = 1;
-    uniforms[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    uniforms[i].stageFlags = guest_stages;
+  }
+  if (guest_vertex) {
+    uniforms[4].binding = 1;
+    uniforms[4].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    uniforms[4].descriptorCount = 1;
+    uniforms[4].stageFlags = guest_stages;
+    uniform_count = 5;
   }
   VkDescriptorSetLayoutCreateInfo set_info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
   set_info.bindingCount = 1;
@@ -1078,7 +1111,7 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
     cleanup();
     return false;
   }
-  set_info.bindingCount = 4;
+  set_info.bindingCount = uniform_count;
   set_info.pBindings = uniforms;
   if (vkCreateDescriptorSetLayout(device, &set_info, nullptr, &set_layouts[1]) != VK_SUCCESS) {
     reason = "guest constant layout failed";
@@ -1149,8 +1182,16 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
       // Alpha test function 7 is "always". color_exp_bias stays at 1 so the
       // shader's own color is what gets stored. Swizzle RGBA for every fetch.
       auto* system = static_cast<uint8_t*>(mapped);
-      const uint32_t alpha_test_always = 7u << 16;
+      // Alpha test function 7 is "always". Bit 10 keeps the vertex shader's W
+      // instead of treating it as 1/W. The host NDC scale is 1 so a clip-space
+      // triangle is not multiplied by zero. vertex_index_max (byte 500) must
+      // be above the vertex ids or every fetch index is clamped to 0.
+      const uint32_t alpha_test_always = (7u << 16) | (1u << 10);
       std::memcpy(system, &alpha_test_always, sizeof(alpha_test_always));
+      const float ndc_scale[3] = {1.f, 1.f, 1.f};
+      std::memcpy(system + 124, ndc_scale, sizeof(ndc_scale));
+      const uint32_t vertex_index_max = 0x00FFFFFFu;
+      std::memcpy(system + 500, &vertex_index_max, sizeof(vertex_index_max));
       const uint32_t swizzle = 0x688u | (0x688u << 12);
       for (uint32_t i = 0; i < 16; ++i) {
         std::memcpy(system + 208 + i * sizeof(uint32_t), &swizzle, sizeof(swizzle));
@@ -1163,7 +1204,7 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
       for (uint32_t i = 0; i < 256 * 4; ++i) {
         values[i] = pattern[i & 3];
       }
-    } else if (buffer == &constants[3]) {
+    } else if (buffer == &constants[3] && !guest_vertex) {
       rex::graphics::xenos::xe_gpu_texture_fetch_t fetch{};
       fetch.type = rex::graphics::xenos::FetchConstantType::kTexture;
       fetch.clamp_x = rex::graphics::xenos::ClampMode::kClampToEdge;
@@ -1184,6 +1225,82 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
       }
     }
     vkUnmapMemory(device, buffer->memory);
+  }
+  if (guest_vertex) {
+    if (!MakeBuffer(vulkan_->physical, device, kBytes, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, kHost,
+                    vertex_floats, reason)) {
+      cleanup();
+      return false;
+    }
+    void* mapped = nullptr;
+    if (vkMapMemory(device, vertex_floats.memory, 0, kBytes, 0, &mapped) != VK_SUCCESS) {
+      reason = "guest vertex constant map failed";
+      cleanup();
+      return false;
+    }
+    auto* values = static_cast<float*>(mapped);
+    for (uint32_t reg = 0; reg < 256; ++reg) {
+      values[reg * 4 + 0] = (reg % 4) == 0 ? 1.f : 0.f;
+      values[reg * 4 + 1] = (reg % 4) == 1 ? 1.f : 0.f;
+      values[reg * 4 + 2] = (reg % 4) == 2 ? 1.f : 0.f;
+      values[reg * 4 + 3] = (reg % 4) == 3 ? 1.f : 0.f;
+    }
+    vkUnmapMemory(device, vertex_floats.memory);
+  }
+  if (guest_vertex && streams != nullptr && stream_count != 0) {
+    void* memory_mapped = nullptr;
+    void* fetch_mapped = nullptr;
+    if (vkMapMemory(device, shared.memory, 0, kBytes, 0, &memory_mapped) != VK_SUCCESS ||
+        vkMapMemory(device, constants[3].memory, 0, kBytes, 0, &fetch_mapped) != VK_SUCCESS) {
+      reason = "guest vertex memory map failed";
+      if (memory_mapped != nullptr) {
+        vkUnmapMemory(device, shared.memory);
+      }
+      cleanup();
+      return false;
+    }
+    auto* memory = static_cast<uint32_t*>(memory_mapped);
+    auto* fetch = static_cast<uint32_t*>(fetch_mapped);
+    constexpr uint32_t kDwords = 65536 / 4;
+    const float triangle[3][4] = {
+        {-1.f, -1.f, 0.f, 1.f},
+        {3.f, -1.f, 0.f, 1.f},
+        {-1.f, 3.f, 0.f, 1.f},
+    };
+    uint32_t cursor = 64;
+    for (uint32_t s = 0; s < stream_count; ++s) {
+      const VertexStream& stream = streams[s];
+      if (stream.fetch_constant >= 96) {
+        continue;
+      }
+      uint32_t stride = stream.stride_words == 0 ? 4u : stream.stride_words;
+      if (cursor + stride * 3 > kDwords) {
+        break;
+      }
+      const uint32_t base = cursor;
+      fetch[stream.fetch_constant * 2] = (base << 2) | 3u;
+      fetch[stream.fetch_constant * 2 + 1] = 0xFFFFFFu << 2;
+      for (uint32_t vertex = 0; vertex < 3; ++vertex) {
+        for (uint32_t a = 0; a < stream.attribute_count && a < 8; ++a) {
+          const VertexAttribute& attribute = stream.attributes[a];
+          if (!attribute.is_float || attribute.components == 0) {
+            continue;
+          }
+          const int32_t at = stream.stride_words == 0
+                                 ? int32_t(base) + attribute.offset_words
+                                 : int32_t(base + vertex * stream.stride_words) + attribute.offset_words;
+          if (at < 0 || uint32_t(at) + attribute.components > kDwords) {
+            continue;
+          }
+          for (uint32_t c = 0; c < attribute.components && c < 4; ++c) {
+            std::memcpy(memory + at + c, &triangle[vertex][c], sizeof(float));
+          }
+        }
+      }
+      cursor += stride * 3;
+    }
+    vkUnmapMemory(device, constants[3].memory);
+    vkUnmapMemory(device, shared.memory);
   }
 
   if (image_count != 0) {
@@ -1282,7 +1399,7 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
   pool_sizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
   pool_sizes[0].descriptorCount = 1;
   pool_sizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-  pool_sizes[1].descriptorCount = 4;
+  pool_sizes[1].descriptorCount = uniform_count;
   uint32_t pool_count = 2;
   if (image_count != 0) {
     pool_sizes[pool_count].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
@@ -1312,13 +1429,13 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
     cleanup();
     return false;
   }
-  VkDescriptorBufferInfo buffer_infos[5]{};
+  VkDescriptorBufferInfo buffer_infos[6]{};
   Buffer* bound[5] = {&shared, &constants[0], &constants[1], &constants[2], &constants[3]};
   for (uint32_t i = 0; i < 5; ++i) {
     buffer_infos[i].buffer = bound[i]->buffer;
     buffer_infos[i].range = kBytes;
   }
-  VkWriteDescriptorSet writes[5]{};
+  VkWriteDescriptorSet writes[6]{};
   writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
   writes[0].dstSet = sets[0];
   writes[0].dstBinding = 0;
@@ -1332,6 +1449,18 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
     writes[i + 1].descriptorCount = 1;
     writes[i + 1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     writes[i + 1].pBufferInfo = &buffer_infos[i + 1];
+  }
+  uint32_t write_count = 5;
+  if (guest_vertex) {
+    buffer_infos[5].buffer = vertex_floats.buffer;
+    buffer_infos[5].range = kBytes;
+    writes[5].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[5].dstSet = sets[1];
+    writes[5].dstBinding = 1;
+    writes[5].descriptorCount = 1;
+    writes[5].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    writes[5].pBufferInfo = &buffer_infos[5];
+    write_count = 6;
   }
   std::vector<VkDescriptorImageInfo> image_infos(image_count + sampler_count);
   std::vector<VkWriteDescriptorSet> texture_writes(image_count + sampler_count);
@@ -1354,7 +1483,7 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
     texture_writes[image_count + i].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
     texture_writes[image_count + i].pImageInfo = &image_infos[image_count + i];
   }
-  vkUpdateDescriptorSets(device, 5, writes, 0, nullptr);
+  vkUpdateDescriptorSets(device, write_count, writes, 0, nullptr);
   if (!texture_writes.empty()) {
     vkUpdateDescriptorSets(device, uint32_t(texture_writes.size()), texture_writes.data(), 0,
                            nullptr);
@@ -1417,6 +1546,17 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
   stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
   stages[0].module = vertex_module;
   stages[0].pName = "main";
+  VkSpecializationMapEntry spec_entry{};
+  spec_entry.constantID = 0;
+  spec_entry.size = sizeof(float);
+  VkSpecializationInfo spec{};
+  spec.mapEntryCount = 1;
+  spec.pMapEntries = &spec_entry;
+  spec.dataSize = sizeof(float);
+  spec.pData = &interpolator_x;
+  if (write_interpolator && !guest_vertex) {
+    stages[0].pSpecializationInfo = &spec;
+  }
   stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
   stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
   stages[1].module = fragment_module;

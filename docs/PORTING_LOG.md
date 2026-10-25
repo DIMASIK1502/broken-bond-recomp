@@ -534,9 +534,21 @@ those constants into the color target: two as 255,127,64,255 and one as
 32 were drawn with their own image and sampler counts. Every image binding
 received one 32×32 RGBA8 texture and every sampler binding was nearest.
 Drawing each of those 32 a second time with a different texture changed all
-64 pixels for 10 shaders, so those shaders sampled the bound image. There
-are still no interpolators, no guest-memory fetches, and no EDRAM in this
-path.
+64 pixels for 10 shaders, so those shaders sampled the bound image. Interpolator
+0 was then enabled for textureless pixel shaders that read at least one
+register. 62 such shaders exist. The first 16 were drawn twice, with the
+vertex stage writing (1, 0.25, 0.5, 1) and then (0, 0.25, 0.5, 1) at location
+0. Four of them changed all 64 pixels. One copied the interpolator unchanged:
+255,64,127,255 became 0,64,127,255. Every one of the 16542 vertex fetches in
+this dump has format 0 and stride 0, so the translator loads no words. A probe
+patched the 31 textureless shaders that write interpolator 0 and have a single
+vfetch indexed by r0.x: the empty fields became float4 (format 38) and a stride
+of 4 dwords. System constants then had NDC scale (1, 1, 1) at byte 124,
+vertex_index_max 0xFFFFFF at byte 500, and bit 10 set so W is kept. Shared
+memory held a covering triangle and fetch constant vf0 pointed at it. The first
+16 of those 31 produced fragments: 4 covered all 64 pixels and 12 covered 32.
+The real format and stride are not in the shader database, and EDRAM is still
+absent from this path.
 
 `GetTiledAddressLowerBound3D` masks Z with `~kTextureTileDepth` (`~4`) rather
 than `~(kTextureTileDepth - 1)`. On 300 of 600 tile corners, Z = 4 and

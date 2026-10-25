@@ -39,6 +39,7 @@
 #include <cstring>
 
 #include <rex/cvar.h>
+#include <rex/graphics/format/ucode.h>
 #include <rex/graphics/pipeline/shader/spirv.h>
 #include <rex/graphics/pipeline/texture/conversion.h>
 #include <rex/graphics/pipeline/texture/util.h>
@@ -522,10 +523,36 @@ struct TranslateStats {
     std::vector<uint32_t> words;
     uint32_t images = 0;
     uint32_t samplers = 0;
+    bool interpolate = false;
+    bool vertex = false;
+    std::vector<broken_bond::gfx::VertexStream> streams;
   };
   std::vector<GuestDraw> guest_alu;
   std::vector<GuestDraw> guest_textured;
+  std::vector<GuestDraw> guest_interpolated;
+  std::vector<GuestDraw> guest_vertices;
   uint32_t guest_textured_seen = 0;
+  uint32_t guest_interpolated_seen = 0;
+  uint32_t guest_vertex_seen = 0;
+  uint32_t guest_fetch_seen = 0;
+  uint32_t vb_shaders = 0;
+  uint32_t vb_with_binding = 0;
+  uint32_t vb_attr_stride = 0;
+  uint32_t vb_float = 0;
+  uint32_t vb_index0 = 0;
+  uint32_t format_hits[64] = {};
+  uint32_t example_format = 0xFFFFFFFFu;
+  uint32_t example_stride = 0;
+  uint32_t example_offset = 0;
+  uint32_t example_index = 0xFFFFFFFFu;
+  uint32_t example_swizzle = 0xFFFFFFFFu;
+  uint32_t example_fetch = 0;
+  uint32_t disasm_vfetch = 0;
+  uint32_t disasm_format = 0;
+  uint32_t disasm_stride = 0;
+  std::string disasm_sample;
+  uint32_t sample_dwords[48] = {};
+  uint32_t sample_dword_count = 0;
 };
 
 struct HostProbe {
@@ -1353,6 +1380,62 @@ void NoteModule(const std::vector<uint8_t>& binary, bool vertex,
   }
 }
 
+uint32_t HostFromBe(uint32_t loaded) {
+  return (loaded >> 24) | ((loaded >> 8) & 0x0000FF00u) | ((loaded << 8) & 0x00FF0000u) | (loaded << 24);
+}
+
+// This dump stores every vfetch with format 0 and stride 0. The translator then
+// loads nothing. A single float4 fetch is enough to test the address path, so
+// those empty fields become VertexFormat::k_32_32_32_32_FLOAT (38) and a stride
+// of 4 dwords.
+void PatchZeroVertexFetches(std::vector<uint32_t>& dwords) {
+  if (dwords.size() < 3 || dwords.size() % 3 != 0) {
+    return;
+  }
+  const uint32_t slots = static_cast<uint32_t>(dwords.size() / 3);
+  uint32_t bound = slots;
+  for (uint32_t slot = 0; slot < bound; ++slot) {
+    rex::graphics::ucode::ControlFlowInstruction pair[2];
+    rex::graphics::ucode::UnpackControlFlowInstructions(dwords.data() + slot * 3, pair);
+    for (const rex::graphics::ucode::ControlFlowInstruction& instr : pair) {
+      if (!rex::graphics::ucode::IsControlFlowOpcodeExec(instr.opcode())) {
+        continue;
+      }
+      const uint32_t address = instr.exec.address();
+      if (address != 0 && address < bound) {
+        bound = address;
+      }
+    }
+  }
+  for (uint32_t slot = 0; slot < bound; ++slot) {
+    rex::graphics::ucode::ControlFlowInstruction pair[2];
+    rex::graphics::ucode::UnpackControlFlowInstructions(dwords.data() + slot * 3, pair);
+    for (const rex::graphics::ucode::ControlFlowInstruction& instr : pair) {
+      if (!rex::graphics::ucode::IsControlFlowOpcodeExec(instr.opcode())) {
+        continue;
+      }
+      uint32_t sequence = instr.exec.sequence();
+      const uint32_t address = instr.exec.address();
+      const uint32_t count = instr.exec.count();
+      for (uint32_t n = 0; n < count; ++n, sequence >>= 2) {
+        if ((sequence & 1u) == 0) {
+          continue;
+        }
+        const uint32_t at = (address + n) * 3;
+        if (at + 2 >= dwords.size() || (dwords[at] & 0x1Fu) != 0) {
+          continue;
+        }
+        if (((dwords[at + 1] >> 16) & 0x3Fu) == 0) {
+          dwords[at + 1] |= 38u << 16;
+        }
+        if ((dwords[at + 2] & 0xFFu) == 0) {
+          dwords[at + 2] |= 4u;
+        }
+      }
+    }
+  }
+}
+
 void TranslateShader(rex::graphics::SpirvShaderTranslator& translator, uint32_t token,
                      const UcodeSpan& ucode, TranslateStats& stats, HostProbe& probe) {
   const auto type = token == 0xFFFE0300u ? rex::graphics::xenos::ShaderType::kVertex
@@ -1360,6 +1443,25 @@ void TranslateShader(rex::graphics::SpirvShaderTranslator& translator, uint32_t 
   rex::graphics::SpirvShader shader(type, 0, ucode.dwords, ucode.dword_count, std::endian::big);
   rex::string::StringBuffer disassembly;
   shader.AnalyzeUcode(disassembly);
+  if (type == rex::graphics::xenos::ShaderType::kVertex) {
+    const std::string_view text = disassembly.to_string_view();
+    if (text.find("vfetch") != std::string_view::npos) {
+      ++stats.disasm_vfetch;
+    }
+    if (text.find("DataFormat=") != std::string_view::npos) {
+      ++stats.disasm_format;
+    }
+    if (text.find("Stride=") != std::string_view::npos) {
+      ++stats.disasm_stride;
+    }
+    if (stats.disasm_sample.empty() && text.find("vfetch") != std::string_view::npos) {
+      stats.disasm_sample.assign(text.data(), std::min<size_t>(text.size(), 2000));
+      stats.sample_dword_count =
+          static_cast<uint32_t>(std::min<size_t>(shader.ucode_dword_count(), 48));
+      std::memcpy(stats.sample_dwords, shader.ucode_dwords(),
+                  sizeof(uint32_t) * stats.sample_dword_count);
+    }
+  }
   if (shader.uses_register_dynamic_addressing()) {
     ++stats.dynamic_registers;
   }
@@ -1405,6 +1507,157 @@ void TranslateShader(rex::graphics::SpirvShaderTranslator& translator, uint32_t 
           draw.words.assign(reinterpret_cast<const uint32_t*>(binary.data()),
                             reinterpret_cast<const uint32_t*>(binary.data() + binary.size()));
           stats.guest_textured.push_back(std::move(draw));
+        }
+      }
+      if (guest_color && stage.images == 0 && stage.samplers == 0 &&
+          shader.register_static_address_bound() >= 1) {
+        ++stats.guest_interpolated_seen;
+        if (stats.guest_interpolated.size() < 16) {
+          rex::graphics::SpirvShaderTranslator::Modification modification(
+              translator.GetDefaultPixelShaderModification(0));
+          modification.pixel.interpolator_mask = 1;
+          rex::graphics::Shader::Translation& interpolated =
+              *shader.GetOrCreateTranslation(modification.value);
+          if (translator.TranslateAnalyzedShader(interpolated)) {
+            const std::vector<uint8_t>& again = interpolated.translated_binary();
+            if (again.size() >= 4 && again.size() % 4 == 0) {
+              TranslateStats::GuestDraw draw;
+              draw.interpolate = true;
+              draw.words.assign(reinterpret_cast<const uint32_t*>(again.data()),
+                                reinterpret_cast<const uint32_t*>(again.data() + again.size()));
+              stats.guest_interpolated.push_back(std::move(draw));
+            }
+          }
+        }
+      }
+      if (stage.vertex) {
+        ++stats.vb_shaders;
+        bool any_stride = false;
+        bool any_float = false;
+        bool any_index0 = false;
+        if (!shader.vertex_bindings().empty()) {
+          ++stats.vb_with_binding;
+        }
+        for (const rex::graphics::Shader::VertexBinding& binding : shader.vertex_bindings()) {
+          for (const rex::graphics::Shader::VertexBinding::Attribute& attribute :
+               binding.attributes) {
+            const auto format_value = static_cast<uint32_t>(attribute.fetch_instr.attributes.data_format);
+            if (format_value < 64) {
+              ++stats.format_hits[format_value];
+            }
+            if (attribute.fetch_instr.attributes.stride != 0) {
+              any_stride = true;
+            }
+            const rex::graphics::xenos::VertexFormat format =
+                attribute.fetch_instr.attributes.data_format;
+            if (format == rex::graphics::xenos::VertexFormat::k_32_FLOAT ||
+                format == rex::graphics::xenos::VertexFormat::k_32_32_FLOAT ||
+                format == rex::graphics::xenos::VertexFormat::k_32_32_32_FLOAT ||
+                format == rex::graphics::xenos::VertexFormat::k_32_32_32_32_FLOAT) {
+              any_float = true;
+            }
+            if (stats.example_format == 0xFFFFFFFFu && attribute.fetch_instr.operand_count > 0) {
+              stats.example_format = format_value;
+              stats.example_stride = attribute.fetch_instr.attributes.stride;
+              stats.example_offset = attribute.fetch_instr.attributes.offset;
+              stats.example_fetch = binding.fetch_constant;
+              stats.example_index = attribute.fetch_instr.operands[0].storage_index;
+              stats.example_swizzle = static_cast<uint32_t>(attribute.fetch_instr.operands[0].components[0]);
+            }
+            if (attribute.fetch_instr.operand_count > 0 &&
+                attribute.fetch_instr.operands[0].storage_source ==
+                    rex::graphics::InstructionStorageSource::kRegister &&
+                attribute.fetch_instr.operands[0].storage_index == 0 &&
+                !attribute.fetch_instr.operands[0].is_negated &&
+                attribute.fetch_instr.operands[0].components[0] == rex::graphics::SwizzleSource::kX) {
+              any_index0 = true;
+            }
+          }
+        }
+        if (any_stride) {
+          ++stats.vb_attr_stride;
+        }
+        if (any_float) {
+          ++stats.vb_float;
+        }
+        if (any_index0) {
+          ++stats.vb_index0;
+        }
+      }
+      if (stage.vertex && stage.images == 0 && stage.samplers == 0 &&
+          (shader.writes_interpolators() & 1u) != 0 && shader.memexport_eM_written() == 0) {
+        ++stats.guest_vertex_seen;
+        const bool single_fetch =
+            shader.vertex_bindings().size() == 1 && shader.vertex_bindings()[0].attributes.size() == 1 &&
+            shader.vertex_bindings()[0].attributes[0].fetch_instr.operand_count > 0 &&
+            shader.vertex_bindings()[0].attributes[0].fetch_instr.operands[0].storage_source ==
+                rex::graphics::InstructionStorageSource::kRegister &&
+            shader.vertex_bindings()[0].attributes[0].fetch_instr.operands[0].storage_index == 0 &&
+            !shader.vertex_bindings()[0].attributes[0].fetch_instr.operands[0].is_negated &&
+            shader.vertex_bindings()[0].attributes[0].fetch_instr.operands[0].components[0] ==
+                rex::graphics::SwizzleSource::kX;
+        if (single_fetch) {
+          ++stats.guest_fetch_seen;
+        }
+        if (single_fetch && stats.guest_vertices.size() < 16) {
+          std::vector<uint32_t> patched_ucode(ucode.dword_count);
+          for (uint32_t i = 0; i < ucode.dword_count; ++i) {
+            patched_ucode[i] = HostFromBe(ucode.dwords[i]);
+          }
+          PatchZeroVertexFetches(patched_ucode);
+          rex::graphics::SpirvShader patched(rex::graphics::xenos::ShaderType::kVertex, 0,
+                                            patched_ucode.data(), patched_ucode.size(),
+                                            std::endian::native);
+          rex::string::StringBuffer patched_disassembly;
+          patched.AnalyzeUcode(patched_disassembly);
+          rex::graphics::SpirvShaderTranslator::Modification modification(
+              translator.GetDefaultVertexShaderModification(0));
+          modification.vertex.interpolator_mask = 1;
+          rex::graphics::Shader::Translation& vertex_out =
+              *patched.GetOrCreateTranslation(modification.value);
+          if (translator.TranslateAnalyzedShader(vertex_out)) {
+            const std::vector<uint8_t>& again = vertex_out.translated_binary();
+            if (again.size() >= 4 && again.size() % 4 == 0) {
+              TranslateStats::GuestDraw draw;
+              draw.vertex = true;
+              draw.words.assign(reinterpret_cast<const uint32_t*>(again.data()),
+                                reinterpret_cast<const uint32_t*>(again.data() + again.size()));
+              for (const rex::graphics::Shader::VertexBinding& binding : patched.vertex_bindings()) {
+                broken_bond::gfx::VertexStream stream;
+                stream.fetch_constant = binding.fetch_constant;
+                stream.stride_words = binding.stride_words;
+                if (!binding.attributes.empty() && binding.attributes[0].fetch_instr.operand_count > 0 &&
+                    binding.attributes[0].fetch_instr.operands[0].storage_source ==
+                        rex::graphics::InstructionStorageSource::kRegister) {
+                  stream.index_register = binding.attributes[0].fetch_instr.operands[0].storage_index;
+                }
+                for (const rex::graphics::Shader::VertexBinding::Attribute& attribute :
+                     binding.attributes) {
+                  if (stream.attribute_count >= 8) {
+                    break;
+                  }
+                  const rex::graphics::xenos::VertexFormat format =
+                      attribute.fetch_instr.attributes.data_format;
+                  broken_bond::gfx::VertexAttribute& out =
+                      stream.attributes[stream.attribute_count++];
+                  out.offset_words = attribute.fetch_instr.attributes.offset;
+                  out.is_float = format == rex::graphics::xenos::VertexFormat::k_32_FLOAT ||
+                                 format == rex::graphics::xenos::VertexFormat::k_32_32_FLOAT ||
+                                 format == rex::graphics::xenos::VertexFormat::k_32_32_32_FLOAT ||
+                                 format == rex::graphics::xenos::VertexFormat::k_32_32_32_32_FLOAT;
+                  out.components =
+                      out.is_float
+                          ? uint32_t(rex::graphics::xenos::GetVertexFormatComponentCount(format))
+                          : 0;
+                  if (attribute.fetch_instr.attributes.stride > stream.stride_words) {
+                    stream.stride_words = attribute.fetch_instr.attributes.stride;
+                  }
+                }
+                draw.streams.push_back(stream);
+              }
+              stats.guest_vertices.push_back(std::move(draw));
+            }
+          }
         }
       }
       ++stats.ok;
@@ -2070,9 +2323,17 @@ int main(int argc, char** argv) {
         }
         std::vector<uint8_t> drawn;
         std::vector<uint8_t> other;
-        if (!device.DrawGuestFragment(fragment.words.data(), fragment.words.size(), kGuestSize,
-                                      kGuestSize, fragment.images, fragment.samplers, 0, drawn,
-                                      guest_reason)) {
+        const bool first_ok =
+            fragment.vertex
+                ? device.DrawGuestFragment(fragment.words.data(), fragment.words.size(), kGuestSize,
+                                           kGuestSize, 0, 0, 0, false, 0.f, true,
+                                           fragment.streams.data(), uint32_t(fragment.streams.size()),
+                                           drawn, guest_reason)
+                : device.DrawGuestFragment(fragment.words.data(), fragment.words.size(), kGuestSize,
+                                           kGuestSize, fragment.images, fragment.samplers, 0,
+                                           fragment.interpolate, 1.f, false, nullptr, 0, drawn,
+                                           guest_reason);
+        if (!first_ok) {
           std::cout << kind << " failed images " << fragment.images << " samplers "
                     << fragment.samplers << " " << guest_reason << "\n";
           continue;
@@ -2080,10 +2341,17 @@ int main(int argc, char** argv) {
         uint32_t changed = 0;
         uint32_t texture_diff = 0;
         const bool second =
-            fragment.images != 0 &&
-            device.DrawGuestFragment(fragment.words.data(), fragment.words.size(), kGuestSize,
-                                     kGuestSize, fragment.images, fragment.samplers, 1, other,
-                                     guest_reason);
+            fragment.vertex
+                ? false
+                : fragment.interpolate
+                      ? device.DrawGuestFragment(fragment.words.data(), fragment.words.size(),
+                                                 kGuestSize, kGuestSize, 0, 0, 0, true, 0.f, false,
+                                                 nullptr, 0, other, guest_reason)
+                      : fragment.images != 0 &&
+                            device.DrawGuestFragment(
+                                fragment.words.data(), fragment.words.size(), kGuestSize, kGuestSize,
+                                fragment.images, fragment.samplers, 1, false, 0.f, false, nullptr, 0,
+                                other, guest_reason);
         for (size_t i = 0; i + 3 < drawn.size(); i += 4) {
           if (drawn[i] != 255 || drawn[i + 1] != 0 || drawn[i + 2] != 255 || drawn[i + 3] != 255) {
             ++changed;
@@ -2095,7 +2363,25 @@ int main(int argc, char** argv) {
           }
         }
         std::cout << kind << " ok images " << fragment.images << " samplers " << fragment.samplers
-                  << " changed " << changed << " texture_diff " << texture_diff;
+                  << " streams " << fragment.streams.size();
+        if (!fragment.streams.empty()) {
+          const broken_bond::gfx::VertexStream& stream = fragment.streams[0];
+          uint32_t floats = 0;
+          for (uint32_t a = 0; a < stream.attribute_count && a < 8; ++a) {
+            if (stream.attributes[a].is_float) {
+              ++floats;
+            }
+          }
+          std::cout << " fetch " << stream.fetch_constant << " stride " << stream.stride_words
+                    << " attrs " << stream.attribute_count << " floats " << floats << " index "
+                    << stream.index_register;
+          if (stream.attribute_count != 0) {
+            std::cout << " offset0 " << stream.attributes[0].offset_words << " comps0 "
+                      << stream.attributes[0].components;
+          }
+        }
+        std::cout << " changed " << changed
+                  << " diff " << texture_diff;
         if (drawn.size() >= 4) {
           std::cout << " first " << int(drawn[0]) << " " << int(drawn[1]) << " " << int(drawn[2])
                     << " " << int(drawn[3]);
@@ -2111,8 +2397,34 @@ int main(int argc, char** argv) {
       }
     };
     std::cout << "guest_textured_seen " << translated.guest_textured_seen << "\n";
+    std::cout << "guest_interpolated_seen " << translated.guest_interpolated_seen << "\n";
+    std::cout << "guest_vertex_seen " << translated.guest_vertex_seen << "\n";
+    std::cout << "guest_single_fetch " << translated.guest_fetch_seen << "\n";
+    std::cout << "vb_shaders " << translated.vb_shaders << " with_binding " << translated.vb_with_binding
+              << " attr_stride " << translated.vb_attr_stride << " float " << translated.vb_float
+              << " index0 " << translated.vb_index0 << "\n";
+    std::cout << "disasm vfetch " << translated.disasm_vfetch << " format " << translated.disasm_format
+              << " stride " << translated.disasm_stride << "\n";
+    if (!translated.disasm_sample.empty()) {
+      std::cout << "--- vs sample ---\n" << translated.disasm_sample << "\n--- sample dwords ---\n";
+      for (uint32_t i = 0; i < translated.sample_dword_count; ++i) {
+        std::cout << std::hex << translated.sample_dwords[i] << (i + 1 == translated.sample_dword_count ? "" : " ");
+      }
+      std::cout << std::dec << "\n";
+    }
+    std::cout << "vfetch example format " << translated.example_format << " stride "
+              << translated.example_stride << " offset " << translated.example_offset << " fetch "
+              << translated.example_fetch << " index " << translated.example_index << " swizzle "
+              << translated.example_swizzle << "\n";
+    for (uint32_t format = 0; format < 64; ++format) {
+      if (translated.format_hits[format] != 0) {
+        std::cout << "vfetch format " << format << " " << translated.format_hits[format] << "\n";
+      }
+    }
     draw_batch(translated.guest_alu, "guest_alu");
     draw_batch(translated.guest_textured, "guest_tex");
+    draw_batch(translated.guest_interpolated, "guest_interp");
+    draw_batch(translated.guest_vertices, "guest_vert");
     if (guest_draws == 0) {
       guest_draw_failed = 1;
     }
