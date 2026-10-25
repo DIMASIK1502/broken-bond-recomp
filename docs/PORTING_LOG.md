@@ -820,6 +820,14 @@ into one 1280×512 target covers 182122 pixels after the first draw and
 186, 137, 125, 0. `broken_bond` now links `broken_bond_gfx`. `renderer=host`
 opens this Vulkan device. The default remains `xenos`, and present stays
 on Xenos.
+With `renderer=host`, the two counted draw entries also submit into that
+retained target. The translator lives in `broken_bond_gfx`. Four draws are
+submitted per present, and a shader is translated at most 32 times. The
+title still presents at 30 Hz. Over five seconds the host submits about
+600 draws, all from the cache after the first window, across 12 shaders.
+The retained 1280×512 image then covers 378344 pixels in 53 colors. Format
+20 and a surface whose pitch is not the draw width are skipped. The window
+is still the Xenos present.
 
 `GetTiledAddressLowerBound3D` masks Z with `~kTextureTileDepth` (`~4`) rather
 than `~(kTextureTileDepth - 1)`. On 300 of 600 tile corners, Z = 4 and

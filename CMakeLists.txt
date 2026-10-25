@@ -55,7 +55,7 @@ if(EXISTS "${BROKEN_BOND_REXGLUE_SOURCE}/src/graphics/pipeline/shader/spirv_tran
     add_subdirectory("${BROKEN_BOND_REXGLUE_SOURCE}/thirdparty/glslang"
         "${CMAKE_CURRENT_BINARY_DIR}/glslang" EXCLUDE_FROM_ALL)
 
-    target_sources(shader_db PRIVATE
+    set(BROKEN_BOND_TRANSLATOR_SOURCES
         "${BROKEN_BOND_REXGLUE_SOURCE}/src/graphics/format/ucode.cpp"
         "${BROKEN_BOND_REXGLUE_SOURCE}/src/graphics/pipeline/shader/shader.cpp"
         "${BROKEN_BOND_REXGLUE_SOURCE}/src/graphics/pipeline/shader/translator.cpp"
@@ -103,25 +103,41 @@ if(EXISTS "${BROKEN_BOND_VULKAN_SDK}/Lib/vulkan-1.lib" AND
         src/gfx/device_shadow.cpp
         src/gfx/edram.cpp
         src/gfx/guest_stage.cpp
+        src/gfx/host_draw.cpp
         src/gfx/shader_object.cpp
         src/gfx/texture.cpp
         src/gfx/vertex_semantic.cpp
         "${BROKEN_BOND_REXGLUE_SOURCE}/src/graphics/pipeline/texture/conversion.cpp"
         "${BROKEN_BOND_REXGLUE_SOURCE}/src/graphics/pipeline/texture/info_formats.cpp"
         "${BROKEN_BOND_REXGLUE_SOURCE}/src/graphics/pipeline/texture/util.cpp")
+    if(DEFINED BROKEN_BOND_TRANSLATOR_SOURCES)
+        target_sources(broken_bond_gfx PRIVATE ${BROKEN_BOND_TRANSLATOR_SOURCES})
+    endif()
     target_include_directories(broken_bond_gfx
         PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src"
         PRIVATE
             "${BROKEN_BOND_REXGLUE_SOURCE}/include"
+            "${BROKEN_BOND_REXGLUE_SOURCE}/thirdparty/vulkan-headers/include"
+            "${BROKEN_BOND_REXGLUE_SOURCE}/thirdparty/renderdoc"
             "${BROKEN_BOND_VULKAN_SDK}/Include")
     target_link_libraries(broken_bond_gfx PUBLIC
         rex::runtime
+        SPIRV
+        glslang
+        MachineIndependent
+        GenericCodeGen
+        OSDependent
+        OGLCompiler
         "${BROKEN_BOND_VULKAN_SDK}/Lib/vulkan-1.lib")
     target_compile_options(broken_bond_gfx PRIVATE -Wno-unused-variable -Wno-unused-function)
 
     add_executable(host_gfx tools/host_gfx.cpp src/host/device_repack.cpp)
     target_link_libraries(host_gfx PRIVATE broken_bond_gfx)
     target_link_libraries(broken_bond PRIVATE broken_bond_gfx)
+endif()
+
+if(DEFINED BROKEN_BOND_TRANSLATOR_SOURCES AND NOT TARGET broken_bond_gfx AND TARGET shader_db)
+    target_sources(shader_db PRIVATE ${BROKEN_BOND_TRANSLATOR_SOURCES})
 endif()
 
 if(TARGET broken_bond_gfx AND TARGET shader_db)

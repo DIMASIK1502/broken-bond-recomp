@@ -4,6 +4,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <unordered_set>
 #include <thread>
 #include <vector>
 
@@ -15,12 +16,13 @@
 #include "generated/default/broken_bond_init.h"
 #include "broken_bond_app.h"
 #include "gfx/device.h"
+#include "gfx/host_draw.h"
 #include "host/device_repack.h"
 
 REXCVAR_DEFINE_BOOL(dump_device_draw, false, "Game",
                     "Write up to eight textured triangle draws with different pixel shaders");
 REXCVAR_DEFINE_STRING(renderer, "xenos", "Game",
-                      "xenos presents the game. host opens the Vulkan device and still presents through Xenos");
+                      "xenos presents the game. host draws into a retained Vulkan target and still presents through Xenos");
 
 namespace {
 
@@ -132,6 +134,169 @@ struct LiveGuestBytes : broken_bond::host::GuestBytes {
 };
 
 std::atomic<bool> g_draw_dumped{false};
+std::unique_ptr<broken_bond::gfx::Device> g_host;
+int g_host_budget = 4;
+
+struct HostCounters {
+  int submitted = 0;
+  int cached = 0;
+  int skipped = 0;
+  int deferred = 0;
+  int unique = 0;
+  std::chrono::steady_clock::time_point window = std::chrono::steady_clock::now();
+};
+
+HostCounters g_host_counts;
+
+void HostNote(const std::string& reason) {
+  static std::vector<std::string> seen;
+  if (seen.size() >= 8u) {
+    return;
+  }
+  for (const std::string& item : seen) {
+    if (item == reason) {
+      return;
+    }
+  }
+  seen.push_back(reason);
+  REXLOG_INFO("host draw waiting: {}", reason);
+}
+
+void HostLog() {
+  const auto now = std::chrono::steady_clock::now();
+  if (now - g_host_counts.window < std::chrono::seconds(5)) {
+    return;
+  }
+  g_host_counts.window = now;
+  uint32_t covered = 0;
+  uint32_t colors = 0;
+  std::vector<uint8_t> pixels;
+  std::string reason;
+  const bool sampled = g_host && g_host->ReadRetainedFrame(pixels, reason);
+  if (sampled) {
+    std::unordered_set<uint32_t> seen;
+    for (size_t i = 0; i + 3 < pixels.size(); i += 4) {
+      if (pixels[i] == 255 && pixels[i + 1] == 0 && pixels[i + 2] == 255 && pixels[i + 3] == 255) {
+        continue;
+      }
+      seen.insert((uint32_t(pixels[i]) << 16) | (uint32_t(pixels[i + 1]) << 8) | uint32_t(pixels[i + 2]));
+      ++covered;
+    }
+    colors = uint32_t(seen.size());
+  }
+  REXLOG_INFO(
+      "host frame 5s: submitted={} cached={} skipped={} deferred={} unique={} covered={} colors={}",
+      g_host_counts.submitted, g_host_counts.cached, g_host_counts.skipped, g_host_counts.deferred,
+      g_host_counts.unique, covered, colors);
+  g_host_counts.submitted = 0;
+  g_host_counts.cached = 0;
+  g_host_counts.skipped = 0;
+  g_host_counts.deferred = 0;
+}
+
+void SubmitHostSpan(uint32_t device, const broken_bond::host::DrawSpan& span, uint8_t* base) {
+  if (!g_host) {
+    return;
+  }
+  if (g_host_budget <= 0) {
+    ++g_host_counts.deferred;
+    HostLog();
+    return;
+  }
+  --g_host_budget;
+  LiveGuestBytes live;
+  live.base = base;
+  std::vector<uint8_t> image;
+  uint32_t image_device = 0;
+  std::string reason;
+  if (!broken_bond::host::RepackDeviceDraw(live, device, image, image_device, reason, span)) {
+    ++g_host_counts.skipped;
+    HostNote(reason.empty() ? "host draw was not packed" : reason);
+    HostLog();
+    return;
+  }
+  broken_bond::gfx::RetainedDrawInfo info;
+  if (!broken_bond::gfx::SubmitRetainedDraw(*g_host, image.data(), image.size(), image_device,
+                                           g_host_counts.unique < 32, false, info, reason)) {
+    if (reason.rfind("deferred", 0) == 0) {
+      ++g_host_counts.deferred;
+    } else {
+      ++g_host_counts.skipped;
+      HostNote(reason.empty() ? "host draw failed" : reason);
+    }
+    HostLog();
+    return;
+  }
+  ++g_host_counts.submitted;
+  if (info.from_cache) {
+    ++g_host_counts.cached;
+  } else {
+    ++g_host_counts.unique;
+  }
+  HostLog();
+}
+
+bool ReadBeU32(const LiveGuestBytes& live, uint32_t address, uint32_t& out);
+bool TrianglePrimitive(uint32_t prim);
+
+void MaybeHostAuto(uint32_t device, uint32_t prim, uint32_t vertex_start, uint32_t vertex_count,
+                   uint8_t* base) {
+  if (REXCVAR_GET(renderer) != "host" || !g_host || !TrianglePrimitive(prim) || vertex_count < 3u) {
+    return;
+  }
+  broken_bond::host::DrawSpan span;
+  span.vertex_count = vertex_count;
+  span.vertex_start = vertex_start;
+  SubmitHostSpan(device, span, base);
+}
+
+void MaybeHostIndexed(uint32_t device, uint32_t prim, uint32_t base_vertex, uint32_t index_start,
+                      uint32_t index_count, uint8_t* base) {
+  if (REXCVAR_GET(renderer) != "host" || !g_host || !TrianglePrimitive(prim) || index_count < 3u) {
+    return;
+  }
+  LiveGuestBytes live;
+  live.base = base;
+  uint32_t index_object = 0;
+  uint32_t flags = 0;
+  uint32_t index_base = 0;
+  if (!ReadBeU32(live, device + 12436u, index_object) || index_object == 0 ||
+      !ReadBeU32(live, index_object, flags) || !ReadBeU32(live, index_object + 24u, index_base)) {
+    ++g_host_counts.skipped;
+    HostNote("index buffer is missing");
+    return;
+  }
+  const uint32_t index_size = (flags & 0x80000000u) != 0u ? 4u : 2u;
+  const uint64_t index_bytes = uint64_t(index_count) * index_size;
+  const uint64_t index_skip = uint64_t(index_start) * index_size;
+  if (index_bytes == 0 || index_bytes > (8u << 20) || index_skip > 0xFFFFFFFFull ||
+      uint64_t(index_base) + index_skip > 0xFFFFFFFFull) {
+    ++g_host_counts.skipped;
+    HostNote("index list is " + std::to_string(index_bytes) + " bytes");
+    return;
+  }
+  broken_bond::host::DrawSpan span;
+  span.vertex_start = 0;
+  span.index_address = index_base + static_cast<uint32_t>(index_skip);
+  span.index_bytes = static_cast<uint32_t>(index_bytes);
+  span.index_size = index_size;
+  span.base_vertex = base_vertex;
+  std::vector<uint8_t> indices(static_cast<size_t>(index_bytes));
+  std::string reason;
+  uint32_t first = 0;
+  uint32_t vertex_count = 0;
+  if (!live.Read(span.index_address, indices.data(), indices.size()) ||
+      !broken_bond::host::IndexRange(indices.data(), span.index_bytes, index_size, first,
+                                     vertex_count, reason)) {
+    ++g_host_counts.skipped;
+    HostNote(reason.empty() ? "index list is outside guest memory" : reason);
+    return;
+  }
+  span.vertex_count = vertex_count;
+  span.vertex_start = first;
+  span.index_first = first;
+  SubmitHostSpan(device, span, base);
+}
 
 bool ReadBeU32(const LiveGuestBytes& live, uint32_t address, uint32_t& out) {
   uint8_t bytes[4];
@@ -322,6 +487,9 @@ void MaybeDumpDeviceDraw(uint32_t device, uint8_t* base) {
 
 REX_HOOK_RAW(sub_821B1DD0) {
   NoteSwapCaller(static_cast<uint32_t>(ctx.lr));
+  if (g_host) {
+    g_host_budget = 4;
+  }
   __imp__sub_821B1DD0(ctx, base);
 }
 
@@ -333,6 +501,8 @@ REX_HOOK_RAW(sub_821AE158) {
 REX_HOOK_RAW(sub_821AE5D0) {
   MaybeDumpAuto(static_cast<uint32_t>(ctx.r3.u32), static_cast<uint32_t>(ctx.r4.u32),
                 static_cast<uint32_t>(ctx.r5.u32), static_cast<uint32_t>(ctx.r6.u32), base);
+  MaybeHostAuto(static_cast<uint32_t>(ctx.r3.u32), static_cast<uint32_t>(ctx.r4.u32),
+                static_cast<uint32_t>(ctx.r5.u32), static_cast<uint32_t>(ctx.r6.u32), base);
   __imp__sub_821AE5D0(ctx, base);
 }
 
@@ -340,21 +510,21 @@ REX_HOOK_RAW(sub_821AE9C0) {
   MaybeDumpIndexed(static_cast<uint32_t>(ctx.r3.u32), static_cast<uint32_t>(ctx.r4.u32),
                    static_cast<uint32_t>(ctx.r5.u32), static_cast<uint32_t>(ctx.r6.u32),
                    static_cast<uint32_t>(ctx.r7.u32), base);
+  MaybeHostIndexed(static_cast<uint32_t>(ctx.r3.u32), static_cast<uint32_t>(ctx.r4.u32),
+                   static_cast<uint32_t>(ctx.r5.u32), static_cast<uint32_t>(ctx.r6.u32),
+                   static_cast<uint32_t>(ctx.r7.u32), base);
   __imp__sub_821AE9C0(ctx, base);
 }
 
 void BrokenBondApp::OnPostLaunchModule(rex::system::XThread*) {
-  if (REXCVAR_GET(renderer) == "host") {
-    static std::unique_ptr<broken_bond::gfx::Device> host;
-    if (!host) {
-      host = std::make_unique<broken_bond::gfx::Device>();
-      std::string reason;
-      if (!host->Open(reason)) {
-        REXLOG_INFO("host renderer did not open: {}", reason);
-        host.reset();
-      } else {
-        REXLOG_INFO("host renderer {} api {:08X}", host->info().name, host->info().api);
-      }
+  if (REXCVAR_GET(renderer) == "host" && !g_host) {
+    g_host = std::make_unique<broken_bond::gfx::Device>();
+    std::string reason;
+    if (!g_host->Open(reason)) {
+      REXLOG_INFO("host renderer did not open: {}", reason);
+      g_host.reset();
+    } else {
+      REXLOG_INFO("host renderer {} api {:08X}", g_host->info().name, g_host->info().api);
     }
   }
   if (g_thread.joinable()) return;

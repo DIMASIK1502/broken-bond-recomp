@@ -56,14 +56,6 @@
 #include "gfx/vertex_semantic.h"
 #endif
 
-REXCVAR_DEFINE_STRING(dump_shaders, "", "GPU", "Unused here. AnalyzeUcode reads it.");
-
-// The depth-stencil path in the translator names these tables. They live in
-// the GPU plugin's draw helper, which this tool does not link.
-namespace rex::graphics::draw_util {
-extern const int8_t kD3D10StandardSamplePositions2x[2][2] = {{4, 4}, {-4, -4}};
-extern const int8_t kD3D10StandardSamplePositions4x[4][2] = {{-2, -6}, {6, -2}, {-6, 2}, {2, 6}};
-}  // namespace rex::graphics::draw_util
 #endif
 
 namespace {

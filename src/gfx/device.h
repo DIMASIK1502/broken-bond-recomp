@@ -60,6 +60,10 @@ struct DeviceInfo {
   bool dynamic_rendering = false;
   bool demote = false;
   bool sample_rate = false;
+  uint32_t storage_range = 0;
+  bool float_preserve = false;
+  bool float_flush = false;
+  bool float_rte = false;
 };
 
 class Device {
@@ -96,8 +100,13 @@ class Device {
     float clear_blue = 0;
     float clear_alpha = 0;
     // Keep the color and depth images for the next draw of the same size.
-    // The first draw clears them. A later draw loads both.
+    // The first draw clears both and creates a depth image even when this draw
+    // leaves the depth test off, so a later draw can load it. The empty
+    // greater-equal value is 0.
     bool retain_frame = false;
+    // Copy the color target back into out. A retained draw can leave it on
+    // the GPU; out is then empty and the image stays in TRANSFER_SRC.
+    bool readback = true;
   };
 
   // Draw the image onto an offscreen target with a vertex interpolator and read it back.
@@ -134,6 +143,9 @@ class Device {
                          uint32_t texture_height = 0, const RasterState* fixed_state = nullptr,
                          const float* vertex_constants = nullptr,
                          const float* pixel_constants = nullptr);
+
+  // Copy the retained color image. It stays in TRANSFER_SRC for the next draw.
+  bool ReadRetainedFrame(std::vector<uint8_t>& out, std::string& reason);
 
  private:
   struct Vulkan;

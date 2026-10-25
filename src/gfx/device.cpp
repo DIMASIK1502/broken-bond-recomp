@@ -143,6 +143,16 @@ bool Device::Open(std::string& reason) {
   }
   info_.api = api;
 
+  VkPhysicalDeviceFloatControlsProperties float_controls{};
+  float_controls.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES;
+  VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+  properties.pNext = &float_controls;
+  vkGetPhysicalDeviceProperties2(vulkan_->physical, &properties);
+  info_.storage_range = properties.properties.limits.maxStorageBufferRange;
+  info_.float_preserve = float_controls.shaderSignedZeroInfNanPreserveFloat32 == VK_TRUE;
+  info_.float_flush = float_controls.shaderDenormFlushToZeroFloat32 == VK_TRUE;
+  info_.float_rte = float_controls.shaderRoundingModeRTEFloat32 == VK_TRUE;
+
   VkPhysicalDeviceVulkan12Features features12{};
   features12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
   VkPhysicalDeviceVulkan13Features features13{};
@@ -2039,7 +2049,7 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
     cleanup();
     return false;
   }
-  if (decoded.depth) {
+  if (decoded.depth || retain_frame) {
     VkImageCreateInfo depth_info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     depth_info.imageType = VK_IMAGE_TYPE_2D;
     depth_info.format = VK_FORMAT_D32_SFLOAT;
@@ -2084,7 +2094,9 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
   }
   }
   const VkDeviceSize bytes = VkDeviceSize(width) * height * 4;
-  if (!MakeBuffer(vulkan_->physical, device, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, kHost, readback,
+  const bool readback_pixels = fixed_state == nullptr || fixed_state->readback;
+  if (readback_pixels &&
+      !MakeBuffer(vulkan_->physical, device, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, kHost, readback,
                   reason)) {
     cleanup();
     return false;
@@ -2160,7 +2172,8 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
   VkFormat color_format = VK_FORMAT_R8G8B8A8_UNORM;
   VkFormat depth_format = VK_FORMAT_D32_SFLOAT;
   rendering.pColorAttachmentFormats = &color_format;
-  if (decoded.depth) {
+  const bool use_depth = depth_view != VK_NULL_HANDLE;
+  if (use_depth) {
     rendering.depthAttachmentFormat = depth_format;
   }
   VkGraphicsPipelineCreateInfo pipeline_info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
@@ -2172,7 +2185,7 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
   pipeline_info.pViewportState = &viewport_state;
   pipeline_info.pRasterizationState = &raster;
   pipeline_info.pMultisampleState = &multisample;
-  pipeline_info.pDepthStencilState = decoded.depth ? &depth_state : nullptr;
+  pipeline_info.pDepthStencilState = use_depth ? &depth_state : nullptr;
   pipeline_info.pColorBlendState = &blend_state;
   pipeline_info.layout = layout;
   if (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &pipeline) !=
@@ -2235,11 +2248,11 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
   if (reuse_frame) {
     target_barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
   }
-  vkCmdPipelineBarrier(command,
+    vkCmdPipelineBarrier(command,
                        reuse_frame ? VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1,
                        &target_barrier);
-  if (decoded.depth) {
+  if (depth_view != VK_NULL_HANDLE) {
     VkImageMemoryBarrier depth_barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
     depth_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     depth_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -2276,13 +2289,14 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
   depth_attachment.loadOp = reuse_frame ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
   depth_attachment.storeOp =
       retain_frame ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
-  depth_attachment.clearValue.depthStencil.depth = DepthClear(decoded.depth_op);
+  depth_attachment.clearValue.depthStencil.depth =
+      decoded.depth ? DepthClear(decoded.depth_op) : 0.f;
   VkRenderingInfo render{VK_STRUCTURE_TYPE_RENDERING_INFO};
   render.renderArea.extent = {width, height};
   render.layerCount = 1;
   render.colorAttachmentCount = 1;
   render.pColorAttachments = &color;
-  if (decoded.depth) {
+  if (depth_view != VK_NULL_HANDLE) {
     render.pDepthAttachment = &depth_attachment;
   }
   vkCmdBeginRendering(command, &render);
@@ -2306,8 +2320,10 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
   copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
   copy.imageSubresource.layerCount = 1;
   copy.imageExtent = {width, height, 1};
-  vkCmdCopyImageToBuffer(command, target.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                         readback.buffer, 1, &copy);
+  if (readback_pixels) {
+    vkCmdCopyImageToBuffer(command, target.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           readback.buffer, 1, &copy);
+  }
   if (vkEndCommandBuffer(command) != VK_SUCCESS) {
     reason = "guest command recording failed";
     cleanup();
@@ -2322,15 +2338,19 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
     cleanup();
     return false;
   }
-  void* read = nullptr;
-  if (vkMapMemory(device, readback.memory, 0, bytes, 0, &read) != VK_SUCCESS) {
-    reason = "guest readback map failed";
-    cleanup();
-    return false;
+  if (readback_pixels) {
+    void* read = nullptr;
+    if (vkMapMemory(device, readback.memory, 0, bytes, 0, &read) != VK_SUCCESS) {
+      reason = "guest readback map failed";
+      cleanup();
+      return false;
+    }
+    out.resize(size_t(bytes));
+    std::memcpy(out.data(), read, size_t(bytes));
+    vkUnmapMemory(device, readback.memory);
+  } else {
+    out.clear();
   }
-  out.resize(size_t(bytes));
-  std::memcpy(out.data(), read, size_t(bytes));
-  vkUnmapMemory(device, readback.memory);
   if (retain_frame) {
     vulkan_->frame_color = target.image;
     vulkan_->frame_color_memory = target.memory;
@@ -2347,6 +2367,67 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
     hold_targets = true;
   }
   cleanup();
+  return true;
+}
+
+bool Device::ReadRetainedFrame(std::vector<uint8_t>& out, std::string& reason) {
+  if (vulkan_ == nullptr || vulkan_->device == VK_NULL_HANDLE ||
+      vulkan_->frame_color == VK_NULL_HANDLE || vulkan_->frame_width == 0 ||
+      vulkan_->frame_height == 0) {
+    reason = "retained frame is empty";
+    return false;
+  }
+  const uint32_t width = vulkan_->frame_width;
+  const uint32_t height = vulkan_->frame_height;
+  const VkDeviceSize bytes = VkDeviceSize(width) * height * 4;
+  VkDevice device = vulkan_->device;
+  Buffer readback{};
+  constexpr VkMemoryPropertyFlags kHost =
+      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+  if (!MakeBuffer(vulkan_->physical, device, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, kHost, readback,
+                  reason)) {
+    return false;
+  }
+  VkCommandBuffer command = VK_NULL_HANDLE;
+  VkCommandBufferAllocateInfo command_info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  command_info.commandPool = vulkan_->pool;
+  command_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  command_info.commandBufferCount = 1;
+  if (vkAllocateCommandBuffers(device, &command_info, &command) != VK_SUCCESS) {
+    DestroyBuffer(device, readback);
+    reason = "retained readback command failed";
+    return false;
+  }
+  VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  vkBeginCommandBuffer(command, &begin);
+  VkBufferImageCopy copy{};
+  copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  copy.imageSubresource.layerCount = 1;
+  copy.imageExtent = {width, height, 1};
+  vkCmdCopyImageToBuffer(command, vulkan_->frame_color, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                         readback.buffer, 1, &copy);
+  const bool recorded = vkEndCommandBuffer(command) == VK_SUCCESS;
+  bool copied = false;
+  if (recorded) {
+    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &command;
+    copied = vkQueueSubmit(vulkan_->queue, 1, &submit, VK_NULL_HANDLE) == VK_SUCCESS &&
+             vkQueueWaitIdle(vulkan_->queue) == VK_SUCCESS;
+  }
+  void* read = nullptr;
+  if (!copied || vkMapMemory(device, readback.memory, 0, bytes, 0, &read) != VK_SUCCESS) {
+    vkFreeCommandBuffers(device, vulkan_->pool, 1, &command);
+    DestroyBuffer(device, readback);
+    reason = "retained readback failed";
+    return false;
+  }
+  out.resize(size_t(bytes));
+  std::memcpy(out.data(), read, size_t(bytes));
+  vkUnmapMemory(device, readback.memory);
+  vkFreeCommandBuffers(device, vulkan_->pool, 1, &command);
+  DestroyBuffer(device, readback);
   return true;
 }
 
