@@ -1,6 +1,5 @@
-// Vulkan device for the host renderer. The game does not construct this yet.
-// Xenos remains the renderer until this path can run the story, fights, and
-// cutscenes.
+// Vulkan device for the host renderer. The game opens one only when
+// renderer=host. The default remains Xenos, and present stays on Xenos.
 
 #pragma once
 
@@ -96,6 +95,9 @@ class Device {
     float clear_green = 0;
     float clear_blue = 0;
     float clear_alpha = 0;
+    // Keep the color and depth images for the next draw of the same size.
+    // The first draw clears them. A later draw loads both.
+    bool retain_frame = false;
   };
 
   // Draw the image onto an offscreen target with a vertex interpolator and read it back.

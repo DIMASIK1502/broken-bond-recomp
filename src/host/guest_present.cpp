@@ -2,6 +2,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -13,10 +14,13 @@
 
 #include "generated/default/broken_bond_init.h"
 #include "broken_bond_app.h"
+#include "gfx/device.h"
 #include "host/device_repack.h"
 
 REXCVAR_DEFINE_BOOL(dump_device_draw, false, "Game",
                     "Write up to eight textured triangle draws with different pixel shaders");
+REXCVAR_DEFINE_STRING(renderer, "xenos", "Game",
+                      "xenos presents the game. host opens the Vulkan device and still presents through Xenos");
 
 namespace {
 
@@ -340,6 +344,19 @@ REX_HOOK_RAW(sub_821AE9C0) {
 }
 
 void BrokenBondApp::OnPostLaunchModule(rex::system::XThread*) {
+  if (REXCVAR_GET(renderer) == "host") {
+    static std::unique_ptr<broken_bond::gfx::Device> host;
+    if (!host) {
+      host = std::make_unique<broken_bond::gfx::Device>();
+      std::string reason;
+      if (!host->Open(reason)) {
+        REXLOG_INFO("host renderer did not open: {}", reason);
+        host.reset();
+      } else {
+        REXLOG_INFO("host renderer {} api {:08X}", host->info().name, host->info().api);
+      }
+    }
+  }
   if (g_thread.joinable()) return;
   g_stop.store(false);
   g_thread = std::thread(SampleLoop);

@@ -94,7 +94,8 @@ if(EXISTS "${BROKEN_BOND_VULKAN_SDK}/Include/spirv-tools/libspirv.h")
         "SHADER_DB_VULKAN_SDK=\"${BROKEN_BOND_VULKAN_SDK}\"")
 endif()
 
-# Host renderer. Not linked into broken_bond, so the running game stays on Xenos.
+# Host renderer. Linked into the game. The default renderer stays Xenos, and
+# present stays on Xenos until renderer=host is drawing frames.
 if(EXISTS "${BROKEN_BOND_VULKAN_SDK}/Lib/vulkan-1.lib" AND
    EXISTS "${BROKEN_BOND_REXGLUE_SOURCE}/src/graphics/pipeline/texture/conversion.cpp")
     add_library(broken_bond_gfx STATIC
@@ -120,6 +121,7 @@ if(EXISTS "${BROKEN_BOND_VULKAN_SDK}/Lib/vulkan-1.lib" AND
 
     add_executable(host_gfx tools/host_gfx.cpp src/host/device_repack.cpp)
     target_link_libraries(host_gfx PRIVATE broken_bond_gfx)
+    target_link_libraries(broken_bond PRIVATE broken_bond_gfx)
 endif()
 
 if(TARGET broken_bond_gfx AND TARGET shader_db)

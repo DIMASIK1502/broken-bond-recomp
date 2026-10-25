@@ -22,10 +22,51 @@ struct Device::Vulkan {
   VkQueue queue = VK_NULL_HANDLE;
   uint32_t family = 0;
   VkCommandPool pool = VK_NULL_HANDLE;
+  VkImage frame_color = VK_NULL_HANDLE;
+  VkDeviceMemory frame_color_memory = VK_NULL_HANDLE;
+  VkImageView frame_color_view = VK_NULL_HANDLE;
+  VkImage frame_depth = VK_NULL_HANDLE;
+  VkDeviceMemory frame_depth_memory = VK_NULL_HANDLE;
+  VkImageView frame_depth_view = VK_NULL_HANDLE;
+  uint32_t frame_width = 0;
+  uint32_t frame_height = 0;
+
+  void ReleaseFrameImages() {
+    if (device == VK_NULL_HANDLE) {
+      return;
+    }
+    if (frame_color_view != VK_NULL_HANDLE) {
+      vkDestroyImageView(device, frame_color_view, nullptr);
+    }
+    if (frame_color != VK_NULL_HANDLE) {
+      vkDestroyImage(device, frame_color, nullptr);
+    }
+    if (frame_color_memory != VK_NULL_HANDLE) {
+      vkFreeMemory(device, frame_color_memory, nullptr);
+    }
+    if (frame_depth_view != VK_NULL_HANDLE) {
+      vkDestroyImageView(device, frame_depth_view, nullptr);
+    }
+    if (frame_depth != VK_NULL_HANDLE) {
+      vkDestroyImage(device, frame_depth, nullptr);
+    }
+    if (frame_depth_memory != VK_NULL_HANDLE) {
+      vkFreeMemory(device, frame_depth_memory, nullptr);
+    }
+    frame_color = VK_NULL_HANDLE;
+    frame_color_memory = VK_NULL_HANDLE;
+    frame_color_view = VK_NULL_HANDLE;
+    frame_depth = VK_NULL_HANDLE;
+    frame_depth_memory = VK_NULL_HANDLE;
+    frame_depth_view = VK_NULL_HANDLE;
+    frame_width = 0;
+    frame_height = 0;
+  }
 
   ~Vulkan() {
     if (device != VK_NULL_HANDLE) {
       vkDeviceWaitIdle(device);
+      ReleaseFrameImages();
     }
     if (pool != VK_NULL_HANDLE) {
       vkDestroyCommandPool(device, pool, nullptr);
@@ -1338,6 +1379,10 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
   Buffer texture_upload{};
   Buffer readback{};
   VkCommandBuffer command = VK_NULL_HANDLE;
+  const bool retain_frame = fixed_state != nullptr && fixed_state->retain_frame;
+  const bool reuse_frame = retain_frame && vulkan_->frame_color != VK_NULL_HANDLE &&
+                           vulkan_->frame_width == width && vulkan_->frame_height == height;
+  bool hold_targets = reuse_frame;
   constexpr uint32_t kTextureSize = 32;
   const bool custom_texture = texture_rgba != nullptr;
   const uint32_t tex_w = custom_texture ? texture_width : kTextureSize;
@@ -1359,14 +1404,16 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
       vkDestroyImageView(device, texture_view, nullptr);
     }
     DestroyImage(device, texture);
-    if (target_view != VK_NULL_HANDLE) {
-      vkDestroyImageView(device, target_view, nullptr);
+    if (!hold_targets) {
+      if (target_view != VK_NULL_HANDLE) {
+        vkDestroyImageView(device, target_view, nullptr);
+      }
+      if (depth_view != VK_NULL_HANDLE) {
+        vkDestroyImageView(device, depth_view, nullptr);
+      }
+      DestroyImage(device, depth);
+      DestroyImage(device, target);
     }
-    if (depth_view != VK_NULL_HANDLE) {
-      vkDestroyImageView(device, depth_view, nullptr);
-    }
-    DestroyImage(device, depth);
-    DestroyImage(device, target);
     for (Buffer& constant : constants) {
       DestroyBuffer(device, constant);
     }
@@ -1933,6 +1980,20 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
                            nullptr);
   }
 
+  if (reuse_frame) {
+    target.image = vulkan_->frame_color;
+    target.memory = vulkan_->frame_color_memory;
+    target_view = vulkan_->frame_color_view;
+    depth.image = vulkan_->frame_depth;
+    depth.memory = vulkan_->frame_depth_memory;
+    depth_view = vulkan_->frame_depth_view;
+    if (decoded.depth && depth.image == VK_NULL_HANDLE) {
+      reason = "retained frame has no depth image";
+      cleanup();
+      return false;
+    }
+  }
+  if (!reuse_frame) {
   VkImageCreateInfo image{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
   image.imageType = VK_IMAGE_TYPE_2D;
   image.format = VK_FORMAT_R8G8B8A8_UNORM;
@@ -2020,6 +2081,7 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
       cleanup();
       return false;
     }
+  }
   }
   const VkDeviceSize bytes = VkDeviceSize(width) * height * 4;
   if (!MakeBuffer(vulkan_->physical, device, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, kHost, readback,
@@ -2161,7 +2223,8 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
   }
   VkImageMemoryBarrier target_barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
   target_barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-  target_barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  target_barrier.oldLayout =
+      reuse_frame ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED;
   target_barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
   target_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   target_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -2169,7 +2232,11 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
   target_barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
   target_barrier.subresourceRange.levelCount = 1;
   target_barrier.subresourceRange.layerCount = 1;
-  vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+  if (reuse_frame) {
+    target_barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+  }
+  vkCmdPipelineBarrier(command,
+                       reuse_frame ? VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1,
                        &target_barrier);
   if (decoded.depth) {
@@ -2180,18 +2247,24 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
     depth_barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
     depth_barrier.subresourceRange.levelCount = 1;
     depth_barrier.subresourceRange.layerCount = 1;
-    depth_barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    depth_barrier.oldLayout = reuse_frame ? VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL
+                                          : VK_IMAGE_LAYOUT_UNDEFINED;
     depth_barrier.newLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+    if (reuse_frame) {
+      depth_barrier.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    }
     depth_barrier.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
                                   VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-    vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+    vkCmdPipelineBarrier(command,
+                         reuse_frame ? VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT
+                                     : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                          VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT, 0, 0, nullptr, 0, nullptr, 1,
                          &depth_barrier);
   }
   VkRenderingAttachmentInfo color{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
   color.imageView = target_view;
   color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-  color.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+  color.loadOp = reuse_frame ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
   color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
   color.clearValue.color.float32[0] = fixed_state == nullptr ? 1.f : fixed_state->clear_red;
   color.clearValue.color.float32[1] = fixed_state == nullptr ? 0.f : fixed_state->clear_green;
@@ -2200,8 +2273,9 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
   VkRenderingAttachmentInfo depth_attachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
   depth_attachment.imageView = depth_view;
   depth_attachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-  depth_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-  depth_attachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+  depth_attachment.loadOp = reuse_frame ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
+  depth_attachment.storeOp =
+      retain_frame ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
   depth_attachment.clearValue.depthStencil.depth = DepthClear(decoded.depth_op);
   VkRenderingInfo render{VK_STRUCTURE_TYPE_RENDERING_INFO};
   render.renderArea.extent = {width, height};
@@ -2257,6 +2331,21 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
   out.resize(size_t(bytes));
   std::memcpy(out.data(), read, size_t(bytes));
   vkUnmapMemory(device, readback.memory);
+  if (retain_frame) {
+    vulkan_->frame_color = target.image;
+    vulkan_->frame_color_memory = target.memory;
+    vulkan_->frame_color_view = target_view;
+    vulkan_->frame_depth = depth.image;
+    vulkan_->frame_depth_memory = depth.memory;
+    vulkan_->frame_depth_view = depth_view;
+    vulkan_->frame_width = width;
+    vulkan_->frame_height = height;
+    target = {};
+    depth = {};
+    target_view = VK_NULL_HANDLE;
+    depth_view = VK_NULL_HANDLE;
+    hold_targets = true;
+  }
   cleanup();
   return true;
 }

@@ -2177,7 +2177,8 @@ uint32_t LoadBe(const std::vector<uint8_t>& image, uint32_t at) {
          (uint32_t(image[at + 2]) << 8) | uint32_t(image[at + 3]);
 }
 
-int DrawMesh(const char* path) {
+int DrawMesh(const char* path, broken_bond::gfx::Device* shared = nullptr,
+             bool accumulate = false) {
   std::ifstream in(path, std::ios::binary);
   if (!in) {
     Fail(std::string("cannot open ") + path);
@@ -2402,8 +2403,9 @@ int DrawMesh(const char* path) {
           texture_tiled != 0, image.data() + texture_offset, texture_bytes, rgba, reason)) {
     Fail(reason.empty() ? "mesh texture was not decoded" : reason);
   }
-  broken_bond::gfx::Device device;
-  if (!device.Open(reason)) {
+  broken_bond::gfx::Device owned;
+  broken_bond::gfx::Device& device = shared != nullptr ? *shared : owned;
+  if (shared == nullptr && !device.Open(reason)) {
     Fail(reason);
   }
   std::cout << "mesh verts " << (stream_bytes.size() / (draw.stream_stride_dwords * 4u))
@@ -2534,16 +2536,50 @@ int DrawMesh(const char* path) {
   raster.clear_green = 0.f;
   raster.clear_blue = 1.f;
   raster.clear_alpha = 1.f;
+  raster.retain_frame = accumulate;
   std::cout << "mesh surface msaa " << ((draw.surface_info >> 16) & 3u) << " raster endian "
             << best_endian << "\n";
-  draw_mesh(best_endian, &raster, "raster");
-  broken_bond::gfx::Device::RasterState depth_off = raster;
-  depth_off.depth_control &= ~2u;
-  draw_mesh(best_endian, &depth_off, "depth off");
-  broken_bond::gfx::Device::RasterState cull_off = raster;
-  cull_off.mode_cntl &= ~3u;
-  draw_mesh(best_endian, &cull_off, "cull off");
+  draw_mesh(best_endian, &raster, accumulate ? "frame" : "raster");
+  if (!accumulate) {
+    broken_bond::gfx::Device::RasterState depth_off = raster;
+    depth_off.depth_control &= ~2u;
+    draw_mesh(best_endian, &depth_off, "depth off");
+    broken_bond::gfx::Device::RasterState cull_off = raster;
+    cull_off.mode_cntl &= ~3u;
+    draw_mesh(best_endian, &cull_off, "cull off");
+  }
   std::cout << "mesh_draw_ok 1\n";
+  return 0;
+}
+
+int DrawFrame(const char* directory) {
+  broken_bond::gfx::Device device;
+  std::string reason;
+  if (!device.Open(reason)) {
+    Fail(reason.empty() ? "frame device did not open" : reason);
+  }
+  std::string prefix = directory;
+  if (!prefix.empty() && prefix.back() != '/' && prefix.back() != '\\') {
+    prefix.push_back('\\');
+  }
+  int count = 0;
+  for (int i = 0; i < 8; ++i) {
+    const std::string path = prefix + "device-draw-" + std::to_string(i) + ".bin";
+    std::ifstream probe(path, std::ios::binary);
+    if (!probe) {
+      break;
+    }
+    probe.close();
+    std::cout << "---- " << i << " ----\n";
+    if (DrawMesh(path.c_str(), &device, true) != 0) {
+      return 1;
+    }
+    ++count;
+  }
+  if (count == 0) {
+    Fail("frame directory has no device-draw-0.bin");
+  }
+  std::cout << "frame_draws " << count << "\n";
   return 0;
 }
 #endif
@@ -2905,6 +2941,9 @@ int main(int argc, char** argv) {
 #if defined(SHADER_DB_TRANSLATE) && defined(BROKEN_BOND_HOST_GFX)
     if (argc == 4 && std::string(argv[2]) == "mesh") {
       return DrawMesh(argv[3]);
+    }
+    if (argc == 4 && std::string(argv[2]) == "frame") {
+      return DrawFrame(argv[3]);
     }
 #endif
     int tiling_failed = 0;

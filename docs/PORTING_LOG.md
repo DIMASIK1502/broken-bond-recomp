@@ -813,6 +813,13 @@ in 262 colors. Clearing the depth-enable bit still covers 321377 pixels, in
 clear and fails a strict greater compare. A texture narrower than 32 texels
 is uploaded with a fetch pitch of one 32-texel unit. The two 16-wide draws
 then run: fetch endian 2 covers 143 pixels on one and 2 pixels on the other.
+A retained frame keeps that color image and its depth. The first draw clears
+both, and each later draw loads them. Replaying the eight title snapshots
+into one 1280×512 target covers 182122 pixels after the first draw and
+442981 after the eighth, in 238 colors. The first covered pixel stays
+186, 137, 125, 0. `broken_bond` now links `broken_bond_gfx`. `renderer=host`
+opens this Vulkan device. The default remains `xenos`, and present stays
+on Xenos.
 
 `GetTiledAddressLowerBound3D` masks Z with `~kTextureTileDepth` (`~4`) rather
 than `~(kTextureTileDepth - 1)`. On 300 of 600 tile corners, Z = 4 and
