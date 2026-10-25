@@ -30,6 +30,7 @@ struct Device::Vulkan {
   VkImageView frame_depth_view = VK_NULL_HANDLE;
   uint32_t frame_width = 0;
   uint32_t frame_height = 0;
+  bool frame_restart = false;
 
   void ReleaseFrameImages() {
     if (device == VK_NULL_HANDLE) {
@@ -1392,6 +1393,10 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
   const bool retain_frame = fixed_state != nullptr && fixed_state->retain_frame;
   const bool reuse_frame = retain_frame && vulkan_->frame_color != VK_NULL_HANDLE &&
                            vulkan_->frame_width == width && vulkan_->frame_height == height;
+  const bool restart_frame = reuse_frame && vulkan_->frame_restart;
+  if (restart_frame) {
+    vulkan_->frame_restart = false;
+  }
   bool hold_targets = reuse_frame;
   constexpr uint32_t kTextureSize = 32;
   const bool custom_texture = texture_rgba != nullptr;
@@ -2277,7 +2282,8 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
   VkRenderingAttachmentInfo color{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
   color.imageView = target_view;
   color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-  color.loadOp = reuse_frame ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
+  color.loadOp = reuse_frame && !restart_frame ? VK_ATTACHMENT_LOAD_OP_LOAD
+                                              : VK_ATTACHMENT_LOAD_OP_CLEAR;
   color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
   color.clearValue.color.float32[0] = fixed_state == nullptr ? 1.f : fixed_state->clear_red;
   color.clearValue.color.float32[1] = fixed_state == nullptr ? 0.f : fixed_state->clear_green;
@@ -2286,7 +2292,8 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
   VkRenderingAttachmentInfo depth_attachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
   depth_attachment.imageView = depth_view;
   depth_attachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-  depth_attachment.loadOp = reuse_frame ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
+  depth_attachment.loadOp = reuse_frame && !restart_frame ? VK_ATTACHMENT_LOAD_OP_LOAD
+                                                         : VK_ATTACHMENT_LOAD_OP_CLEAR;
   depth_attachment.storeOp =
       retain_frame ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
   depth_attachment.clearValue.depthStencil.depth =
@@ -2368,6 +2375,12 @@ bool Device::DrawGuestFragment(const uint32_t* words, size_t word_count, uint32_
   }
   cleanup();
   return true;
+}
+
+void Device::RestartRetainedFrame() {
+  if (vulkan_ != nullptr) {
+    vulkan_->frame_restart = true;
+  }
 }
 
 bool Device::ReadRetainedFrame(std::vector<uint8_t>& out, std::string& reason) {

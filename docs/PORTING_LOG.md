@@ -844,6 +844,16 @@ seconds, from the cache after the first window, across 25 shaders. The
 retained image still covers 492257 pixels. Sixteen draws that reach the
 GPU cover the same pixels and the present falls to about 18 Hz. Pitch
 160 is still the only skip. The window is still the Xenos present.
+One slot per present is reserved for a shader that is not cached yet.
+The address of a shader already seen is not packed again. The retained
+color and depth are cleared on the next draw after each present, so a
+later shader cannot leave its depth on the following frame. The cache
+fills to 96 shaders. After that the title stays at 30 Hz: about 900
+draws in five seconds, all from the cache. One frame of those draws
+covers about 1900 pixels in 165 colors. The earlier 492257-pixel image
+was carried over from before the clear. Skips now also name a missing
+semantic marker, a missing shader, and surface pitches 320 and 640.
+The window is still the Xenos present.
 
 `GetTiledAddressLowerBound3D` masks Z with `~kTextureTileDepth` (`~4`) rather
 than `~(kTextureTileDepth - 1)`. On 300 of 600 tile corners, Z = 4 and

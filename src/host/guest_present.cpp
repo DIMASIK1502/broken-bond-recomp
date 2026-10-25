@@ -136,6 +136,14 @@ struct LiveGuestBytes : broken_bond::host::GuestBytes {
 std::atomic<bool> g_draw_dumped{false};
 std::unique_ptr<broken_bond::gfx::Device> g_host;
 int g_host_budget = 6;
+int g_host_learn = 1;
+std::unordered_set<uint64_t> g_host_seen;
+
+bool ReadBeU32(const LiveGuestBytes& live, uint32_t address, uint32_t& out);
+
+uint64_t ShaderAddressKey(uint32_t vertex, uint32_t pixel, uint32_t declaration) {
+  return (uint64_t(vertex) << 32) ^ uint64_t(pixel) ^ (uint64_t(declaration) << 1);
+}
 
 struct HostCounters {
   int submitted = 0;
@@ -143,6 +151,7 @@ struct HostCounters {
   int skipped = 0;
   int deferred = 0;
   int capped = 0;
+  int learned = 0;
   int unique = 0;
   std::chrono::steady_clock::time_point window = std::chrono::steady_clock::now();
 };
@@ -186,27 +195,42 @@ void HostLog() {
     colors = uint32_t(seen.size());
   }
   REXLOG_INFO(
-      "host frame 5s: submitted={} cached={} skipped={} deferred={} capped={} unique={} covered={} colors={}",
+      "host frame 5s: submitted={} cached={} skipped={} deferred={} capped={} learned={} unique={} covered={} colors={}",
       g_host_counts.submitted, g_host_counts.cached, g_host_counts.skipped, g_host_counts.deferred,
-      g_host_counts.capped, g_host_counts.unique, covered, colors);
+      g_host_counts.capped, g_host_counts.learned, g_host_counts.unique, covered, colors);
   g_host_counts.submitted = 0;
   g_host_counts.cached = 0;
   g_host_counts.skipped = 0;
   g_host_counts.deferred = 0;
   g_host_counts.capped = 0;
+  g_host_counts.learned = 0;
 }
 
 void SubmitHostSpan(uint32_t device, const broken_bond::host::DrawSpan& span, uint8_t* base) {
   if (!g_host) {
     return;
   }
-  if (g_host_budget <= 0) {
+  const bool room = g_host_budget > 0;
+  const bool learn = g_host_learn > 0 && g_host_counts.unique < 96;
+  if (!room && !learn) {
     ++g_host_counts.deferred;
     HostLog();
     return;
   }
   LiveGuestBytes live;
   live.base = base;
+  uint32_t vertex_shader = 0;
+  uint32_t pixel_shader = 0;
+  uint32_t declaration = 0;
+  const bool have_address = ReadBeU32(live, device + 12696u, vertex_shader) &&
+                            ReadBeU32(live, device + 12692u, pixel_shader) &&
+                            ReadBeU32(live, device + 11820u, declaration);
+  const uint64_t address_key = ShaderAddressKey(vertex_shader, pixel_shader, declaration);
+  if (!room && have_address && g_host_seen.find(address_key) != g_host_seen.end()) {
+    ++g_host_counts.deferred;
+    HostLog();
+    return;
+  }
   std::vector<uint8_t> identity;
   uint32_t identity_device = 0;
   std::string reason;
@@ -230,6 +254,15 @@ void SubmitHostSpan(uint32_t device, const broken_bond::host::DrawSpan& span, ui
     HostLog();
     return;
   }
+  if (shader_cached && have_address) {
+    g_host_seen.insert(address_key);
+  }
+  if (!room && shader_cached) {
+    ++g_host_counts.deferred;
+    HostLog();
+    return;
+  }
+  const bool learning = !room && !shader_cached;
   std::vector<uint8_t> image;
   uint32_t image_device = 0;
   if (!broken_bond::host::RepackDeviceDraw(live, device, image, image_device, reason, span)) {
@@ -250,7 +283,15 @@ void SubmitHostSpan(uint32_t device, const broken_bond::host::DrawSpan& span, ui
     HostLog();
     return;
   }
-  --g_host_budget;
+  if (learning) {
+    --g_host_learn;
+    ++g_host_counts.learned;
+  } else {
+    --g_host_budget;
+  }
+  if (have_address) {
+    g_host_seen.insert(address_key);
+  }
   ++g_host_counts.submitted;
   if (info.from_cache) {
     ++g_host_counts.cached;
@@ -260,7 +301,6 @@ void SubmitHostSpan(uint32_t device, const broken_bond::host::DrawSpan& span, ui
   HostLog();
 }
 
-bool ReadBeU32(const LiveGuestBytes& live, uint32_t address, uint32_t& out);
 bool TrianglePrimitive(uint32_t prim);
 
 void MaybeHostAuto(uint32_t device, uint32_t prim, uint32_t vertex_start, uint32_t vertex_count,
@@ -513,6 +553,8 @@ REX_HOOK_RAW(sub_821B1DD0) {
   NoteSwapCaller(static_cast<uint32_t>(ctx.lr));
   if (g_host) {
     g_host_budget = 6;
+    g_host_learn = 1;
+    g_host->RestartRetainedFrame();
   }
   __imp__sub_821B1DD0(ctx, base);
 }

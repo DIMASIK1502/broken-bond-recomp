@@ -147,6 +147,9 @@ class Device {
   // Copy the retained color image. It stays in TRANSFER_SRC for the next draw.
   bool ReadRetainedFrame(std::vector<uint8_t>& out, std::string& reason);
 
+  // The next retained draw clears color and depth instead of loading them.
+  void RestartRetainedFrame();
+
  private:
   struct Vulkan;
   std::unique_ptr<Vulkan> vulkan_;
