@@ -1846,7 +1846,7 @@ void TranslateShader(rex::graphics::SpirvShaderTranslator& translator, uint32_t 
                 patched.AnalyzeUcode(patched_disassembly);
                 rex::graphics::SpirvShaderTranslator::Modification modification(
                     translator.GetDefaultVertexShaderModification(0));
-                modification.vertex.interpolator_mask = 1;
+                modification.vertex.interpolator_mask = shader.writes_interpolators() & 0xFFFFu;
                 rex::graphics::Shader::Translation& packed_translation =
                     *patched.GetOrCreateTranslation(modification.value);
                 if (translator.TranslateAnalyzedShader(packed_translation)) {
@@ -1867,6 +1867,8 @@ void TranslateShader(rex::graphics::SpirvShaderTranslator& translator, uint32_t 
                       stream.attributes[i].components = 4;
                       stream.attributes[i].short4 = packed_elements[i].format == 26;
                       stream.attributes[i].is_float = packed_elements[i].format == 38;
+                      stream.attributes[i].usage = packed_elements[i].usage;
+                      stream.attributes[i].usage_index = packed_elements[i].usage_index;
                     }
                     draw.streams.push_back(stream);
                     draw.interpolators = shader.writes_interpolators();
@@ -2624,6 +2626,7 @@ int main(int argc, char** argv) {
     uint32_t guest_draws = 0;
     uint32_t pack_seen = 0;
     uint32_t pack_bad = 0;
+    uint32_t slot_bad = 0;
     constexpr uint32_t kGuestSize = 8;
     std::vector<uint32_t> link_fragment;
     const auto draw_batch = [&](const std::vector<TranslateStats::GuestDraw>& batch,
@@ -2742,6 +2745,153 @@ int main(int argc, char** argv) {
           if (!fill_ok) {
             std::cout << " fill_failed " << guest_reason;
           }
+          const uint32_t mask = fragment.interpolators & 0xFFFFu;
+          struct Slot {
+            uint32_t interpolator;
+            uint32_t location;
+          };
+          std::vector<Slot> slots;
+          uint32_t dense = 0;
+          for (uint32_t bit = 0; bit < 16; ++bit) {
+            if ((mask & (1u << bit)) == 0) {
+              continue;
+            }
+            slots.push_back(Slot{bit, dense});
+            ++dense;
+          }
+          auto count_diff = [](const std::vector<uint8_t>& left, const std::vector<uint8_t>& right) {
+            uint32_t diff = 0;
+            for (size_t i = 0; i + 3 < left.size() && i + 3 < right.size(); i += 4) {
+              if (left[i] != right[i] || left[i + 1] != right[i + 1] || left[i + 2] != right[i + 2] ||
+                  left[i + 3] != right[i + 3]) {
+                ++diff;
+              }
+            }
+            return diff;
+          };
+          if (slots.empty()) {
+            ++slot_bad;
+            std::cout << " slots empty";
+          } else {
+            std::vector<std::vector<uint8_t>> baseline(slots.size());
+            bool slots_ok = true;
+            for (size_t s = 0; s < slots.size(); ++s) {
+              std::vector<uint32_t> pass;
+              if (!broken_bond::gfx::InterpolatorPassFragment(slots[s].location, pass) ||
+                  !device.DrawGuestFragment(
+                      fragment.words.data(), fragment.words.size(), kGuestSize, kGuestSize, 0, 0, 0,
+                      false, 0.f, true, fragment.streams.data(), uint32_t(fragment.streams.size()),
+                      baseline[s], guest_reason, pass.data(), pass.size())) {
+                slots_ok = false;
+                break;
+              }
+            }
+            if (!slots_ok || !fill_ok) {
+              ++slot_bad;
+              if (!slots_ok) {
+                std::cout << " slots_failed " << guest_reason;
+              }
+            } else {
+              std::cout << " slots";
+              std::vector<uint32_t> all_diff(slots.size(), 0);
+              for (size_t s = 0; s < slots.size(); ++s) {
+                std::vector<uint32_t> pass;
+                std::vector<uint8_t> filled_slot;
+                broken_bond::gfx::InterpolatorPassFragment(slots[s].location, pass);
+                const bool ok = device.DrawGuestFragment(
+                    fragment.words.data(), fragment.words.size(), kGuestSize, kGuestSize, 0, 0, 0,
+                    false, 0.f, true, filled.data(), uint32_t(filled.size()), filled_slot,
+                    guest_reason, pass.data(), pass.size());
+                std::cout << " i" << slots[s].interpolator;
+                if (!ok || filled_slot.size() < 4 || baseline[s].size() < 4) {
+                  ++slot_bad;
+                  std::cout << " fail";
+                  continue;
+                }
+                all_diff[s] = count_diff(baseline[s], filled_slot);
+                std::cout << " " << all_diff[s] << " " << int(baseline[s][0]) << ","
+                          << int(baseline[s][1]) << "," << int(baseline[s][2]) << ","
+                          << int(baseline[s][3]) << ">" << int(filled_slot[0]) << ","
+                          << int(filled_slot[1]) << "," << int(filled_slot[2]) << ","
+                          << int(filled_slot[3]);
+              }
+              std::vector<uint32_t> float_attributes;
+              std::vector<std::vector<uint32_t>> attribute_diff;
+              for (uint32_t a = 0; a < filled[0].attribute_count && a < 8; ++a) {
+                if (!filled[0].attributes[a].is_float) {
+                  continue;
+                }
+                float_attributes.push_back(a);
+                attribute_diff.emplace_back(slots.size(), 0);
+                std::vector<broken_bond::gfx::VertexStream> one = fragment.streams;
+                one[0].attributes[a].constant_fill = true;
+                std::cout << " " << broken_bond::gfx::VertexUsageName(one[0].attributes[a].usage)
+                          << one[0].attributes[a].usage_index;
+                for (size_t s = 0; s < slots.size(); ++s) {
+                  std::vector<uint32_t> pass;
+                  std::vector<uint8_t> one_pixels;
+                  broken_bond::gfx::InterpolatorPassFragment(slots[s].location, pass);
+                  const bool ok = device.DrawGuestFragment(
+                      fragment.words.data(), fragment.words.size(), kGuestSize, kGuestSize, 0, 0, 0,
+                      false, 0.f, true, one.data(), uint32_t(one.size()), one_pixels, guest_reason,
+                      pass.data(), pass.size());
+                  std::cout << " i" << slots[s].interpolator;
+                  if (!ok) {
+                    ++slot_bad;
+                    std::cout << " fail";
+                    continue;
+                  }
+                  attribute_diff.back()[s] = count_diff(baseline[s], one_pixels);
+                  std::cout << " " << attribute_diff.back()[s];
+                }
+              }
+              for (size_t s = 0; s < slots.size(); ++s) {
+                if (all_diff[s] == 0) {
+                  continue;
+                }
+                bool alone = false;
+                for (const std::vector<uint32_t>& diff : attribute_diff) {
+                  if (diff[s] != 0) {
+                    alone = true;
+                  }
+                }
+                if (alone || float_attributes.size() < 2) {
+                  continue;
+                }
+                std::cout << " pair i" << slots[s].interpolator;
+                for (size_t left = 0; left < float_attributes.size(); ++left) {
+                  for (size_t right = left + 1; right < float_attributes.size(); ++right) {
+                    std::vector<broken_bond::gfx::VertexStream> two = fragment.streams;
+                    two[0].attributes[float_attributes[left]].constant_fill = true;
+                    two[0].attributes[float_attributes[right]].constant_fill = true;
+                    std::vector<uint32_t> pass;
+                    std::vector<uint8_t> pair_pixels;
+                    broken_bond::gfx::InterpolatorPassFragment(slots[s].location, pass);
+                    const bool ok = device.DrawGuestFragment(
+                        fragment.words.data(), fragment.words.size(), kGuestSize, kGuestSize, 0, 0,
+                        0, false, 0.f, true, two.data(), uint32_t(two.size()), pair_pixels,
+                        guest_reason, pass.data(), pass.size());
+                    const broken_bond::gfx::VertexAttribute& first =
+                        two[0].attributes[float_attributes[left]];
+                    const broken_bond::gfx::VertexAttribute& second_attribute =
+                        two[0].attributes[float_attributes[right]];
+                    std::cout << " " << broken_bond::gfx::VertexUsageName(first.usage)
+                              << first.usage_index << "+"
+                              << broken_bond::gfx::VertexUsageName(second_attribute.usage)
+                              << second_attribute.usage_index;
+                    if (!ok || pair_pixels.size() < 4) {
+                      ++slot_bad;
+                      std::cout << " fail";
+                      continue;
+                    }
+                    std::cout << " " << count_diff(baseline[s], pair_pixels) << " "
+                              << int(pair_pixels[0]) << "," << int(pair_pixels[1]) << ","
+                              << int(pair_pixels[2]) << "," << int(pair_pixels[3]);
+                  }
+                }
+              }
+            }
+          }
         }
         if (drawn.size() >= 4) {
           std::cout << " first " << int(drawn[0]) << " " << int(drawn[1]) << " " << int(drawn[2])
@@ -2805,7 +2955,7 @@ int main(int argc, char** argv) {
     draw_batch(translated.guest_vertices, "guest_vert");
     draw_batch(translated.guest_declared, "guest_decl");
     draw_batch(translated.guest_packed, "guest_pack");
-    if (pack_seen == 0 || pack_bad != 0) {
+    if (pack_seen == 0 || pack_bad != 0 || slot_bad != 0) {
       guest_draw_failed = 1;
     }
     draw_batch(translated.guest_short, "guest_short");

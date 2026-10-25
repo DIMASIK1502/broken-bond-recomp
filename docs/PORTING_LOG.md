@@ -582,11 +582,22 @@ is a float4. Strides were 6, 10, and 14 for 2, 3, and 4 attributes. All eight
 covered 64 pixels when the triangle was in the position slot, and the first
 pixel matched the float4 declaration probe, including the white shader. None
 covered when the triangle sat only in the following float4. Filling those
-float4 semantics with (1, 0.5, 0.25, 1) changed all 64 pixels for six of the
-eight. The two that stayed put write interpolator masks 7 and 63; this probe
-still exports only interpolator 0. The eight masks are 1, 3, 1, 7, 1, 3, 3,
-and 63. The sizes are still the HLSL layout, not the declaration the game
-binds, and EDRAM is still absent.
+float4 semantics with (1, 0.5, 0.25, 1) changed interpolator 0 on six of the
+eight. The vertex stage now exports the whole interpolator mask, and a pass
+fragment reads one location at a time. Each of these masks is a low contiguous
+run, so the location number is the interpolator index. texcoord0 alone moves
+one interpolator in six shaders, index 0 in five of them and index 3 in the
+mask-63 shader, taking the first pixel from 0,0,0,0 to 255,127,0,0. color0
+alone moves interpolator 1 of the first mask-3 shader and interpolator 0 of
+the mask-1 color shader, both to 64,127,255,255. On the mask-7 shader
+interpolator 0 stays black, color0 moves interpolator 2, color1 moves
+interpolators 1 and 2, and texcoord0 moves none. On the other four-attribute
+shader texcoord0 moves interpolator 0, and interpolator 1 moves only when
+color0 and color1 are filled together, to 16,64,255,255. The mask-63 shader
+leaves interpolators 0, 1, 2, and 4 unchanged (white, black, black, and
+255,0,0,0), and normal0 moves interpolator 5 to 64,0,0,0. One mask-3 shader
+keeps a constant 0,255,0,0 in interpolator 1. The sizes are still the HLSL
+layout, not the declaration the game binds, and EDRAM is still absent.
 
 `GetTiledAddressLowerBound3D` masks Z with `~kTextureTileDepth` (`~4`) rather
 than `~(kTextureTileDepth - 1)`. On 300 of 600 tile corners, Z = 4 and

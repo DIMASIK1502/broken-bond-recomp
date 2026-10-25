@@ -23,7 +23,12 @@ struct VertexAttribute {
   bool short4 = false;
   // When this float attribute is not the triangle, write (1, 0.5, 0.25, 1).
   bool constant_fill = false;
+  uint32_t usage = 0;
+  uint32_t usage_index = 0;
 };
+
+// Fragment that copies one vertex-shader interpolator location to the color target.
+bool InterpolatorPassFragment(uint32_t location, std::vector<uint32_t>& words);
 
 struct VertexStream {
   uint32_t fetch_constant = 0;

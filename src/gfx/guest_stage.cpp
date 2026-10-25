@@ -1,4 +1,5 @@
 #include <cstdint>
+#include <vector>
 
 namespace broken_bond::gfx {
 
@@ -64,5 +65,17 @@ extern const uint32_t kPassFragment[] = {
 };
 
 extern const size_t kPassFragmentWords = sizeof(kPassFragment) / sizeof(kPassFragment[0]);
+
+bool InterpolatorPassFragment(uint32_t location, std::vector<uint32_t>& words) {
+  words.assign(kPassFragment, kPassFragment + kPassFragmentWords);
+  for (size_t i = 0; i + 3 < words.size(); ++i) {
+    // OpDecorate of the input id 11, DecorationLocation.
+    if (words[i] == 0x00040047 && words[i + 1] == 0x0000000bu && words[i + 2] == 0x0000001eu) {
+      words[i + 3] = location;
+      return true;
+    }
+  }
+  return false;
+}
 
 }  // namespace broken_bond::gfx
