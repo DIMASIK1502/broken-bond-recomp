@@ -32,6 +32,18 @@ Write-Host "Initializing SDK submodules (this can take a while) ..."
 git -C $sdkDir submodule update --init --recursive --depth 1
 if ($LASTEXITCODE -ne 0) { throw "submodule init failed" }
 
+# Without symlink support git writes libmspack's links as one-line text files,
+# and clang then fails on "../../libmspack/mspack/lzxd.c". Copy the targets in.
+$mspackDir = Join-Path $sdkDir "thirdparty\libmspack"
+$links = git -C $mspackDir ls-files -s | Where-Object { $_ -match '^120000 ' } |
+    ForEach-Object { ($_ -split "`t", 2)[1] }
+foreach ($link in $links) {
+    $linkPath = Join-Path $mspackDir $link
+    if ((Get-Item $linkPath).Length -gt 256) { continue }
+    $target = Join-Path (Split-Path $linkPath) ((Get-Content $linkPath -Raw).Trim())
+    if (Test-Path $target -PathType Leaf) { Copy-Item $target $linkPath -Force }
+}
+
 $applySdkPatches = Join-Path $root "patches\apply_sdk_patches.ps1"
 if (Test-Path $applySdkPatches) {
     Write-Host "Applying local SDK patches ..."

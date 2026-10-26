@@ -28,6 +28,13 @@ endif()
 
 rexglue_setup_target(broken_bond GPU_PLUGINS xenos)
 
+# An SDK built from source links imgui privately into rexruntime, but the
+# rex/ui headers the app includes still name imgui.h.
+if(TARGET imgui)
+    target_include_directories(broken_bond PRIVATE
+        $<TARGET_PROPERTY:imgui,INTERFACE_INCLUDE_DIRECTORIES>)
+endif()
+
 # Reads game/xeshader.sdb. Not part of the game link and writes no cache.
 # The installed GPU plugin is D3D12-only, so SPIR-V is compiled from the SDK
 # checkout when that tree sits next to this repo. The game plugin is not rebuilt.
@@ -52,8 +59,11 @@ if(EXISTS "${BROKEN_BOND_REXGLUE_SOURCE}/src/graphics/pipeline/shader/spirv_tran
     set(SKIP_GLSLANG_INSTALL ON CACHE BOOL "" FORCE)
     set(ENABLE_RTTI ON CACHE BOOL "" FORCE)
     set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "" FORCE)
-    add_subdirectory("${BROKEN_BOND_REXGLUE_SOURCE}/thirdparty/glslang"
-        "${CMAKE_CURRENT_BINARY_DIR}/glslang" EXCLUDE_FROM_ALL)
+    # An SDK built from source with Vulkan already adds glslang.
+    if(NOT TARGET glslang)
+        add_subdirectory("${BROKEN_BOND_REXGLUE_SOURCE}/thirdparty/glslang"
+            "${CMAKE_CURRENT_BINARY_DIR}/glslang" EXCLUDE_FROM_ALL)
+    endif()
 
     set(BROKEN_BOND_TRANSLATOR_SOURCES
         "${BROKEN_BOND_REXGLUE_SOURCE}/src/graphics/format/ucode.cpp"
@@ -129,6 +139,10 @@ if(EXISTS "${BROKEN_BOND_VULKAN_SDK}/Lib/vulkan-1.lib" AND
         OSDependent
         OGLCompiler
         "${BROKEN_BOND_VULKAN_SDK}/Lib/vulkan-1.lib")
+    # rex/hash.h includes xxhash.h; the SDK source tree does not export it.
+    if(TARGET xxHash::xxhash)
+        target_link_libraries(broken_bond_gfx PUBLIC xxHash::xxhash)
+    endif()
     target_compile_options(broken_bond_gfx PRIVATE -Wno-unused-variable -Wno-unused-function)
 
     add_executable(host_gfx tools/host_gfx.cpp src/host/device_repack.cpp)

@@ -139,6 +139,22 @@ port has been tested with.
   --log_level=info
 ```
 
+To run on Vulkan instead, configure with `-DREXGLUE_USE_VULKAN=ON` against the
+SDK source tree (`-DREXSDK_DIR=thirdparty\rexglue-sdk`) and pick the backend:
+
+```powershell
+.\out\build\win-amd64-vulkan\broken_bond.exe `
+  --game_data_root=game `
+  --gpu_plugin=xenos `
+  --gpu_backend=vulkan `
+  --render_target_path_vulkan=fsi `
+  --mnk_mode
+```
+
+`--gpu_backend` is `any` (D3D12 first), `d3d12` or `vulkan`.
+`--render_target_path_vulkan` is `fsi` (fragment shader interlock, the Vulkan
+counterpart of ROV) or `fbo` (host framebuffers, for GPUs without interlock).
+
 Useful extra flags:
 
 | Flag | Why |
