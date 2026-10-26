@@ -59,4 +59,22 @@ bool LoadGuestTextureRgba8(uint32_t format, uint32_t width, uint32_t height, uin
                            uint32_t endian, bool tiled, const uint8_t* guest, size_t guest_bytes,
                            std::vector<uint8_t>& linear, std::string& reason);
 
+// Any format the SDK's FormatInfo describes, as tightly packed rows of
+// blocks: untiled when the fetch says so, each dword swapped by the fetch
+// endian, nothing decoded. block_width / block_height / block_bytes describe
+// the output. Fails for formats without a FormatInfo.
+struct LinearTexture {
+  std::vector<uint8_t> blocks;
+  uint32_t block_width = 1;
+  uint32_t block_height = 1;
+  uint32_t block_bytes = 4;
+  uint32_t width_blocks = 0;
+  uint32_t height_blocks = 0;
+};
+uint32_t GuestTextureBytesAny(uint32_t format, uint32_t width, uint32_t height, uint32_t pitch,
+                              bool tiled);
+bool LoadGuestTextureLinear(uint32_t format, uint32_t width, uint32_t height, uint32_t pitch,
+                            uint32_t endian, bool tiled, const uint8_t* guest, size_t guest_bytes,
+                            LinearTexture& out, std::string& reason);
+
 }  // namespace broken_bond::gfx

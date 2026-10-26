@@ -33,8 +33,20 @@ class Renderer {
   // One guest draw, from the guest thread, before the original runs.
   void Draw(const GuestDraw& draw, const uint8_t* base);
 
-  // One guest present. Called from the guest thread that runs Swap.
-  void Present();
+  // D3DDevice_ClearF (821ACB10): flags (targets 0-3, 0x10 Z, 0x20 stencil),
+  // rect (D3DRECT* or 0), color (float4* or 0), z, stencil.
+  void Clear(uint32_t device, uint32_t flags, uint32_t rect, uint32_t color, float z, uint32_t stencil,
+             const uint8_t* base);
+
+  // D3DDevice_Resolve (821AD328): flags (low 3 bits the source, 0x100 and
+  // 0x200 clear the target and depth afterwards), source rect, destination
+  // texture object, destination point, clear color.
+  void Resolve(uint32_t device, uint32_t flags, uint32_t rect, uint32_t texture, uint32_t point,
+               uint32_t clear_color, float z, const uint8_t* base);
+
+  // One guest present of the frontbuffer texture object Swap was given.
+  // Called from the guest thread that runs Swap.
+  void Present(uint32_t frontbuffer, const uint8_t* base);
 
   // Counts since the last call, for the 5 s log.
   std::string TakeStats();

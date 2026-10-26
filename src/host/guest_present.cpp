@@ -131,6 +131,8 @@ extern "C" void __imp__sub_821B1DD0(PPCContext& __restrict ctx, uint8_t* base);
 extern "C" void __imp__sub_821AE158(PPCContext& __restrict ctx, uint8_t* base);
 extern "C" void __imp__sub_821AE5D0(PPCContext& __restrict ctx, uint8_t* base);
 extern "C" void __imp__sub_821AE9C0(PPCContext& __restrict ctx, uint8_t* base);
+extern "C" void __imp__sub_821ACB10(PPCContext& __restrict ctx, uint8_t* base);
+extern "C" void __imp__sub_821AD328(PPCContext& __restrict ctx, uint8_t* base);
 
 struct LiveGuestBytes : broken_bond::host::GuestBytes {
   uint8_t* base = nullptr;
@@ -585,7 +587,7 @@ REX_HOOK_RAW(sub_821B1DD0) {
   }
   broken_bond::host::ShadowSwap(base);
 #if defined(BROKEN_BOND_HAS_NATIVE_RENDERER)
-  if (g_native) g_native->Present();
+  if (g_native) g_native->Present(ctx.r4.u32, base);
 #endif
   const int census = broken_bond::host::CensusEnter(0x821B1DD0, ctx, base);
   __imp__sub_821B1DD0(ctx, base);
@@ -643,6 +645,30 @@ REX_HOOK_RAW(sub_821AE9C0) {
 #endif
   const int census = broken_bond::host::CensusEnter(0x821AE9C0, ctx, base);
   __imp__sub_821AE9C0(ctx, base);
+  broken_bond::host::CensusReturn(census, ctx);
+}
+
+// D3DDevice_ClearF and D3DDevice_Resolve (docs/D3D_MAP.md).
+REX_HOOK_RAW(sub_821ACB10) {
+#if defined(BROKEN_BOND_HAS_NATIVE_RENDERER)
+  if (g_native) {
+    g_native->Clear(ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, float(ctx.f1.f64), ctx.r7.u32, base);
+  }
+#endif
+  const int census = broken_bond::host::CensusEnter(0x821ACB10, ctx, base);
+  __imp__sub_821ACB10(ctx, base);
+  broken_bond::host::CensusReturn(census, ctx);
+}
+
+REX_HOOK_RAW(sub_821AD328) {
+#if defined(BROKEN_BOND_HAS_NATIVE_RENDERER)
+  if (g_native) {
+    g_native->Resolve(ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, ctx.r10.u32,
+                      float(ctx.f1.f64), base);
+  }
+#endif
+  const int census = broken_bond::host::CensusEnter(0x821AD328, ctx, base);
+  __imp__sub_821AD328(ctx, base);
   broken_bond::host::CensusReturn(census, ctx);
 }
 

@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -13,6 +15,7 @@
 #include <xxhash.h>
 
 #include <fmt/format.h>
+#include <rex/cvar.h>
 #include <plume_render_interface.h>
 #include <rex/graphics/xenos.h>
 #include <rex/system/xmemory.h>
@@ -27,6 +30,11 @@
 namespace plume {
 std::unique_ptr<RenderInterface> CreateVulkanInterface();
 }
+
+REXCVAR_DEFINE_INT32(native_dump_frame, 0, "Game",
+                     "With renderer=native, describe every draw of this present (from 1) in "
+                     "logs/native-frame-<n>.txt; 0 writes none")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace broken_bond::render {
 
@@ -73,9 +81,13 @@ float BeFloat(const uint8_t* base, uint32_t address) {
   return value;
 }
 
-// Fetch constants and D3D objects hold physical addresses; any of the
-// 0xA0000000+ views reaches them.
-uint32_t PhysicalView(uint32_t physical) { return 0xA0000000u | (physical & 0x1FFFFFFFu); }
+// Fetch constants hold physical addresses (below 0x20000000), which the
+// 0xA0000000 view reaches unshifted. Some D3D objects (index buffers) keep a
+// virtual address in the 0xE0000000 range instead; that range maps physical
+// memory 0x1000 further on, so it is read as the virtual address it is.
+uint32_t PhysicalView(uint32_t address) {
+  return address < 0x20000000u ? 0xA0000000u + address : address;
+}
 
 constexpr uint32_t kDeviceFetch = 1152;
 constexpr uint32_t kDeviceVsConstants = 1920;
@@ -190,62 +202,218 @@ plume::RenderBlendOperation BlendOp(uint32_t op) {
   }
 }
 
-// Host format of one declaration element. XenosRecomp reads NORMAL, TANGENT,
-// BINORMAL and BLENDINDICES as uint4 (the first three as raw float bits or
-// packed 11:11:10), everything else as float4.
-bool ElementFormat(uint32_t usage, uint32_t format_word, plume::RenderFormat& out,
-                   bool& packed_normal) {
-  using F = plume::RenderFormat;
-  const auto format = static_cast<xenos::VertexFormat>(format_word & 0x3F);
-  const bool is_signed = (format_word & 0x100) != 0;
-  const bool is_integer = (format_word & 0x200) != 0;
-  const bool raw = usage == uint32_t(DeclUsage::kNormal) || usage == uint32_t(DeclUsage::kTangent) ||
-                   usage == uint32_t(DeclUsage::kBinormal);
-  const bool uint_input = raw || usage == uint32_t(DeclUsage::kBlendIndices);
-  packed_normal = false;
+// How a guest element becomes host vertex data: copied as is, or decoded to
+// four 32-bit floats (written as floats, or as their bits for the uint4
+// inputs XenosRecomp reads through asfloat).
+enum class ElementConvert : uint8_t { kCopy, kFloat4, kFloat4Bits };
+
+struct ElementSource {
+  xenos::VertexFormat format;
+  bool is_signed;
+  bool is_integer;
+};
+
+uint32_t GuestElementSize(xenos::VertexFormat format) {
   switch (format) {
     case xenos::VertexFormat::k_8_8_8_8:
-      if (uint_input) out = F::R8G8B8A8_UINT;
-      else if (is_integer) return false;
-      else out = is_signed ? F::R8G8B8A8_SNORM : F::R8G8B8A8_UNORM;
-      return true;
+    case xenos::VertexFormat::k_2_10_10_10:
     case xenos::VertexFormat::k_10_11_11:
     case xenos::VertexFormat::k_11_11_10:
-      if (!raw) return false;
+    case xenos::VertexFormat::k_16_16:
+    case xenos::VertexFormat::k_16_16_FLOAT:
+    case xenos::VertexFormat::k_32_FLOAT:
+      return 4;
+    case xenos::VertexFormat::k_16_16_16_16:
+    case xenos::VertexFormat::k_16_16_16_16_FLOAT:
+    case xenos::VertexFormat::k_32_32_FLOAT:
+      return 8;
+    case xenos::VertexFormat::k_32_32_32_FLOAT:
+      return 12;
+    case xenos::VertexFormat::k_32_32_32_32_FLOAT:
+      return 16;
+    default:
+      return 0;
+  }
+}
+
+float HalfToFloat(uint16_t h) {
+  const uint32_t sign = uint32_t(h & 0x8000) << 16;
+  uint32_t exponent = (h >> 10) & 0x1F;
+  uint32_t mantissa = h & 0x3FF;
+  uint32_t bits;
+  if (exponent == 0) {
+    if (mantissa == 0) {
+      bits = sign;
+    } else {
+      exponent = 1;
+      while ((mantissa & 0x400) == 0) {
+        mantissa <<= 1;
+        --exponent;
+      }
+      mantissa &= 0x3FF;
+      bits = sign | ((exponent + 112) << 23) | (mantissa << 13);
+    }
+  } else if (exponent == 31) {
+    bits = sign | 0x7F800000 | (mantissa << 13);
+  } else {
+    bits = sign | ((exponent + 112) << 23) | (mantissa << 13);
+  }
+  float f;
+  std::memcpy(&f, &bits, 4);
+  return f;
+}
+
+// One component `bits` wide, as Xenos fetch would return it.
+float FixedComponent(uint32_t value, uint32_t bits, bool is_signed, bool is_integer) {
+  if (is_signed) {
+    const int32_t shift = 32 - int32_t(bits);
+    const int32_t v = int32_t(value << shift) >> shift;
+    if (is_integer) return float(v);
+    return std::max(float(v) / float((1u << (bits - 1)) - 1), -1.0f);
+  }
+  if (is_integer) return float(value);
+  return float(value) / float((1u << bits) - 1);
+}
+
+// Decodes one element (already in host byte order) to xyzw; absent
+// components are 0, absent w is 1.
+void DecodeElement(const ElementSource& source, const uint8_t* src, float out[4]) {
+  out[0] = out[1] = out[2] = 0.0f;
+  out[3] = 1.0f;
+  uint32_t word0;
+  std::memcpy(&word0, src, 4);
+  const bool sg = source.is_signed;
+  const bool in = source.is_integer;
+  switch (source.format) {
+    case xenos::VertexFormat::k_8_8_8_8:
+      for (uint32_t c = 0; c < 4; ++c) out[c] = FixedComponent((word0 >> (8 * c)) & 0xFF, 8, sg, in);
+      return;
+    case xenos::VertexFormat::k_2_10_10_10:
+      out[0] = FixedComponent(word0 & 0x3FF, 10, sg, in);
+      out[1] = FixedComponent((word0 >> 10) & 0x3FF, 10, sg, in);
+      out[2] = FixedComponent((word0 >> 20) & 0x3FF, 10, sg, in);
+      out[3] = FixedComponent(word0 >> 30, 2, sg, in);
+      return;
+    case xenos::VertexFormat::k_10_11_11:
+      out[0] = FixedComponent(word0 & 0x7FF, 11, sg, in);
+      out[1] = FixedComponent((word0 >> 11) & 0x7FF, 11, sg, in);
+      out[2] = FixedComponent(word0 >> 22, 10, sg, in);
+      return;
+    case xenos::VertexFormat::k_11_11_10:
+      out[0] = FixedComponent(word0 & 0x3FF, 10, sg, in);
+      out[1] = FixedComponent((word0 >> 10) & 0x7FF, 11, sg, in);
+      out[2] = FixedComponent(word0 >> 21, 11, sg, in);
+      return;
+    case xenos::VertexFormat::k_16_16:
+    case xenos::VertexFormat::k_16_16_16_16: {
+      const uint32_t n = source.format == xenos::VertexFormat::k_16_16 ? 2 : 4;
+      for (uint32_t c = 0; c < n; ++c) {
+        uint16_t v;
+        std::memcpy(&v, src + 2 * c, 2);
+        out[c] = FixedComponent(v, 16, sg, in);
+      }
+      return;
+    }
+    case xenos::VertexFormat::k_16_16_FLOAT:
+    case xenos::VertexFormat::k_16_16_16_16_FLOAT: {
+      const uint32_t n = source.format == xenos::VertexFormat::k_16_16_FLOAT ? 2 : 4;
+      for (uint32_t c = 0; c < n; ++c) {
+        uint16_t v;
+        std::memcpy(&v, src + 2 * c, 2);
+        out[c] = HalfToFloat(v);
+      }
+      return;
+    }
+    case xenos::VertexFormat::k_32_FLOAT:
+    case xenos::VertexFormat::k_32_32_FLOAT:
+    case xenos::VertexFormat::k_32_32_32_FLOAT:
+    case xenos::VertexFormat::k_32_32_32_32_FLOAT:
+      std::memcpy(out, src, GuestElementSize(source.format));
+      return;
+    default:
+      return;
+  }
+}
+
+// Host format of one declaration element. XenosRecomp reads NORMAL, TANGENT,
+// BINORMAL and BLENDINDICES as uint4 (the first three as raw float bits, or
+// as packed 11:11:10 when the vertex shader's spec constant says so),
+// everything else as float4. Formats Vulkan cannot fetch the way Xenos does
+// are decoded on the CPU while the stream is gathered.
+bool ElementFormat(uint32_t usage, uint32_t format_word, plume::RenderFormat& out, uint32_t& in_size,
+                   uint32_t& out_size, ElementConvert& convert, ElementSource& source,
+                   bool& packed_normal) {
+  using F = plume::RenderFormat;
+  source.format = static_cast<xenos::VertexFormat>(format_word & 0x3F);
+  source.is_signed = (format_word & 0x100) != 0;
+  source.is_integer = (format_word & 0x200) != 0;
+  in_size = GuestElementSize(source.format);
+  if (in_size == 0) return false;
+  const bool raw = usage == uint32_t(DeclUsage::kNormal) || usage == uint32_t(DeclUsage::kTangent) ||
+                   usage == uint32_t(DeclUsage::kBinormal);
+  packed_normal = false;
+  convert = ElementConvert::kCopy;
+  out_size = in_size;
+  if (usage == uint32_t(DeclUsage::kBlendIndices)) {
+    if (source.format != xenos::VertexFormat::k_8_8_8_8) return false;
+    out = F::R8G8B8A8_UINT;
+    return true;
+  }
+  if (raw) {
+    if (source.format == xenos::VertexFormat::k_11_11_10 ||
+        source.format == xenos::VertexFormat::k_10_11_11) {
       out = F::R32_UINT;
       packed_normal = true;
       return true;
-    case xenos::VertexFormat::k_16_16:
-      if (uint_input || is_integer) return false;
-      out = is_signed ? F::R16G16_SNORM : F::R16G16_UNORM;
-      return true;
-    case xenos::VertexFormat::k_16_16_16_16:
-      if (uint_input || is_integer) return false;
-      out = is_signed ? F::R16G16B16A16_SNORM : F::R16G16B16A16_UNORM;
-      return true;
-    case xenos::VertexFormat::k_16_16_FLOAT:
-      if (uint_input) return false;
-      out = F::R16G16_FLOAT;
-      return true;
-    case xenos::VertexFormat::k_16_16_16_16_FLOAT:
-      if (uint_input) return false;
-      out = F::R16G16B16A16_FLOAT;
-      return true;
-    case xenos::VertexFormat::k_32_FLOAT:
-      out = uint_input ? F::R32_UINT : F::R32_FLOAT;
-      return true;
-    case xenos::VertexFormat::k_32_32_FLOAT:
-      out = uint_input ? F::R32G32_UINT : F::R32G32_FLOAT;
-      return true;
-    case xenos::VertexFormat::k_32_32_32_FLOAT:
-      out = uint_input ? F::R32G32B32_UINT : F::R32G32B32_FLOAT;
-      return true;
-    case xenos::VertexFormat::k_32_32_32_32_FLOAT:
-      out = uint_input ? F::R32G32B32A32_UINT : F::R32G32B32A32_FLOAT;
-      return true;
-    default:
-      return false;
+    }
+    convert = ElementConvert::kFloat4Bits;
+    out = F::R32G32B32A32_UINT;
+    out_size = 16;
+    return true;
   }
+  switch (source.format) {
+    case xenos::VertexFormat::k_8_8_8_8:
+      if (!source.is_integer) {
+        out = source.is_signed ? F::R8G8B8A8_SNORM : F::R8G8B8A8_UNORM;
+        return true;
+      }
+      break;
+    case xenos::VertexFormat::k_16_16:
+      if (!source.is_integer) {
+        out = source.is_signed ? F::R16G16_SNORM : F::R16G16_UNORM;
+        return true;
+      }
+      break;
+    case xenos::VertexFormat::k_16_16_16_16:
+      if (!source.is_integer) {
+        out = source.is_signed ? F::R16G16B16A16_SNORM : F::R16G16B16A16_UNORM;
+        return true;
+      }
+      break;
+    case xenos::VertexFormat::k_16_16_FLOAT: out = F::R16G16_FLOAT; return true;
+    case xenos::VertexFormat::k_16_16_16_16_FLOAT: out = F::R16G16B16A16_FLOAT; return true;
+    case xenos::VertexFormat::k_32_FLOAT: out = F::R32_FLOAT; return true;
+    case xenos::VertexFormat::k_32_32_FLOAT: out = F::R32G32_FLOAT; return true;
+    case xenos::VertexFormat::k_32_32_32_FLOAT: out = F::R32G32B32_FLOAT; return true;
+    case xenos::VertexFormat::k_32_32_32_32_FLOAT: out = F::R32G32B32A32_FLOAT; return true;
+    default:
+      break;
+  }
+  convert = ElementConvert::kFloat4;
+  out = F::R32G32B32A32_FLOAT;
+  out_size = 16;
+  return true;
+}
+
+void ConvertElement(const uint8_t* src, uint8_t* dst, uint32_t in_size, ElementConvert convert,
+                    const ElementSource& source) {
+  if (convert == ElementConvert::kCopy) {
+    std::memcpy(dst, src, in_size);
+    return;
+  }
+  float value[4];
+  DecodeElement(source, src, value);
+  std::memcpy(dst, value, 16);
 }
 
 uint32_t UsageLocation(uint32_t usage, uint32_t index) {
@@ -269,13 +437,67 @@ const char* UsageSemantic(uint32_t usage) {
   return "TEXCOORD";
 }
 
+// Host format holding a Xenos texture format's texels unchanged.
+plume::RenderFormat HostTextureFormat(uint32_t format) {
+  using F = plume::RenderFormat;
+  switch (static_cast<xenos::TextureFormat>(format)) {
+    case xenos::TextureFormat::k_8: return F::R8_UNORM;
+    case xenos::TextureFormat::k_8_8: return F::R8G8_UNORM;
+    case xenos::TextureFormat::k_8_8_8_8: return F::R8G8B8A8_UNORM;
+    case xenos::TextureFormat::k_DXT1: return F::BC1_UNORM;
+    case xenos::TextureFormat::k_DXT2_3: return F::BC2_UNORM;
+    case xenos::TextureFormat::k_DXT4_5: return F::BC3_UNORM;
+    case xenos::TextureFormat::k_DXT5A: return F::BC4_UNORM;
+    case xenos::TextureFormat::k_DXN: return F::BC5_UNORM;
+    case xenos::TextureFormat::k_16: return F::R16_UNORM;
+    case xenos::TextureFormat::k_16_16: return F::R16G16_UNORM;
+    case xenos::TextureFormat::k_16_16_16_16: return F::R16G16B16A16_UNORM;
+    case xenos::TextureFormat::k_16_FLOAT: return F::R16_FLOAT;
+    case xenos::TextureFormat::k_16_16_FLOAT: return F::R16G16_FLOAT;
+    case xenos::TextureFormat::k_16_16_16_16_FLOAT: return F::R16G16B16A16_FLOAT;
+    case xenos::TextureFormat::k_32_FLOAT: return F::R32_FLOAT;
+    case xenos::TextureFormat::k_32_32_FLOAT: return F::R32G32_FLOAT;
+    case xenos::TextureFormat::k_32_32_32_32_FLOAT: return F::R32G32B32A32_FLOAT;
+    default: return F::UNKNOWN;
+  }
+}
+
+// Fetch swizzle: three bits per output component, 0-3 pick x/y/z/w of the
+// fetched texel, 4 is 0 and 5 is 1.
+plume::RenderComponentMapping ComponentMapping(uint32_t swizzle) {
+  auto one = [](uint32_t s) {
+    switch (s & 7) {
+      case 0: return plume::RenderSwizzle::R;
+      case 1: return plume::RenderSwizzle::G;
+      case 2: return plume::RenderSwizzle::B;
+      case 3: return plume::RenderSwizzle::A;
+      case 4: return plume::RenderSwizzle::ZERO;
+      default: return plume::RenderSwizzle::ONE;
+    }
+  };
+  return plume::RenderComponentMapping(one(swizzle), one(swizzle >> 3), one(swizzle >> 6), one(swizzle >> 9));
+}
+
+// Names one guest image by its texture fetch constant. Clamp and filter
+// bits are sampler state and are left out.
+uint64_t ImageKey(const uint32_t words[6]) {
+  uint32_t image_words[6];
+  std::memcpy(image_words, words, sizeof(image_words));
+  image_words[0] &= ~0x3FFC00u;    // clamp_x/y/z
+  image_words[3] &= ~0x0FF80000u;  // mag/min/mip/aniso filter
+  return XXH3_64bits(image_words, sizeof(image_words));
+}
+
+// xenos::ClampMode: repeat, mirrored repeat, clamp to edge, mirror clamp to
+// edge, clamp halfway, mirror clamp halfway, clamp to border, mirror clamp to
+// border. Halfway clamps sit between edge and border; edge is the closer.
 plume::RenderTextureAddressMode AddressMode(uint32_t clamp) {
   using A = plume::RenderTextureAddressMode;
   switch (clamp) {
     case 0: return A::WRAP;
     case 1: return A::MIRROR;
-    case 2: return A::CLAMP;
-    case 3: return A::MIRROR_ONCE;
+    case 2: case 4: return A::CLAMP;
+    case 3: case 5: return A::MIRROR_ONCE;
     default: return A::BORDER;
   }
 }
@@ -319,7 +541,13 @@ struct Renderer::State {
 
   struct Texture {
     std::unique_ptr<plume::RenderTexture> texture;
+    std::unique_ptr<plume::RenderTextureView> view;
     uint32_t index = 0;
+    bool resolved = false;  // a host copy of the target, at host scale
+    uint64_t content = 0;   // XXH3 of the guest texels last uploaded
+    uint64_t checked = UINT64_MAX;  // present the content was last compared
+    uint32_t width = 0;
+    uint32_t height = 0;
   };
   std::unordered_map<uint64_t, Texture> textures;
   uint32_t next_texture2d = 1;  // 0 is white in every heap
@@ -327,13 +555,35 @@ struct Renderer::State {
   std::unordered_map<uint32_t, uint32_t> sampler_index;
   std::vector<std::unique_ptr<plume::RenderSampler>> samplers;
 
-  std::unordered_map<uint64_t, uint64_t> frame_streams;  // (address, bytes, endian) -> ring
+  std::string last_viewport;
+  std::string last_bounds;
+  std::map<std::string, uint64_t> viewports;  // VTE_CNTL and viewport per draw, for the log
+  std::string dump;  // lines for native_dump_frame
+  bool Dumping() const { return REXCVAR_GET(native_dump_frame) == int32_t(presents + 1); }
   bool recording = false;
+  uint64_t clears = 0;
+  uint64_t resolves = 0;
+  uint64_t reuploads = 0;
+
+  // A guest D3DRECT {x1, y1, x2, y2} scaled to the host target.
+  plume::RenderRect HostRect(const uint8_t* base, uint32_t rect) const {
+    const float sx = float(width) / kGuestWidth;
+    const float sy = float(height) / kGuestHeight;
+    auto at = [&](uint32_t i) { return int32_t(Be32(base, rect + 4 * i)); };
+    plume::RenderRect out(int32_t(std::lround(at(0) * sx)), int32_t(std::lround(at(1) * sy)),
+                          int32_t(std::lround(at(2) * sx)), int32_t(std::lround(at(3) * sy)));
+    out.left = std::clamp<int32_t>(out.left, 0, int32_t(width));
+    out.right = std::clamp<int32_t>(out.right, out.left, int32_t(width));
+    out.top = std::clamp<int32_t>(out.top, 0, int32_t(height));
+    out.bottom = std::clamp<int32_t>(out.bottom, out.top, int32_t(height));
+    return out;
+  }
   uint64_t presents = 0;
 
   std::mutex mutex;  // Draw and Present run on the guest thread, TakeStats on the sampler
   std::map<std::string, uint64_t> skipped;
   uint64_t drawn = 0;
+  double ms_pipeline = 0, ms_texture = 0, ms_stream = 0, ms_submit = 0;
 
   bool Upload(size_t bytes, size_t align, uint64_t& offset) {
     const uint64_t start = (upload_used + align - 1) & ~uint64_t(align - 1);
@@ -363,7 +613,6 @@ struct Renderer::State {
     if (recording) return;
     recording = true;
     upload_used = 0;
-    frame_streams.clear();
     commands->begin();
     plume::RenderTextureBarrier barriers[] = {
         plume::RenderTextureBarrier(color.get(), plume::RenderTextureLayout::COLOR_WRITE),
@@ -496,89 +745,85 @@ struct Renderer::State {
   }
 
   // Texture index in the 2D heap for one fetch constant, 0 (white) when the
-  // format or dimension is not handled yet.
+  // format is not handled yet. Texels are uploaded untiled and endian-swapped
+  // but otherwise as the guest stores them; the fetch swizzle becomes the
+  // view's component mapping. Guest memory is hashed the first time a texture
+  // is used in a frame, and changed texels (Bink video, CPU-written images)
+  // are uploaded again.
   uint32_t Texture2DFor(const uint32_t words[6], const xenos::xe_gpu_texture_fetch_t& fetch,
                         const uint8_t* base, bool& uploaded) {
+    const uint64_t key = ImageKey(words);
+    auto found = textures.find(key);
+    if (found != textures.end() && (found->second.resolved || found->second.checked == presents)) {
+      return found->second.index;
+    }
     const uint32_t format = uint32_t(fetch.format);
-    if (format != 6 && format != 18 && format != 20) {
+    const plume::RenderFormat host = HostTextureFormat(format);
+    if (host == plume::RenderFormat::UNKNOWN) {
       Skip(fmt::format("texture format {}", format));
       return 0;
     }
     const uint32_t width = fetch.size_2d.width + 1;
     const uint32_t height = fetch.size_2d.height + 1;
     const uint32_t pitch = fetch.pitch * 32;
-    const uint64_t key = XXH3_64bits(words, 24) ^ 0x5bd1e995u;
-    auto found = textures.find(key);
-    if (found != textures.end()) return found->second.index;
-    if (next_texture2d >= kTexture2DCount) return 0;
-    const uint32_t bytes = gfx::GuestTextureBytes(format, width, height, pitch, fetch.tiled);
+    const uint32_t bytes = gfx::GuestTextureBytesAny(format, width, height, pitch, fetch.tiled);
     if (bytes == 0) {
       Skip("texture size");
       return 0;
     }
-    std::vector<uint8_t> linear;
-    std::string reason;
     const uint8_t* guest = At(base, PhysicalView(fetch.base_address << 12));
-    if (!gfx::LoadGuestTextureRgba8(format, width, height, pitch, uint32_t(fetch.endianness),
-                                    fetch.tiled, guest, bytes, linear, reason)) {
-      Skip("texture decode");
+    const uint64_t content = XXH3_64bits(guest, bytes);
+    if (found != textures.end()) {
+      found->second.checked = presents;
+      if (found->second.content == content) return found->second.index;
+      ++reuploads;
+    } else if (next_texture2d >= kTexture2DCount) {
       return 0;
     }
-    // Fetch swizzle: three bits per output component, 0-3 picks x/y/z/w of the
-    // decoded texel, 4 is 0 and 5 is 1.
-    const uint32_t swizzle = fetch.swizzle;
-    if (swizzle != 0x688) {  // xyzw
-      for (size_t p = 0; p + 3 < linear.size(); p += 4) {
-        const uint8_t in[6] = {linear[p], linear[p + 1], linear[p + 2], linear[p + 3], 0, 255};
-        for (uint32_t c = 0; c < 4; ++c) {
-          const uint32_t s = (swizzle >> (3 * c)) & 7;
-          linear[p + c] = in[s < 6 ? s : 4];
-        }
-      }
+    gfx::LinearTexture linear;
+    std::string reason;
+    if (!gfx::LoadGuestTextureLinear(format, width, height, pitch, uint32_t(fetch.endianness), fetch.tiled,
+                                     guest, bytes, linear, reason)) {
+      Skip("texture layout");
+      return found != textures.end() ? found->second.index : 0;
     }
-    const uint32_t row = (width * 4 + 255) & ~255u;
+    const size_t row_bytes = size_t(linear.width_blocks) * linear.block_bytes;
+    const size_t row = (row_bytes + 255) & ~size_t(255);
     uint64_t offset = 0;
-    if (!Upload(size_t(row) * height, 512, offset)) {
+    if (!Upload(row * linear.height_blocks, 512, offset)) {
       Skip("upload ring full");
-      return 0;
+      return found != textures.end() ? found->second.index : 0;
     }
-    for (uint32_t y = 0; y < height; ++y) {
-      std::memcpy(upload_cpu + offset + size_t(y) * row, linear.data() + size_t(y) * width * 4, width * 4);
+    for (uint32_t y = 0; y < linear.height_blocks; ++y) {
+      std::memcpy(upload_cpu + offset + y * row, linear.blocks.data() + y * row_bytes, row_bytes);
     }
-    Texture texture;
-    texture.texture = device->createTexture(
-        plume::RenderTextureDesc::Texture2D(width, height, 1, plume::RenderFormat::R8G8B8A8_UNORM));
-    texture.index = next_texture2d++;
+    if (found == textures.end()) {
+      Texture texture;
+      texture.texture = device->createTexture(plume::RenderTextureDesc::Texture2D(width, height, 1, host));
+      plume::RenderTextureViewDesc view = plume::RenderTextureViewDesc::Texture2D(host);
+      view.componentMapping = ComponentMapping(fetch.swizzle);
+      texture.view = texture.texture->createTextureView(view);
+      texture.index = next_texture2d++;
+      found = textures.emplace(key, std::move(texture)).first;
+    }
+    Texture& texture = found->second;
+    texture.content = content;
+    texture.checked = presents;
     commands->barriers(plume::RenderBarrierStage::COPY,
                        plume::RenderTextureBarrier(texture.texture.get(), plume::RenderTextureLayout::COPY_DEST));
+    const uint32_t row_texels = uint32_t(row / linear.block_bytes) * linear.block_width;
     commands->copyTextureRegion(
         plume::RenderTextureCopyLocation::Subresource(texture.texture.get()),
-        plume::RenderTextureCopyLocation::PlacedFootprint(upload.get(), plume::RenderFormat::R8G8B8A8_UNORM,
-                                                          width, height, 1, row / 4, offset));
+        plume::RenderTextureCopyLocation::PlacedFootprint(upload.get(), host, width, height, 1, row_texels,
+                                                          offset));
     commands->barriers(plume::RenderBarrierStage::GRAPHICS,
                        plume::RenderTextureBarrier(texture.texture.get(), plume::RenderTextureLayout::SHADER_READ));
-    sets[0]->setTexture(texture.index, texture.texture.get(), plume::RenderTextureLayout::SHADER_READ);
+    sets[0]->setTexture(texture.index, texture.texture.get(), plume::RenderTextureLayout::SHADER_READ,
+                        texture.view.get());
     uploaded = true;
-    const uint32_t index = texture.index;
-    textures.emplace(key, std::move(texture));
-    return index;
+    return texture.index;
   }
 
-  // Copies one stream once per frame, swapped to host order by the fetch
-  // constant's endian. Returns the ring offset.
-  bool Stream(uint32_t address, uint32_t bytes, uint32_t endian, const uint8_t* base, uint64_t& offset) {
-    const uint64_t key = (uint64_t(address) << 32) ^ (uint64_t(bytes) << 2) ^ endian;
-    auto found = frame_streams.find(key);
-    if (found != frame_streams.end()) {
-      offset = found->second;
-      return true;
-    }
-    if (!Upload(bytes, 16, offset)) return false;
-    std::memcpy(upload_cpu + offset, At(base, PhysicalView(address)), bytes);
-    SwapDwords(upload_cpu + offset, bytes, endian);
-    frame_streams[key] = offset;
-    return true;
-  }
 };
 
 Renderer::Renderer() : state_(std::make_unique<State>()) {}
@@ -665,7 +910,7 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
     return;
   }
 
-  // Topology. Quad lists become triangle lists through an index list below.
+  // Topology. Quad lists become triangle lists through the index list.
   plume::RenderPrimitiveTopology topology;
   bool quads = false;
   switch (draw.prim) {
@@ -683,58 +928,146 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
       s.Skip(fmt::format("primitive {}", draw.prim));
       return;
   }
+  if (draw.count == 0) return;
 
-  // Vertex declaration -> input layout. Stream s is vertex fetch constant 95-s.
+  // Guest vertex indices of the draw. Vertex v of the draw lives at guest
+  // vertex base_vertex + v (indexed) or v (auto).
+  std::vector<uint32_t> list;
+  if (draw.indexed) {
+    const uint32_t ib = Be32(base, device + kDeviceIndices);
+    if (ib == 0) {
+      s.Skip("index buffer");
+      return;
+    }
+    const bool index32 = (Be32(base, ib) & 0x80000000u) != 0;
+    const uint32_t address = PhysicalView(Be32(base, ib + 24));
+    list.resize(draw.count);
+    for (uint32_t i = 0; i < draw.count; ++i) {
+      list[i] = index32 ? Be32(base, address + 4 * (draw.start + i)) : Be16(base, address + 2 * (draw.start + i));
+    }
+  }
+  uint32_t first = 0, last = 0;
+  if (draw.indexed) {
+    uint32_t lo = UINT32_MAX, hi = 0;
+    for (uint32_t index : list) {
+      if (index == 0xFFFFu || index == 0xFFFFFFFFu) continue;
+      lo = std::min(lo, index);
+      hi = std::max(hi, index);
+    }
+    if (lo == UINT32_MAX) return;
+    first = draw.base_vertex + lo;
+    last = draw.base_vertex + hi;
+  } else {
+    first = draw.start;
+    last = draw.start + draw.count - 1;
+  }
+  const uint32_t vertex_count = last - first + 1;
+  if (vertex_count > (1u << 20)) {
+    s.Skip("vertex range");
+    return;
+  }
+
+  // Declaration: every element is gathered into a host stream per guest
+  // stream, converting what Vulkan cannot fetch (16-bit integers) to float.
+  struct Element {
+    uint32_t stream, offset, usage, usage_index, location;
+    uint32_t in_size, out_size, out_offset;
+    ElementConvert convert;
+    ElementSource source;
+    plume::RenderFormat format;
+  };
   const uint32_t decl = Be32(base, device + kDeviceDecl);
   const uint32_t element_count = decl ? std::min<uint32_t>(Be32(base, decl + 24), 16) : 0;
+  std::array<Element, 16> elems;
+  bool packed_normals = false;
+  for (uint32_t i = 0; i < element_count; ++i) {
+    const uint32_t at = decl + 52 + i * 12;
+    Element& e = elems[i];
+    e.stream = Be16(base, at);
+    e.offset = Be16(base, at + 2);
+    const uint32_t format_word = Be32(base, at + 4);
+    e.usage = *At(base, at + 9);
+    e.usage_index = *At(base, at + 10);
+    e.location = UsageLocation(e.usage, e.usage_index);
+    bool packed = false;
+    if (e.stream >= 16 || e.location == UINT32_MAX ||
+        !ElementFormat(e.usage, format_word, e.format, e.in_size, e.out_size, e.convert, e.source, packed)) {
+      s.Skip(fmt::format("vertex element usage {} format {:03X}", e.usage, format_word & 0x33F));
+      return;
+    }
+    packed_normals |= packed;
+  }
+
   std::array<plume::RenderInputElement, 16> elements;
   std::array<plume::RenderInputSlot, 16> slots;
   std::array<plume::RenderVertexBufferView, 16> views;
   uint32_t slot_count = 0;
-  uint32_t stream_slot[16];
-  std::fill(std::begin(stream_slot), std::end(stream_slot), UINT32_MAX);
-  bool packed_normals = false;
   XXH3_state_t key_state;
   XXH3_64bits_reset(&key_state);
-  for (uint32_t i = 0; i < element_count; ++i) {
-    const uint32_t element = decl + 52 + i * 12;
-    const uint32_t stream = Be16(base, element);
-    const uint32_t offset = Be16(base, element + 2);
-    const uint32_t format_word = Be32(base, element + 4);
-    const uint32_t usage = *At(base, element + 9);
-    const uint32_t usage_index = *At(base, element + 10);
-    const uint32_t location = UsageLocation(usage, usage_index);
-    plume::RenderFormat format;
-    bool packed = false;
-    if (stream >= 16 || location == UINT32_MAX || !ElementFormat(usage, format_word, format, packed)) {
-      s.Skip(fmt::format("vertex element usage {} format {:03X}", usage, format_word & 0x33F));
+  const auto t_stream = std::chrono::steady_clock::now();
+  for (uint32_t stream = 0; stream < 16; ++stream) {
+    uint32_t out_stride = 0;
+    for (uint32_t i = 0; i < element_count; ++i) {
+      if (elems[i].stream != stream) continue;
+      elems[i].out_offset = out_stride;
+      out_stride += elems[i].out_size;
+    }
+    if (out_stride == 0) continue;
+    const uint32_t fetch = device + kDeviceFetch + 8 * (95 - stream);
+    xenos::xe_gpu_vertex_fetch_t vf;
+    vf.dword_0 = Be32(base, fetch);
+    vf.dword_1 = Be32(base, fetch + 4);
+    const uint32_t stride = uint32_t(*At(base, device + kDeviceStrides + stream)) * 4;
+    const uint64_t begin = uint64_t(first) * stride;
+    const uint64_t bytes = uint64_t(vertex_count) * stride;
+    if (stride == 0 || begin + bytes > uint64_t(vf.size) * 4) {
+      s.last_bounds = fmt::format("stream {} stride {} first {} count {} base {} fetch_bytes {} indexed {} start {} n {}",
+                                  stream, stride, first, vertex_count, draw.base_vertex, vf.size * 4,
+                                  draw.indexed, draw.start, draw.count);
+      if (draw.indexed) {
+        const uint32_t ib = Be32(base, device + kDeviceIndices);
+        s.last_bounds += fmt::format(" ib {:08X} flags {:08X} addr {:08X} words", ib, Be32(base, ib),
+                                     Be32(base, ib + 24));
+        for (uint32_t w = 0; w < 8; ++w) s.last_bounds += fmt::format(" {:08X}", Be32(base, ib + 4 * w));
+        s.last_bounds += " idx";
+        for (size_t i = 0; i < std::min<size_t>(list.size(), 12); ++i) s.last_bounds += fmt::format(" {}", list[i]);
+      }
+      s.Skip("vertex stream bounds");
       return;
     }
-    packed_normals |= packed;
-    if (stream_slot[stream] == UINT32_MAX) {
-      const uint32_t fetch = device + kDeviceFetch + 8 * (95 - stream);
-      xenos::xe_gpu_vertex_fetch_t vf;
-      vf.dword_0 = Be32(base, fetch);
-      vf.dword_1 = Be32(base, fetch + 4);
-      const uint32_t stride = uint32_t(*At(base, device + kDeviceStrides + stream)) * 4;
-      const uint32_t bytes = vf.size * 4;
-      uint64_t ring = 0;
-      if (bytes == 0 || bytes > (32u << 20) ||
-          !s.Stream(vf.address * 4, bytes, uint32_t(vf.endian), base, ring)) {
-        s.Skip("vertex stream");
-        return;
-      }
-      stream_slot[stream] = slot_count;
-      slots[slot_count] = plume::RenderInputSlot(slot_count, stride);
-      views[slot_count] = plume::RenderVertexBufferView(s.upload->at(ring), bytes);
-      ++slot_count;
-      XXH3_64bits_update(&key_state, &stride, 4);
+    std::vector<uint8_t> raw(bytes);
+    std::memcpy(raw.data(), At(base, PhysicalView(vf.address * 4 + uint32_t(begin))), bytes);
+    SwapDwords(raw.data(), raw.size(), uint32_t(vf.endian));
+    uint64_t ring = 0;
+    if (!s.Upload(size_t(vertex_count) * out_stride, 16, ring)) {
+      s.Skip("upload ring full");
+      return;
     }
-    elements[i] = plume::RenderInputElement(UsageSemantic(usage), usage_index, location, format,
-                                            stream_slot[stream], offset);
-    const uint32_t element_key[4] = {location, uint32_t(format), stream_slot[stream], offset};
-    XXH3_64bits_update(&key_state, element_key, sizeof(element_key));
+    uint8_t* out = s.upload_cpu + ring;
+    for (uint32_t v = 0; v < vertex_count; ++v) {
+      const uint8_t* src = raw.data() + size_t(v) * stride;
+      uint8_t* dst = out + size_t(v) * out_stride;
+      for (uint32_t i = 0; i < element_count; ++i) {
+        const Element& e = elems[i];
+        if (e.stream != stream) continue;
+        ConvertElement(src + e.offset, dst + e.out_offset, e.in_size, e.convert, e.source);
+      }
+    }
+    slots[slot_count] = plume::RenderInputSlot(slot_count, out_stride);
+    views[slot_count] = plume::RenderVertexBufferView(s.upload->at(ring), vertex_count * out_stride);
+    for (uint32_t i = 0; i < element_count; ++i) {
+      if (elems[i].stream != stream) continue;
+      elements[i] = plume::RenderInputElement(UsageSemantic(elems[i].usage), elems[i].usage_index,
+                                              elems[i].location, elems[i].format, slot_count,
+                                              elems[i].out_offset);
+      const uint32_t element_key[4] = {elems[i].location, uint32_t(elems[i].format), slot_count,
+                                       elems[i].out_offset};
+      XXH3_64bits_update(&key_state, element_key, sizeof(element_key));
+    }
+    XXH3_64bits_update(&key_state, &out_stride, 4);
+    ++slot_count;
   }
+  s.ms_stream += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_stream).count();
 
   // Render state.
   const uint32_t depth_control = Reg(base, device, kRbDepthControl);
@@ -753,8 +1086,8 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
       (ps_entry->second->specConstantsMask & SPEC_CONSTANT_ALPHA_TEST)) {
     spec |= SPEC_CONSTANT_ALPHA_TEST;
   }
-  const uint32_t state_key[7] = {depth_control & 0x77, blend_control, color_mask, uint32_t(topology),
-                                 spec, uint32_t(ps_object != 0), 0};
+  const uint32_t state_key[6] = {depth_control & 0x77, blend_control, color_mask, uint32_t(topology),
+                                 spec, uint32_t(ps_object != 0)};
   XXH3_64bits_update(&key_state, state_key, sizeof(state_key));
   XXH3_64bits_update(&key_state, &vs_key, 8);
   XXH3_64bits_update(&key_state, &ps_key, 8);
@@ -794,7 +1127,9 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
     const plume::RenderSpecConstant spec_constant(0, spec);
     desc.specConstants = &spec_constant;
     desc.specConstantsCount = 1;
+    const auto t0 = std::chrono::steady_clock::now();
     auto created = s.device->createGraphicsPipeline(desc);
+    s.ms_pipeline += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     if (!created) {
       s.Skip("pipeline");
       return;
@@ -827,8 +1162,10 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
     if (uint32_t(fetch.type) != 2) continue;
     indices[DESCRIPTOR_KIND_SAMPLER * DESCRIPTOR_SLOT_COUNT + slot] = s.SamplerFor(fetch);
     if (uint32_t(fetch.dimension) == 1) {
+      const auto t0 = std::chrono::steady_clock::now();
       indices[DESCRIPTOR_KIND_TEXTURE2D * DESCRIPTOR_SLOT_COUNT + slot] =
           s.Texture2DFor(words, fetch, base, uploaded);
+      s.ms_texture += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     }
   }
   const uint32_t bools0 = Be32(base, device + kDeviceBools);
@@ -838,44 +1175,38 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
   const float alpha_ref = RegFloat(base, device, kRbAlphaRef);
   std::memcpy(shared_cpu + gfx::kSharedAlphaThresholdOffset, &alpha_ref, 4);
 
-  // Index list: guest indices are big-endian; quad lists are expanded.
+  // Host index list, relative to the first copied vertex.
+  const bool use_indices = draw.indexed || quads;
   uint32_t index_count = draw.count;
-  bool use_indices = draw.indexed || quads;
   uint64_t index_ring = 0;
   if (use_indices) {
-    std::vector<uint32_t> list;
+    std::vector<uint32_t> host;
     if (draw.indexed) {
-      const uint32_t ib = Be32(base, device + kDeviceIndices);
-      if (ib == 0) {
-        s.Skip("index buffer");
-        return;
-      }
-      const bool index32 = (Be32(base, ib) & 0x80000000u) != 0;
-      const uint32_t address = PhysicalView(Be32(base, ib + 24));
-      list.resize(draw.count);
-      for (uint32_t i = 0; i < draw.count; ++i) {
-        list[i] = index32 ? Be32(base, address + 4 * (draw.start + i))
-                          : Be16(base, address + 2 * (draw.start + i));
+      host.resize(list.size());
+      for (size_t i = 0; i < list.size(); ++i) {
+        const uint32_t index = list[i];
+        host[i] = (index == 0xFFFFu || index == 0xFFFFFFFFu) ? 0xFFFFFFFFu
+                                                             : draw.base_vertex + index - first;
       }
     } else {
-      list.resize(draw.count);
-      for (uint32_t i = 0; i < draw.count; ++i) list[i] = draw.start + i;
+      host.resize(draw.count);
+      for (uint32_t i = 0; i < draw.count; ++i) host[i] = i;
     }
     if (quads) {
       std::vector<uint32_t> triangles;
-      triangles.reserve(list.size() / 4 * 6);
-      for (size_t q = 0; q + 3 < list.size(); q += 4) {
-        const uint32_t v[6] = {list[q], list[q + 1], list[q + 2], list[q], list[q + 2], list[q + 3]};
+      triangles.reserve(host.size() / 4 * 6);
+      for (size_t q = 0; q + 3 < host.size(); q += 4) {
+        const uint32_t v[6] = {host[q], host[q + 1], host[q + 2], host[q], host[q + 2], host[q + 3]};
         triangles.insert(triangles.end(), std::begin(v), std::end(v));
       }
-      list.swap(triangles);
+      host.swap(triangles);
     }
-    index_count = uint32_t(list.size());
-    if (index_count == 0 || !s.Upload(list.size() * 4, 16, index_ring)) {
+    index_count = uint32_t(host.size());
+    if (index_count == 0 || !s.Upload(host.size() * 4, 16, index_ring)) {
       s.Skip("index list");
       return;
     }
-    std::memcpy(s.upload_cpu + index_ring, list.data(), list.size() * 4);
+    std::memcpy(s.upload_cpu + index_ring, host.data(), host.size() * 4);
   }
 
   // Viewport from the D3D registers, scaled to the host target.
@@ -890,9 +1221,15 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
   plume::RenderViewport viewport((xoffset - xscale) * sx, (yoffset - yscale) * sy, 2.0f * xscale * sx,
                                  2.0f * yscale * sy, std::clamp(zoffset, 0.0f, 1.0f),
                                  std::clamp(zoffset + zscale, 0.0f, 1.0f));
-  if (viewport.width <= 0.0f || viewport.height <= 0.0f) {
+  if (!(viewport.width > 0.0f) || !(viewport.height > 0.0f)) {
     viewport = plume::RenderViewport(0.0f, 0.0f, float(s.width), float(s.height));
   }
+  ++s.viewports[fmt::format("vte={:03X} vp={:.0f},{:.0f},{:.0f}x{:.0f} z={:.2f}+{:.2f} surf={:08X} wo={:08X} sc={:08X}-{:08X}",
+                              Reg(base, device, 0x2206), xoffset - xscale, yoffset - yscale, 2 * xscale,
+                              2 * yscale, zoffset, zscale, Reg(base, device, 0x2000), Reg(base, device, 0x2080),
+                              Reg(base, device, 0x200E), Reg(base, device, 0x200F))];
+  s.last_viewport = fmt::format("{:.1f},{:.1f} {:.1f}x{:.1f}", xoffset - xscale, yoffset - yscale,
+                                2.0f * xscale, 2.0f * yscale);
 
   if (uploaded) s.BindTarget();
   s.commands->setPipeline(pipeline);
@@ -906,18 +1243,175 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
     const plume::RenderIndexBufferView view(s.upload->at(index_ring), index_count * 4,
                                             plume::RenderFormat::R32_UINT);
     s.commands->setIndexBuffer(&view);
-    s.commands->drawIndexedInstanced(index_count, 1, 0, draw.indexed ? int32_t(draw.base_vertex) : 0, 0);
+    s.commands->drawIndexedInstanced(index_count, 1, 0, 0, 0);
   } else {
-    s.commands->drawInstanced(draw.count, 1, draw.start, 0);
+    s.commands->drawInstanced(draw.count, 1, 0, 0);
+  }
+  if (s.Dumping()) {
+    std::string line = fmt::format("draw {} indexed={} prim={} start={} count={} base={} first={} verts={} "
+                                   "vs={:016X} ps={:016X} depth={:08X} blend={:08X} mask={:X} vp={} cull={:08X} "
+                                   "clip={:08X}",
+                                   s.drawn, draw.indexed, draw.prim, draw.start, draw.count, draw.base_vertex,
+                                   first, vertex_count, vs_key, ps_key, depth_control, blend_control, color_mask,
+                                   s.last_viewport, Reg(base, device, kPaSuScModeCntl), Reg(base, device, 0x2204));
+    for (uint32_t i = 0; i < element_count; ++i) {
+      line += fmt::format(" | e{} s{} +{} usage{}.{} fmt{:03X}", i, elems[i].stream, elems[i].offset,
+                          elems[i].usage, elems[i].usage_index,
+                          uint32_t(elems[i].source.format) | (elems[i].source.is_signed ? 0x100 : 0) |
+                              (elems[i].source.is_integer ? 0x200 : 0));
+    }
+    // Decoded positions of the first vertices (stream of the POSITION element).
+    for (uint32_t i = 0; i < element_count; ++i) {
+      if (elems[i].usage != 0 || elems[i].usage_index != 0) continue;
+      const uint32_t fetch_at = device + kDeviceFetch + 8 * (95 - elems[i].stream);
+      xenos::xe_gpu_vertex_fetch_t vf;
+      vf.dword_0 = Be32(base, fetch_at);
+      vf.dword_1 = Be32(base, fetch_at + 4);
+      const uint32_t stride = uint32_t(*At(base, device + kDeviceStrides + elems[i].stream)) * 4;
+      for (uint32_t v = 0; v < std::min<uint32_t>(vertex_count, 6); ++v) {
+        uint8_t raw[16] = {};
+        std::memcpy(raw, At(base, PhysicalView(vf.address * 4 + (first + v) * stride + elems[i].offset)),
+                    elems[i].in_size);
+        SwapDwords(raw, sizeof(raw), uint32_t(vf.endian));
+        float pos[4];
+        DecodeElement(elems[i].source, raw, pos);
+        line += fmt::format(" | v{} ({:.2f},{:.2f},{:.2f},{:.2f})", first + v, pos[0], pos[1], pos[2], pos[3]);
+      }
+    }
+    const float* c = reinterpret_cast<const float*>(s.upload_cpu + vs_constants);
+    for (uint32_t r = 0; r < 8; ++r) {
+      line += fmt::format(" | c{} ({:.3f},{:.3f},{:.3f},{:.3f})", r, c[4 * r], c[4 * r + 1], c[4 * r + 2],
+                          c[4 * r + 3]);
+    }
+    for (uint32_t slot = 0; slot < DESCRIPTOR_SLOT_COUNT; ++slot) {
+      const uint32_t index = indices[DESCRIPTOR_KIND_TEXTURE2D * DESCRIPTOR_SLOT_COUNT + slot];
+      if (index != 0) line += fmt::format(" | t{}=#{}", slot, index);
+    }
+    s.dump += line + "\n";
   }
   ++s.drawn;
 }
 
-void Renderer::Present() {
+void Renderer::Clear(uint32_t device, uint32_t flags, uint32_t rect, uint32_t color, float z,
+                     uint32_t stencil, const uint8_t* base) {
+  State& s = *state_;
+  std::lock_guard<std::mutex> lock(s.mutex);
+  (void)device;
+  s.BeginFrame();
+  s.UploadDefaults();
+  s.BindTarget();
+  plume::RenderRect host_rect(0, 0, int32_t(s.width), int32_t(s.height));
+  if (rect != 0) host_rect = s.HostRect(base, rect);
+  if (flags & 0xF) {
+    plume::RenderColor value(0.0f, 0.0f, 0.0f, 0.0f);
+    if (color != 0) {
+      value = plume::RenderColor(BeFloat(base, color), BeFloat(base, color + 4), BeFloat(base, color + 8),
+                                 BeFloat(base, color + 12));
+    }
+    s.commands->clearColor(0, value, &host_rect, 1);
+  }
+  if (flags & 0x30) {
+    s.commands->clearDepthStencil((flags & 0x10) != 0, (flags & 0x20) != 0, std::clamp(z, 0.0f, 1.0f),
+                                  stencil & 0xFF, &host_rect, 1);
+  }
+  if (s.Dumping()) s.dump += fmt::format("clear flags={:X} rect={:08X} z={}\n", flags, rect, z);
+  ++s.clears;
+}
+
+void Renderer::Resolve(uint32_t device, uint32_t flags, uint32_t rect, uint32_t texture, uint32_t point,
+                       uint32_t clear_color, float z, const uint8_t* base) {
+  State& s = *state_;
+  std::lock_guard<std::mutex> lock(s.mutex);
+  (void)device;
+  s.BeginFrame();
+  s.UploadDefaults();
+  const uint32_t source = flags & 7;
+  if (texture != 0 && source < 4) {
+    uint32_t words[6];
+    for (uint32_t w = 0; w < 6; ++w) words[w] = Be32(base, texture + 28 + 4 * w);
+    xenos::xe_gpu_texture_fetch_t fetch;
+    std::memcpy(&fetch, words, sizeof(words));
+    const uint32_t guest_width = fetch.size_2d.width + 1;
+    const uint32_t guest_height = fetch.size_2d.height + 1;
+    const uint32_t width = std::max(1u, uint32_t(std::lround(guest_width * float(s.width) / kGuestWidth)));
+    const uint32_t height = std::max(1u, uint32_t(std::lround(guest_height * float(s.height) / kGuestHeight)));
+    const uint64_t key = ImageKey(words);
+    State::Texture& entry = s.textures[key];
+    if (!entry.texture || !entry.resolved || entry.width != width || entry.height != height) {
+      entry.texture = s.device->createTexture(plume::RenderTextureDesc::Texture2D(width, height, 1, kColorFormat));
+      plume::RenderTextureViewDesc view = plume::RenderTextureViewDesc::Texture2D(kColorFormat);
+      view.componentMapping = ComponentMapping(fetch.swizzle);
+      entry.view = entry.texture->createTextureView(view);
+      if (entry.index == 0) {
+        if (s.next_texture2d >= kTexture2DCount) return;
+        entry.index = s.next_texture2d++;
+      }
+      entry.resolved = true;
+      entry.width = width;
+      entry.height = height;
+    }
+    plume::RenderRect src(0, 0, int32_t(s.width), int32_t(s.height));
+    if (rect != 0) src = s.HostRect(base, rect);
+    int32_t dst_x = 0, dst_y = 0;
+    if (point != 0) {
+      dst_x = int32_t(std::lround(int32_t(Be32(base, point)) * float(s.width) / kGuestWidth));
+      dst_y = int32_t(std::lround(int32_t(Be32(base, point + 4)) * float(s.height) / kGuestHeight));
+    }
+    src.right = std::min<int32_t>(src.right, src.left + int32_t(width) - dst_x);
+    src.bottom = std::min<int32_t>(src.bottom, src.top + int32_t(height) - dst_y);
+    if (src.right > src.left && src.bottom > src.top) {
+      plume::RenderTextureBarrier to_copy[] = {
+          plume::RenderTextureBarrier(s.color.get(), plume::RenderTextureLayout::COPY_SOURCE),
+          plume::RenderTextureBarrier(entry.texture.get(), plume::RenderTextureLayout::COPY_DEST)};
+      s.commands->barriers(plume::RenderBarrierStage::COPY, to_copy, 2);
+      const plume::RenderBox box(src.left, src.top, src.right, src.bottom);
+      s.commands->copyTextureRegion(plume::RenderTextureCopyLocation::Subresource(entry.texture.get()),
+                                    plume::RenderTextureCopyLocation::Subresource(s.color.get()), uint32_t(dst_x),
+                                    uint32_t(dst_y), 0, &box);
+      plume::RenderTextureBarrier back[] = {
+          plume::RenderTextureBarrier(s.color.get(), plume::RenderTextureLayout::COLOR_WRITE),
+          plume::RenderTextureBarrier(entry.texture.get(), plume::RenderTextureLayout::SHADER_READ)};
+      s.commands->barriers(plume::RenderBarrierStage::GRAPHICS, back, 2);
+      s.sets[0]->setTexture(entry.index, entry.texture.get(), plume::RenderTextureLayout::SHADER_READ,
+                            entry.view.get());
+    }
+    if (s.Dumping()) {
+      s.dump += fmt::format("resolve flags={:X} texture={:08X} {}x{} key={:016X} src={},{}-{},{}\n", flags,
+                            texture, guest_width, guest_height, key, src.left, src.top, src.right, src.bottom);
+    }
+    ++s.resolves;
+  }
+  s.BindTarget();
+  if (flags & 0x100) {
+    plume::RenderColor value(0.0f, 0.0f, 0.0f, 0.0f);
+    if (clear_color != 0) {
+      value = plume::RenderColor(BeFloat(base, clear_color), BeFloat(base, clear_color + 4),
+                                 BeFloat(base, clear_color + 8), BeFloat(base, clear_color + 12));
+    }
+    s.commands->clearColor(0, value);
+  }
+  if (flags & 0x200) s.commands->clearDepthStencil(true, true, std::clamp(z, 0.0f, 1.0f), 0);
+}
+
+void Renderer::Present(uint32_t frontbuffer, const uint8_t* base) {
   State& s = *state_;
   std::lock_guard<std::mutex> lock(s.mutex);
   s.BeginFrame();
   s.UploadDefaults();
+  // Swap shows a texture: the last resolve into it when there was one, else
+  // whatever the target holds.
+  plume::RenderTexture* source = s.color.get();
+  plume::RenderTextureLayout source_layout = plume::RenderTextureLayout::COLOR_WRITE;
+  if (frontbuffer != 0) {
+    uint32_t words[6];
+    for (uint32_t w = 0; w < 6; ++w) words[w] = Be32(base, frontbuffer + 28 + 4 * w);
+    auto found = s.textures.find(ImageKey(words));
+    if (found != s.textures.end() && found->second.resolved && found->second.width == s.width &&
+        found->second.height == s.height) {
+      source = found->second.texture.get();
+      source_layout = plume::RenderTextureLayout::SHADER_READ;
+    }
+  }
   uint32_t image = 0;
   const bool resize = s.swap_chain->needsResize();
   const bool acquired = !resize && !s.swap_chain->isEmpty() &&
@@ -925,12 +1419,14 @@ void Renderer::Present() {
   plume::RenderTexture* target = acquired ? s.swap_chain->getTexture(image) : nullptr;
   if (target) {
     plume::RenderTextureBarrier to_copy[] = {
-        plume::RenderTextureBarrier(s.color.get(), plume::RenderTextureLayout::COPY_SOURCE),
+        plume::RenderTextureBarrier(source, plume::RenderTextureLayout::COPY_SOURCE),
         plume::RenderTextureBarrier(target, plume::RenderTextureLayout::COPY_DEST)};
     s.commands->barriers(plume::RenderBarrierStage::COPY, to_copy, 2);
-    s.commands->copyTexture(target, s.color.get());
-    s.commands->barriers(plume::RenderBarrierStage::NONE,
-                         plume::RenderTextureBarrier(target, plume::RenderTextureLayout::PRESENT));
+    s.commands->copyTexture(target, source);
+    plume::RenderTextureBarrier after[] = {
+        plume::RenderTextureBarrier(target, plume::RenderTextureLayout::PRESENT),
+        plume::RenderTextureBarrier(source, source_layout)};
+    s.commands->barriers(plume::RenderBarrierStage::NONE, after, 2);
   }
   s.commands->end();
   s.recording = false;
@@ -943,7 +1439,18 @@ void Renderer::Present() {
   } else {
     s.queue->executeCommandLists(&list, 1, nullptr, 0, nullptr, 0, s.fence.get());
   }
+  const auto t_submit = std::chrono::steady_clock::now();
   s.queue->waitForCommandFence(s.fence.get());
+  s.ms_submit += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_submit).count();
+  if (s.Dumping()) {
+    const std::string path = fmt::format("logs/native-frame-{}.txt", s.presents + 1);
+    if (FILE* f = std::fopen(path.c_str(), "w")) {
+      std::fputs(s.dump.c_str(), f);
+      std::fprintf(f, "present frontbuffer=%08X target=%ux%u\n", frontbuffer, s.width, s.height);
+      std::fclose(f);
+    }
+    s.dump.clear();
+  }
   ++s.presents;
   if (resize) {
     if (s.swap_chain->resize()) {
@@ -958,10 +1465,24 @@ void Renderer::Present() {
 std::string Renderer::TakeStats() {
   State& s = *state_;
   std::lock_guard<std::mutex> lock(s.mutex);
-  std::string out = fmt::format("drawn={} pipelines={} shaders={} textures={} samplers={}", s.drawn,
-                                s.pipelines.size(), s.shaders.size(), s.textures.size(), s.samplers.size());
+  std::string out = fmt::format(
+      "drawn={} clears={} resolves={} reuploads={} pipelines={} shaders={} textures={} samplers={} ms pipeline={:.0f} texture={:.0f} "
+      "stream={:.0f} gpu_wait={:.0f} viewport={}",
+      s.drawn, s.clears, s.resolves, s.reuploads, s.pipelines.size(), s.shaders.size(), s.textures.size(), s.samplers.size(),
+      s.ms_pipeline, s.ms_texture, s.ms_stream, s.ms_submit, s.last_viewport);
+  s.ms_pipeline = s.ms_texture = s.ms_stream = s.ms_submit = 0;
   for (const auto& [reason, count] : s.skipped) out += fmt::format(" | {}: {}", reason, count);
+  if (!s.last_bounds.empty()) out += " | last bounds: " + s.last_bounds;
+  std::vector<std::pair<uint64_t, std::string>> top;
+  for (const auto& [k, n] : s.viewports) top.emplace_back(n, k);
+  std::sort(top.rbegin(), top.rend());
+  for (size_t i = 0; i < std::min<size_t>(top.size(), 6); ++i) out += fmt::format(" || {} x{}", top[i].second, top[i].first);
+  s.viewports.clear();
+  s.last_bounds.clear();
   s.drawn = 0;
+  s.clears = 0;
+  s.resolves = 0;
+  s.reuploads = 0;
   s.skipped.clear();
   return out;
 }

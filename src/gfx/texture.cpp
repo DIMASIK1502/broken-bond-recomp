@@ -455,4 +455,78 @@ bool LoadGuestTextureRgba8(uint32_t format, uint32_t width, uint32_t height, uin
   return true;
 }
 
+namespace {
+
+uint32_t Log2Bytes(uint32_t bytes) {
+  uint32_t log2 = 0;
+  while ((1u << (log2 + 1)) <= bytes) ++log2;
+  return log2;
+}
+
+}  // namespace
+
+uint32_t GuestTextureBytesAny(uint32_t format, uint32_t width, uint32_t height, uint32_t pitch,
+                              bool tiled) {
+  const rex::graphics::FormatInfo* info = rex::graphics::FormatInfo::Get(format);
+  if (info == nullptr || info->bytes_per_block() == 0 || width == 0 || height == 0 ||
+      pitch < width || (pitch % info->block_width) != 0) {
+    return 0;
+  }
+  const uint32_t block_bytes = info->bytes_per_block();
+  const uint32_t pitch_blocks = pitch / info->block_width;
+  const uint32_t x_blocks = (width + info->block_width - 1u) / info->block_width;
+  const uint32_t y_blocks = (height + info->block_height - 1u) / info->block_height;
+  uint64_t bytes = 0;
+  if (!tiled) {
+    bytes = uint64_t(pitch_blocks) * y_blocks * block_bytes;
+  } else {
+    bytes = uint64_t(rex::graphics::texture_util::GetTiledAddressUpperBound2D(
+                x_blocks, y_blocks, pitch_blocks, Log2Bytes(block_bytes))) +
+            block_bytes;
+  }
+  return bytes > 0xFFFFFFFFull ? 0u : static_cast<uint32_t>(bytes);
+}
+
+bool LoadGuestTextureLinear(uint32_t format, uint32_t width, uint32_t height, uint32_t pitch,
+                            uint32_t endian, bool tiled, const uint8_t* guest, size_t guest_bytes,
+                            LinearTexture& out, std::string& reason) {
+  const rex::graphics::FormatInfo* info = rex::graphics::FormatInfo::Get(format);
+  if (info == nullptr || info->bytes_per_block() == 0 || guest == nullptr || endian > 3u) {
+    reason = "texture format has no layout";
+    return false;
+  }
+  const uint32_t need = GuestTextureBytesAny(format, width, height, pitch, tiled);
+  if (need == 0 || guest_bytes < need) {
+    reason = "texture is shorter than its base level";
+    return false;
+  }
+  out.block_width = info->block_width;
+  out.block_height = info->block_height;
+  out.block_bytes = info->bytes_per_block();
+  out.width_blocks = (width + info->block_width - 1u) / info->block_width;
+  out.height_blocks = (height + info->block_height - 1u) / info->block_height;
+  const uint32_t pitch_blocks = pitch / info->block_width;
+  const size_t row = size_t(out.width_blocks) * out.block_bytes;
+  out.blocks.assign(row * out.height_blocks, 0);
+  if (!tiled) {
+    for (uint32_t by = 0; by < out.height_blocks; ++by) {
+      std::memcpy(out.blocks.data() + by * row, guest + size_t(by) * pitch_blocks * out.block_bytes, row);
+    }
+  } else {
+    rex::graphics::texture_conversion::UntileInfo untile{};
+    untile.width = out.width_blocks;
+    untile.height = out.height_blocks;
+    untile.input_pitch = pitch_blocks;
+    untile.output_pitch = out.width_blocks;
+    untile.input_format_info = info;
+    untile.output_format_info = info;
+    untile.copy_callback = [](void* output, const void* input, size_t length) {
+      std::memcpy(output, input, length);
+    };
+    rex::graphics::texture_conversion::Untile(out.blocks.data(), guest, &untile);
+  }
+  SwapBlock(out.blocks.data(), uint32_t(out.blocks.size()), endian);
+  return true;
+}
+
 }  // namespace broken_bond::gfx
