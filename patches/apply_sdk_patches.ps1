@@ -4,7 +4,15 @@ param(
 
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $sdkPath = Join-Path $projectRoot $SdkDir
-$patchFile = Join-Path $PSScriptRoot "sdk\rexglue-sdk-v0.10.0.patch"
+
+# Applied in this order; later patches assume the earlier ones.
+# Optional ones were written against an earlier SDK revision than the v0.10.0
+# tag and do not apply to it yet: they are reported and skipped.
+$patches = @(
+    @{ File = "guest-counters-and-file-open-hook.patch"; Optional = $false },
+    @{ File = "rexglue-sdk-v0.10.0.patch"; Optional = $true },
+    @{ File = "xma-past-buffer.patch"; Optional = $true }
+)
 
 if (-not (Test-Path $sdkPath)) {
     Write-Error "SDK directory not found: $sdkPath"
@@ -12,37 +20,37 @@ if (-not (Test-Path $sdkPath)) {
     exit 1
 }
 
-if (-not (Test-Path $patchFile)) {
-    Write-Error "Patch file not found: $patchFile"
-    exit 1
-}
-
 Write-Host "Applying SDK patches to $sdkPath ..."
 Push-Location $sdkPath
+$failed = $false
 try {
-    git apply --reverse --check $patchFile 2>&1 | Out-Null
-    if ($LASTEXITCODE -eq 0) {
-        Write-Host "SDK patches already applied."
-        exit 0
-    }
-
-    git apply --check $patchFile 2>&1 | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "Attempting to apply with --3way..."
-        $applyResult = git apply --3way $patchFile 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            Write-Error "Failed to apply SDK patches: $applyResult"
-            exit 1
+    foreach ($patch in $patches) {
+        $patchFile = Join-Path $PSScriptRoot "sdk\$($patch.File)"
+        if (-not (Test-Path $patchFile)) {
+            Write-Error "Patch file not found: $patchFile"
+            $failed = $true
+            continue
         }
-    } else {
+        git apply --reverse --check $patchFile 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "  already applied: $($patch.File)"
+            continue
+        }
         $applyResult = git apply $patchFile 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            Write-Error "Failed to apply SDK patches: $applyResult"
-            exit 1
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "  applied: $($patch.File)"
+        } elseif ($patch.Optional) {
+            Write-Warning "  skipped (does not apply to this SDK revision): $($patch.File)"
+        } else {
+            Write-Error "  failed: $($patch.File): $applyResult"
+            $failed = $true
         }
     }
-    Write-Host "SDK patches applied successfully."
 }
 finally {
     Pop-Location
 }
+if ($failed) { exit 1 }
+Write-Host "SDK patches done."
+# A skipped optional patch leaves git's exit code behind; setup.ps1 reads it.
+exit 0

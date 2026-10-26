@@ -10,6 +10,7 @@
 #include <rex/cvar.h>
 #include <rex/hook.h>
 #include <rex/logging.h>
+#include <rex/system/xmemory.h>
 
 #include "generated/default/broken_bond_init.h"
 
@@ -20,7 +21,8 @@ REXCVAR_DEFINE_BOOL(d3d_census, false, "Game",
 // Every function in 8219C358..821B4060 that code outside 82190000..821C7FFF
 // calls (tools/ppc_xref.py entries), plus the draw, shader-load and flush
 // helpers named in PORTING_LOG.md. 821B1DD0, 821AE158, 821AE5D0 and 821AE9C0
-// are hooked in guest_present.cpp and report from there.
+// are hooked in guest_present.cpp, 821A5C98 and 821A59B0 in shadow_draw.cpp;
+// they report from there.
 #define BROKEN_BOND_CENSUS_HOOKS(X)                                           \
   X(8219C358) X(8219C468) X(8219C588) X(8219C6A8) X(8219CA18) X(8219CAB0) \
   X(8219CB50) X(8219D070) X(8219D270) X(8219D6E0) X(8219D8F8) X(8219DE88) \
@@ -33,8 +35,8 @@ REXCVAR_DEFINE_BOOL(d3d_census, false, "Game",
   X(821A1D80) X(821A2358) X(821A2A80) X(821A2E00) X(821A3590) X(821A3C10) \
   X(821A3DB8) X(821A4730) X(821A47B0) X(821A48D0) X(821A4958) X(821A49E8) \
   X(821A4D30) X(821A5008) X(821A5630) X(821A5710) X(821A57F0) X(821A5850) \
-  X(821A58B0) X(821A5908) X(821A5960) X(821A59B0) X(821A59E8) X(821A5AD8) \
-  X(821A5C98) X(821A5D90) X(821A5E80) X(821A6050) X(821A6158) X(821A62C8) \
+  X(821A58B0) X(821A5908) X(821A5960) X(821A59E8) X(821A5AD8) \
+  X(821A5D90) X(821A5E80) X(821A6050) X(821A6158) X(821A62C8) \
   X(821A62D0) X(821A9F20) X(821A9FD8) X(821A9FE0) X(821AA000) X(821AA018) \
   X(821AA038) X(821AA060) X(821AA0D8) X(821AA158) X(821AA1D8) X(821AA270) \
   X(821AA2C8) X(821AA360) X(821AA3C0) X(821AA418) X(821AA478) X(821AA490) \
@@ -49,7 +51,8 @@ REXCVAR_DEFINE_BOOL(d3d_census, false, "Game",
 namespace broken_bond::host {
 namespace {
 
-constexpr uint32_t kReportedElsewhere[] = {0x821AE158, 0x821AE5D0, 0x821AE9C0, 0x821B1DD0};
+constexpr uint32_t kReportedElsewhere[] = {0x821A59B0, 0x821A5C98, 0x821AE158,
+                                           0x821AE5D0, 0x821AE9C0, 0x821B1DD0};
 
 #define BROKEN_BOND_CENSUS_ADDRESS(addr) 0x##addr,
 constexpr uint32_t kHooked[] = {BROKEN_BOND_CENSUS_HOOKS(BROKEN_BOND_CENSUS_ADDRESS)};
@@ -98,7 +101,7 @@ constexpr uint32_t kSamplerStateTable = 0x82CD62C0;
 constexpr uint32_t kSamplerStateCount = 20;
 
 uint32_t LoadBe32(const uint8_t* base, uint32_t address) {
-  const uint8_t* p = base + address;
+  const uint8_t* p = rex::memory::GuestPtr<const uint8_t*>(const_cast<uint8_t*>(base), address);
   return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | p[3];
 }
 

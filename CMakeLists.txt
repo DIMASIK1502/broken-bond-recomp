@@ -19,6 +19,7 @@ set(BROKENBOND_SOURCES
     src/host/d3d_census.cpp
     src/host/device_repack.cpp
     src/host/guest_present.cpp
+    src/host/shadow_draw.cpp
 )
 
 if(WIN32)
@@ -34,6 +35,11 @@ rexglue_setup_target(broken_bond GPU_PLUGINS xenos)
 if(TARGET imgui)
     target_include_directories(broken_bond PRIVATE
         $<TARGET_PROPERTY:imgui,INTERFACE_INCLUDE_DIRECTORIES>)
+endif()
+# shadow_draw.cpp inlines xxHash (XXH_INLINE_ALL) and needs only its header.
+if(TARGET xxHash::xxhash)
+    target_include_directories(broken_bond PRIVATE
+        $<TARGET_PROPERTY:xxHash::xxhash,INTERFACE_INCLUDE_DIRECTORIES>)
 endif()
 
 # Reads game/xeshader.sdb. Not part of the game link and writes no cache.
@@ -221,6 +227,10 @@ if(EXISTS "${BROKEN_BOND_PLUME_DIR}/CMakeLists.txt" AND
 
     add_executable(render_probe EXCLUDE_FROM_ALL tools/render_probe.cpp)
     target_link_libraries(render_probe PRIVATE plume broken_bond_shader_cache)
+
+    # The shadow recorder checks each draw's shaders against the cache keys.
+    target_link_libraries(broken_bond PRIVATE broken_bond_shader_cache)
+    target_compile_definitions(broken_bond PRIVATE BROKEN_BOND_HAS_SHADER_CACHE)
 endif()
 
 if(TARGET broken_bond_gfx AND TARGET shader_db)
