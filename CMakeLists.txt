@@ -28,7 +28,38 @@ else()
     add_executable(broken_bond ${BROKENBOND_SOURCES})
 endif()
 
-rexglue_setup_target(broken_bond GPU_PLUGINS xenos)
+# rexgpu-host (--gpu_plugin=host): the SDK's PM4 command processor with a
+# backend that draws nothing, so the game's fences and interrupts keep running
+# while the native renderer draws. Built from the SDK source tree only.
+set(BROKEN_BOND_GPU_PLUGINS xenos)
+if(REXSDK_DIR AND EXISTS "${REXSDK_DIR}/src/graphics/command_processor.cpp")
+    set(_rex_graphics "${REXSDK_DIR}/src/graphics")
+    add_library(rexgpu-host SHARED
+        src/render/host_gpu_plugin.cpp
+        "${_rex_graphics}/flags.cpp"
+        "${_rex_graphics}/register_file.cpp"
+        "${_rex_graphics}/registers.cpp"
+        "${_rex_graphics}/pipeline/shader/shader.cpp"
+        "${_rex_graphics}/format/ucode.cpp"
+        "${_rex_graphics}/sampler_info.cpp"
+        "${_rex_graphics}/graphics_system.cpp"
+        "${_rex_graphics}/command_processor.cpp"
+        "${_rex_graphics}/util/draw_extent_estimator.cpp"
+        "${_rex_graphics}/util/draw.cpp"
+        "${_rex_graphics}/packet_disassembler.cpp"
+        "${_rex_graphics}/pipeline/shader/interpreter.cpp")
+    set_target_properties(rexgpu-host PROPERTIES
+        CXX_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN ON
+        DEBUG_POSTFIX "d"
+        RELWITHDEBINFO_POSTFIX "rd")
+    target_include_directories(rexgpu-host PRIVATE "${REXSDK_DIR}/thirdparty/renderdoc")
+    target_compile_options(rexgpu-host PRIVATE -Wno-unused-variable)
+    target_link_libraries(rexgpu-host PRIVATE rexruntime xxHash::xxhash)
+    list(APPEND BROKEN_BOND_GPU_PLUGINS host)
+endif()
+
+rexglue_setup_target(broken_bond GPU_PLUGINS ${BROKEN_BOND_GPU_PLUGINS})
 
 # An SDK built from source links imgui privately into rexruntime, but the
 # rex/ui headers the app includes still name imgui.h.
