@@ -17,6 +17,7 @@
 #include "broken_bond_app.h"
 #include "gfx/device.h"
 #include "gfx/host_draw.h"
+#include "host/d3d_census.h"
 #include "host/device_repack.h"
 
 REXCVAR_DEFINE_BOOL(dump_device_draw, false, "Game",
@@ -106,6 +107,7 @@ void SampleLoop() {
     REXLOG_INFO(
         "guest swap callers 5s: 821610F0={} 821B2578={} 821A15B0={} 821B8740={} other={} other_lr={:08X}",
         c610, c2578, cA15, c8740, c_other, other_lr);
+    broken_bond::host::CensusLog();
     n60 = n30 = n24 = n_other = 0;
   }
 }
@@ -568,12 +570,16 @@ REX_HOOK_RAW(sub_821B1DD0) {
     g_host_learn = 1;
     g_host->RestartRetainedFrame();
   }
+  const int census = broken_bond::host::CensusEnter(0x821B1DD0, ctx, base);
   __imp__sub_821B1DD0(ctx, base);
+  broken_bond::host::CensusReturn(census, ctx);
 }
 
 REX_HOOK_RAW(sub_821AE158) {
   MaybeDumpDeviceDraw(static_cast<uint32_t>(ctx.r3.u32), base);
+  const int census = broken_bond::host::CensusEnter(0x821AE158, ctx, base);
   __imp__sub_821AE158(ctx, base);
+  broken_bond::host::CensusReturn(census, ctx);
 }
 
 REX_HOOK_RAW(sub_821AE5D0) {
@@ -581,7 +587,9 @@ REX_HOOK_RAW(sub_821AE5D0) {
                 static_cast<uint32_t>(ctx.r5.u32), static_cast<uint32_t>(ctx.r6.u32), base);
   MaybeHostAuto(static_cast<uint32_t>(ctx.r3.u32), static_cast<uint32_t>(ctx.r4.u32),
                 static_cast<uint32_t>(ctx.r5.u32), static_cast<uint32_t>(ctx.r6.u32), base);
+  const int census = broken_bond::host::CensusEnter(0x821AE5D0, ctx, base);
   __imp__sub_821AE5D0(ctx, base);
+  broken_bond::host::CensusReturn(census, ctx);
 }
 
 REX_HOOK_RAW(sub_821AE9C0) {
@@ -591,7 +599,9 @@ REX_HOOK_RAW(sub_821AE9C0) {
   MaybeHostIndexed(static_cast<uint32_t>(ctx.r3.u32), static_cast<uint32_t>(ctx.r4.u32),
                    static_cast<uint32_t>(ctx.r5.u32), static_cast<uint32_t>(ctx.r6.u32),
                    static_cast<uint32_t>(ctx.r7.u32), base);
+  const int census = broken_bond::host::CensusEnter(0x821AE9C0, ctx, base);
   __imp__sub_821AE9C0(ctx, base);
+  broken_bond::host::CensusReturn(census, ctx);
 }
 
 void BrokenBondApp::OnPostLaunchModule(rex::system::XThread*) {

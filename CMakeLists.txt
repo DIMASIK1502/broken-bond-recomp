@@ -16,6 +16,7 @@ set(BROKENBOND_SOURCES
     src/broken_bond_app.cpp
     src/compat/xusbcam.cpp
     src/host/boot_flags.cpp
+    src/host/d3d_census.cpp
     src/host/device_repack.cpp
     src/host/guest_present.cpp
 )

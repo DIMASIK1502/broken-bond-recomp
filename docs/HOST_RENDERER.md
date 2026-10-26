@@ -19,7 +19,8 @@ GPL-3.0 — не открываем и не переносим (см. `DEBT_FURT
 
 1. Зависимости и кэш шейдеров. **Готово**, ниже.
 2. Карта D3D в BB: Create* / Set* / Draw* / Resolve / Swap, адреса и что
-   каждая пишет в device.
+   каждая пишет в device. **Готово для бута и титула**:
+   [`D3D_MAP.md`](D3D_MAP.md), [`D3D_STATES.md`](D3D_STATES.md).
 3. Теневой режим: хуки пишут вызовы, рисует Xenos. Сверка draw и текстур.
 4. Заставка на своём рендере через Plume Vulkan, свой swapchain, без xenos.
 5. Меню, бой, сюжет: render target'ы, resolve, occlusion queries, катсцены.
