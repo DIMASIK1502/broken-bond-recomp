@@ -1,0 +1,108 @@
+diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
+index 698a418..dda47e2 100644
+--- a/XenosRecomp/shader_recompiler.cpp
++++ b/XenosRecomp/shader_recompiler.cpp
+@@ -74,7 +74,9 @@ struct DeclUsageLocation
+     uint32_t location;
+ };
+ 
+-// NOTE: These are specialized Vulkan locations for Unleashed Recompiled. Change as necessary. Likely not going to work with other games.
++// Vulkan locations for Naruto: The Broken Bond. The host renderer binds vertex
++// elements by the same table (kVertexLocations in xenos_shader_common.h).
++// BB's 4648 vertex shaders use only these 16 semantics.
+ static constexpr DeclUsageLocation USAGE_LOCATIONS[] =
+ {
+     { DeclUsage::Position, 0, 0 },
+@@ -85,14 +87,13 @@ static constexpr DeclUsageLocation USAGE_LOCATIONS[] =
+     { DeclUsage::TexCoord, 1, 5 },
+     { DeclUsage::TexCoord, 2, 6 },
+     { DeclUsage::TexCoord, 3, 7 },
+-    { DeclUsage::Color, 0, 8 },
+-    { DeclUsage::BlendIndices, 0, 9 },
+-    { DeclUsage::BlendWeight, 0, 10 },
+-    { DeclUsage::Color, 1, 11 },
+-    { DeclUsage::TexCoord, 4, 12 },
+-    { DeclUsage::TexCoord, 5, 13 },
+-    { DeclUsage::TexCoord, 6, 14 },
+-    { DeclUsage::TexCoord, 7, 15 },
++    { DeclUsage::TexCoord, 4, 8 },
++    { DeclUsage::Color, 0, 9 },
++    { DeclUsage::Color, 1, 10 },
++    { DeclUsage::Color, 2, 11 },
++    { DeclUsage::Color, 3, 12 },
++    { DeclUsage::BlendIndices, 0, 13 },
++    { DeclUsage::BlendWeight, 0, 14 },
+     { DeclUsage::Position, 1, 15 },
+ };
+ 
+@@ -118,13 +119,6 @@ static constexpr std::pair<DeclUsage, size_t> INTERPOLATORS[] =
+     { DeclUsage::Color, 1 }
+ };
+ 
+-static constexpr std::string_view TEXTURE_DIMENSIONS[] = 
+-{
+-    "2D",
+-    "3D", 
+-    "Cube" 
+-};
+-
+ static FetchDestinationSwizzle getDestSwizzle(uint32_t dstSwizzle, uint32_t index)
+ {
+     return FetchDestinationSwizzle((dstSwizzle >> (index * 3)) & 0x7);
+@@ -331,7 +325,10 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
+         out += "Bicubic";
+ #endif
+ 
+-    print("({0}_Texture{1}DescriptorIndex, {0}_SamplerDescriptorIndex, ", constNamePtr, dimension);
++    // Descriptor indices are kept per fetch constant slot: the host fills them
++    // from the guest's 32 texture fetch constants, so a sampler the constant
++    // table does not name still resolves.
++    print("(TEXTURE{1}_INDEX({0}), SAMPLER_INDEX({0}), ", instr.constIndex, dimension);
+     printSrcRegister(componentCount);
+ 
+     switch (instr.dimension)
+@@ -1171,15 +1168,6 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+ 
+         case RegisterSet::Sampler:
+         {
+-            for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
+-            {
+-                println("#define {}_Texture{}DescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})",
+-                    constantName, TEXTURE_DIMENSIONS[j], j * 64 + constantInfo->registerIndex * 4);
+-            }
+-
+-            println("#define {}_SamplerDescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})",
+-                constantName, std::size(TEXTURE_DIMENSIONS) * 64 + constantInfo->registerIndex * 4);
+-
+             samplers.emplace(constantInfo->registerIndex, constantName);
+             break;
+         }
+@@ -1220,27 +1208,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+ 
+     out += "cbuffer SharedConstants : register(b2, space4)\n";
+     out += "{\n";
+-
+-    for (uint32_t i = 0; i < constantTableContainer->constantTable.constants; i++)
+-    {
+-        const auto constantInfo = reinterpret_cast<const ConstantInfo*>(
+-            constantTableData + constantTableContainer->constantTable.constantInfo + i * sizeof(ConstantInfo));
+-
+-        if (constantInfo->registerSet == RegisterSet::Sampler)
+-        {
+-            const char* constantName = reinterpret_cast<const char*>(constantTableData + constantInfo->name);
+-
+-            for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
+-            {
+-                println("\tuint {}_Texture{}DescriptorIndex : packoffset(c{}.{});",
+-                    constantName, TEXTURE_DIMENSIONS[j], j * 4 + constantInfo->registerIndex / 4, SWIZZLES[constantInfo->registerIndex % 4]);
+-            }
+-
+-            println("\tuint {}_SamplerDescriptorIndex : packoffset(c{}.{});",
+-                constantName, 4 * std::size(TEXTURE_DIMENSIONS) + constantInfo->registerIndex / 4, SWIZZLES[constantInfo->registerIndex % 4]);
+-        }
+-    }
+-
++    out += "\tDEFINE_DESCRIPTOR_INDICES();\n";
+     out += "\tDEFINE_SHARED_CONSTANTS();\n";
+     out += "};\n\n";
+ 

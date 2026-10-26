@@ -154,6 +154,74 @@ if(DEFINED BROKEN_BOND_TRANSLATOR_SOURCES AND NOT TARGET broken_bond_gfx AND TAR
     target_sources(shader_db PRIVATE ${BROKEN_BOND_TRANSLATOR_SOURCES})
 endif()
 
+# Native renderer foundations: Plume (MIT) for Vulkan / D3D12 and a shader
+# cache XenosRecomp (MIT, patched by patches/xenosrecomp) builds from this
+# dump's xeshader.sdb. setup.ps1 clones both at pinned commits. The cache is
+# derived from game files, so it lives in the build tree only.
+set(BROKEN_BOND_PLUME_DIR "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/plume")
+set(BROKEN_BOND_XENOSRECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/xenosrecomp")
+set(BROKEN_BOND_SHADER_DB "${CMAKE_CURRENT_SOURCE_DIR}/game/xeshader.sdb")
+if(EXISTS "${BROKEN_BOND_PLUME_DIR}/CMakeLists.txt" AND
+   EXISTS "${BROKEN_BOND_XENOSRECOMP_DIR}/CMakeLists.txt" AND
+   EXISTS "${BROKEN_BOND_SHADER_DB}" AND TARGET shader_db)
+    add_subdirectory("${BROKEN_BOND_PLUME_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/plume" EXCLUDE_FROM_ALL)
+
+    set(ZSTD_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
+    set(ZSTD_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(ZSTD_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+    set(ZSTD_LEGACY_SUPPORT OFF CACHE BOOL "" FORCE)
+    add_subdirectory("${BROKEN_BOND_XENOSRECOMP_DIR}/thirdparty/zstd/build/cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/zstd" EXCLUDE_FROM_ALL)
+
+    # XenosRecomp is a host tool with its own fmt and xxHash, so it builds in
+    # its own tree instead of next to the SDK's copies.
+    include(ExternalProject)
+    set(BROKEN_BOND_XENOSRECOMP_EXE
+        "${CMAKE_CURRENT_BINARY_DIR}/xenosrecomp/XenosRecomp/XenosRecomp${CMAKE_EXECUTABLE_SUFFIX}")
+    ExternalProject_Add(xenosrecomp_tool
+        SOURCE_DIR "${BROKEN_BOND_XENOSRECOMP_DIR}"
+        BINARY_DIR "${CMAKE_CURRENT_BINARY_DIR}/xenosrecomp"
+        CMAKE_ARGS
+            -G Ninja
+            -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
+            -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
+            -DCMAKE_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+        INSTALL_COMMAND ""
+        BUILD_BYPRODUCTS "${BROKEN_BOND_XENOSRECOMP_EXE}"
+        EXCLUDE_FROM_ALL ON)
+
+    set(BROKEN_BOND_SHADER_DIR "${CMAKE_CURRENT_BINARY_DIR}/shaders")
+    set(BROKEN_BOND_SHADER_CACHE "${BROKEN_BOND_SHADER_DIR}/shader_cache.cpp")
+    add_custom_command(
+        OUTPUT "${BROKEN_BOND_SHADER_CACHE}"
+        COMMAND "$<TARGET_FILE:shader_db>" "${BROKEN_BOND_SHADER_DB}" extract
+            "${BROKEN_BOND_SHADER_DIR}/containers"
+        COMMAND "${BROKEN_BOND_XENOSRECOMP_EXE}" "${BROKEN_BOND_SHADER_DIR}/containers"
+            "${BROKEN_BOND_SHADER_CACHE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/gfx/xenos_shader_common.h"
+        DEPENDS shader_db xenosrecomp_tool "${BROKEN_BOND_SHADER_DB}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/gfx/xenos_shader_common.h"
+        COMMENT "Translating xeshader.sdb with XenosRecomp"
+        VERBATIM)
+
+    add_library(broken_bond_shader_cache STATIC
+        "${BROKEN_BOND_SHADER_CACHE}"
+        "${BROKEN_BOND_XENOSRECOMP_DIR}/thirdparty/smol-v/source/smolv.cpp")
+    target_include_directories(broken_bond_shader_cache
+        PUBLIC
+            "${CMAKE_CURRENT_SOURCE_DIR}/src"
+            "${BROKEN_BOND_XENOSRECOMP_DIR}/thirdparty/smol-v/source"
+        PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/gfx")
+    target_link_libraries(broken_bond_shader_cache PUBLIC libzstd_static)
+    target_include_directories(broken_bond_shader_cache PUBLIC
+        "${BROKEN_BOND_XENOSRECOMP_DIR}/thirdparty/zstd/lib")
+
+    add_executable(render_probe EXCLUDE_FROM_ALL tools/render_probe.cpp)
+    target_link_libraries(render_probe PRIVATE plume broken_bond_shader_cache)
+endif()
+
 if(TARGET broken_bond_gfx AND TARGET shader_db)
     target_link_libraries(shader_db PRIVATE broken_bond_gfx)
     target_compile_definitions(shader_db PRIVATE BROKEN_BOND_HOST_GFX)

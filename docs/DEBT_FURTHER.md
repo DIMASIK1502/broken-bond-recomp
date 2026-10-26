@@ -64,6 +64,10 @@ Rise лежит только в `.references/naruto-rise-recomp` (GPL-3.0). От
 
 ### F3. Свой backend
 
+Новый путь — перехват D3D игры + Plume + XenosRecomp, план и фазы в
+[`HOST_RENDERER.md`](HOST_RENDERER.md). Ниже — прежний путь через тень
+device и пакеты PM4; он остаётся как отладочная сверка.
+
 - Один Vulkan путь в `src/gfx/`, без Plume из Rise. Библиотека
   `broken_bond` линкует `broken_bond_gfx`. Дефолт остаётся Xenos, present
   остаётся на Xenos. `renderer=host` открывает Vulkan-устройство и рисует

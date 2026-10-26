@@ -23,6 +23,7 @@
 //   memory. Nothing is written.
 
 #include <cstdint>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <iterator>
@@ -2926,6 +2927,54 @@ void CheckTiling3D(TileResult& result) {
 }
 #endif
 
+// Writes shader record i as <dir>/<i>.vs or .ps, the inflated object as is.
+int Extract(const char* path, const char* dir) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in) {
+    Fail(std::string("cannot open ") + path);
+  }
+  std::vector<uint8_t> file(std::istreambuf_iterator<char>(in), {});
+  if (file.size() < 24 || ReadBe32(file.data()) != 0x33424453u ||
+      ReadBe32(file.data() + 4) != 0x00040001u) {
+    Fail("not a 3BDS 4.1 shader database");
+  }
+  const uint32_t shader_count = ReadBe32(file.data() + 12);
+  const uint32_t shader_offset = ReadBe32(file.data() + 20);
+  constexpr size_t kPreamble = 32;
+  constexpr size_t kRecord = 44;
+  if (shader_offset + kPreamble + size_t(shader_count) * kRecord > file.size()) {
+    Fail("shader table runs past the file");
+  }
+  std::filesystem::create_directories(dir);
+  uint32_t vertex = 0;
+  uint32_t pixel = 0;
+  for (uint32_t i = 0; i < shader_count; ++i) {
+    const uint8_t* record = file.data() + shader_offset + kPreamble + size_t(i) * kRecord;
+    const uint32_t offset = ReadBe32(record);
+    const uint32_t compressed = ReadBe32(record + 4);
+    const uint32_t raw_size = ReadBe32(record + 8);
+    if (size_t(offset) + compressed > file.size()) {
+      Fail("shader payload is outside the file");
+    }
+    const std::vector<uint8_t> object = InflateZlib(file.data() + offset, compressed, raw_size);
+    const uint32_t magic = object.size() >= 4 ? ReadBe32(object.data()) : 0;
+    if (magic != 0x102A1101u && magic != 0x102A1100u) {
+      Fail("shader " + std::to_string(i) + " is not a 0x102A110x container");
+    }
+    const bool is_vertex = magic == 0x102A1101u;
+    (is_vertex ? vertex : pixel)++;
+    const std::filesystem::path out =
+        std::filesystem::path(dir) / (std::to_string(i) + (is_vertex ? ".vs" : ".ps"));
+    std::ofstream file_out(out, std::ios::binary);
+    file_out.write(reinterpret_cast<const char*>(object.data()), std::streamsize(object.size()));
+    if (!file_out) {
+      Fail("cannot write " + out.string());
+    }
+  }
+  std::cout << "extracted " << shader_count << " vs " << vertex << " ps " << pixel << "\n";
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -2941,6 +2990,9 @@ int main(int argc, char** argv) {
     int tiling_failed = 0;
     int guest_draw_failed = 0;
     int semantic_failed = 0;
+    if (argc == 4 && std::string(argv[2]) == "extract") {
+      return Extract(argv[1], argv[3]);
+    }
 #if defined(SHADER_DB_TRANSLATE)
     const TileResult tiling = CheckTiling();
     tiling_failed = (tiling.address_failed != 0 || tiling.duplicate != 0 ||
@@ -2971,7 +3023,7 @@ int main(int argc, char** argv) {
 #endif
     const bool boot_pair = argc == 3 && std::string(argv[2]) == "pair";
     if (argc != 2 && !boot_pair) {
-      std::cerr << "usage: shader_db <xeshader.sdb> [pair]\n";
+      std::cerr << "usage: shader_db <xeshader.sdb> [pair | extract <dir>]\n";
       return 2;
     }
     const char* path = argv[1];
