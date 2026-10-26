@@ -90,6 +90,12 @@ bool Enabled() {
   return enabled;
 }
 
+std::atomic<bool> g_keep_keys{false};
+
+bool KeysEnabled() {
+  return Enabled() || g_keep_keys.load(std::memory_order_relaxed);
+}
+
 struct DrawRecord {
   DrawKind kind;
   uint32_t prim = 0;
@@ -350,6 +356,15 @@ void ShadowSwap(uint8_t* base) {
   if (dump > 0 && present == static_cast<uint64_t>(dump)) WriteDump(frame, present);
 }
 
+void ShadowKeepShaderKeys() {
+  g_keep_keys.store(true, std::memory_order_relaxed);
+}
+
+uint64_t ShadowShaderKey(uint32_t object, const uint8_t* base) {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  return ShaderKey(base, object);
+}
+
 void ShadowLog() {
   if (!Enabled()) return;
   Window w;
@@ -403,7 +418,7 @@ REX_HOOK_RAW(sub_821A5C98) {
   const int census = broken_bond::host::CensusEnter(0x821A5C98, ctx, base);
   __imp__sub_821A5C98(ctx, base);
   broken_bond::host::CensusReturn(census, ctx);
-  if (broken_bond::host::Enabled()) broken_bond::host::NoteShaderCreated(object, base);
+  if (broken_bond::host::KeysEnabled()) broken_bond::host::NoteShaderCreated(object, base);
 }
 
 REX_HOOK_RAW(sub_821A59B0) {
@@ -411,5 +426,5 @@ REX_HOOK_RAW(sub_821A59B0) {
   const int census = broken_bond::host::CensusEnter(0x821A59B0, ctx, base);
   __imp__sub_821A59B0(ctx, base);
   broken_bond::host::CensusReturn(census, ctx);
-  if (broken_bond::host::Enabled()) broken_bond::host::NoteShaderCreated(object, base);
+  if (broken_bond::host::KeysEnabled()) broken_bond::host::NoteShaderCreated(object, base);
 }

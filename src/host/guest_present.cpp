@@ -118,6 +118,9 @@ void SampleLoop() {
         c610, c2578, cA15, c8740, c_other, other_lr);
     broken_bond::host::CensusLog();
     broken_bond::host::ShadowLog();
+#if defined(BROKEN_BOND_HAS_NATIVE_RENDERER)
+    if (g_native) REXLOG_INFO("native 5s: {}", g_native->TakeStats());
+#endif
     n60 = n30 = n24 = n_other = 0;
   }
 }
@@ -603,6 +606,16 @@ REX_HOOK_RAW(sub_821AE5D0) {
   MaybeHostAuto(static_cast<uint32_t>(ctx.r3.u32), static_cast<uint32_t>(ctx.r4.u32),
                 static_cast<uint32_t>(ctx.r5.u32), static_cast<uint32_t>(ctx.r6.u32), base);
   broken_bond::host::ShadowDraw(broken_bond::host::DrawKind::kAuto, ctx, base);
+#if defined(BROKEN_BOND_HAS_NATIVE_RENDERER)
+  if (g_native) {
+    broken_bond::render::GuestDraw draw;
+    draw.device = ctx.r3.u32;
+    draw.prim = ctx.r4.u32;
+    draw.start = ctx.r5.u32;
+    draw.count = ctx.r6.u32;
+    g_native->Draw(draw, base);
+  }
+#endif
   const int census = broken_bond::host::CensusEnter(0x821AE5D0, ctx, base);
   __imp__sub_821AE5D0(ctx, base);
   broken_bond::host::CensusReturn(census, ctx);
@@ -616,6 +629,18 @@ REX_HOOK_RAW(sub_821AE9C0) {
                    static_cast<uint32_t>(ctx.r5.u32), static_cast<uint32_t>(ctx.r6.u32),
                    static_cast<uint32_t>(ctx.r7.u32), base);
   broken_bond::host::ShadowDraw(broken_bond::host::DrawKind::kIndexed, ctx, base);
+#if defined(BROKEN_BOND_HAS_NATIVE_RENDERER)
+  if (g_native) {
+    broken_bond::render::GuestDraw draw;
+    draw.indexed = true;
+    draw.device = ctx.r3.u32;
+    draw.prim = ctx.r4.u32;
+    draw.base_vertex = ctx.r5.u32;
+    draw.start = ctx.r6.u32;
+    draw.count = ctx.r7.u32;
+    g_native->Draw(draw, base);
+  }
+#endif
   const int census = broken_bond::host::CensusEnter(0x821AE9C0, ctx, base);
   __imp__sub_821AE9C0(ctx, base);
   broken_bond::host::CensusReturn(census, ctx);

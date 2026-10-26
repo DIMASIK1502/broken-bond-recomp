@@ -25,4 +25,11 @@ void ShadowSwap(uint8_t* base);
 // Logs the last window's coverage. Called by the 5 s present sampler.
 void ShadowLog();
 
+// Keys shader objects from the first load on, as --shadow_draws does, without
+// the per-draw records. The native renderer calls it before the game starts.
+void ShadowKeepShaderKeys();
+
+// XenosRecomp cache key of a guest shader object, 0 when it is not a shader.
+uint64_t ShadowShaderKey(uint32_t object, const uint8_t* base);
+
 }  // namespace broken_bond::host
