@@ -262,6 +262,11 @@ if(EXISTS "${BROKEN_BOND_PLUME_DIR}/CMakeLists.txt" AND
     # The shadow recorder checks each draw's shaders against the cache keys.
     target_link_libraries(broken_bond PRIVATE broken_bond_shader_cache)
     target_compile_definitions(broken_bond PRIVATE BROKEN_BOND_HAS_SHADER_CACHE)
+
+    # Native renderer (--renderer=native with --gpu_plugin=host).
+    target_sources(broken_bond PRIVATE src/render/renderer.cpp)
+    target_link_libraries(broken_bond PRIVATE plume)
+    target_compile_definitions(broken_bond PRIVATE BROKEN_BOND_HAS_NATIVE_RENDERER)
 endif()
 
 if(TARGET broken_bond_gfx AND TARGET shader_db)

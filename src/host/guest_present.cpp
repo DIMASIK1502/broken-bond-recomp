@@ -12,6 +12,7 @@
 #include <rex/logging.h>
 #include <rex/perf/counter.h>
 #include <rex/system/xthread.h>
+#include <rex/ui/window.h>
 
 #include "generated/default/broken_bond_init.h"
 #include "broken_bond_app.h"
@@ -20,15 +21,22 @@
 #include "host/d3d_census.h"
 #include "host/device_repack.h"
 #include "host/shadow_draw.h"
+#if defined(BROKEN_BOND_HAS_NATIVE_RENDERER)
+#include "render/renderer.h"
+#endif
 
 REXCVAR_DEFINE_BOOL(dump_device_draw, false, "Game",
                     "Write up to eight textured triangle draws with different pixel shaders");
 REXCVAR_DEFINE_STRING(renderer, "xenos", "Game",
-                      "xenos presents the game. host draws into a retained Vulkan target and still presents through Xenos");
+                      "xenos presents the game. host draws into a retained Vulkan target and still presents "
+                      "through Xenos. native presents through the Plume renderer (with --gpu_plugin=host)");
 
 namespace {
 
 std::atomic<bool> g_stop{false};
+#if defined(BROKEN_BOND_HAS_NATIVE_RENDERER)
+std::unique_ptr<broken_bond::render::Renderer> g_native;
+#endif
 std::thread g_thread;
 
 const char* BucketName(int64_t dt_us) {
@@ -573,6 +581,9 @@ REX_HOOK_RAW(sub_821B1DD0) {
     g_host->RestartRetainedFrame();
   }
   broken_bond::host::ShadowSwap(base);
+#if defined(BROKEN_BOND_HAS_NATIVE_RENDERER)
+  if (g_native) g_native->Present();
+#endif
   const int census = broken_bond::host::CensusEnter(0x821B1DD0, ctx, base);
   __imp__sub_821B1DD0(ctx, base);
   broken_bond::host::CensusReturn(census, ctx);
@@ -611,6 +622,18 @@ REX_HOOK_RAW(sub_821AE9C0) {
 }
 
 void BrokenBondApp::OnPostLaunchModule(rex::system::XThread*) {
+#if defined(BROKEN_BOND_HAS_NATIVE_RENDERER)
+  if (REXCVAR_GET(renderer) == "native" && !g_native && window()) {
+    auto native = std::make_unique<broken_bond::render::Renderer>();
+    std::string reason;
+    if (native->Open(window()->GetNativeWindowHandle(), reason)) {
+      REXLOG_INFO("native renderer on {}", native->device_name());
+      g_native = std::move(native);
+    } else {
+      REXLOG_ERROR("native renderer did not open: {}", reason);
+    }
+  }
+#endif
   if (REXCVAR_GET(renderer) == "host" && !g_host) {
     g_host = std::make_unique<broken_bond::gfx::Device>();
     std::string reason;
