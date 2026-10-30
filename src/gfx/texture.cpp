@@ -529,4 +529,60 @@ bool LoadGuestTextureLinear(uint32_t format, uint32_t width, uint32_t height, ui
   return true;
 }
 
+namespace {
+
+// Block offset of a packed base level, false when the base level is not in
+// the packed mip tail.
+bool PackedBaseOffset(uint32_t format, uint32_t width, uint32_t height, bool packed_mips,
+                      uint32_t& x_blocks, uint32_t& y_blocks) {
+  uint32_t z_blocks = 0;
+  x_blocks = y_blocks = 0;
+  return packed_mips && rex::graphics::texture_util::GetPackedMipOffset(
+                            width, height, 1, static_cast<rex::graphics::xenos::TextureFormat>(format), 0,
+                            x_blocks, y_blocks, z_blocks);
+}
+
+}  // namespace
+
+uint32_t GuestTextureBaseBytes(uint32_t format, uint32_t width, uint32_t height, uint32_t pitch,
+                               bool tiled, bool packed_mips) {
+  const rex::graphics::FormatInfo* info = rex::graphics::FormatInfo::Get(format);
+  uint32_t x_blocks = 0, y_blocks = 0;
+  if (info == nullptr || !PackedBaseOffset(format, width, height, packed_mips, x_blocks, y_blocks)) {
+    return GuestTextureBytesAny(format, width, height, pitch, tiled);
+  }
+  return GuestTextureBytesAny(format, x_blocks * info->block_width + width,
+                              y_blocks * info->block_height + height, pitch, tiled);
+}
+
+bool LoadGuestTextureBase(uint32_t format, uint32_t width, uint32_t height, uint32_t pitch,
+                          uint32_t endian, bool tiled, bool packed_mips, const uint8_t* guest,
+                          size_t guest_bytes, LinearTexture& out, std::string& reason) {
+  const rex::graphics::FormatInfo* info = rex::graphics::FormatInfo::Get(format);
+  uint32_t x_blocks = 0, y_blocks = 0;
+  if (info == nullptr || !PackedBaseOffset(format, width, height, packed_mips, x_blocks, y_blocks)) {
+    return LoadGuestTextureLinear(format, width, height, pitch, endian, tiled, guest, guest_bytes, out,
+                                  reason);
+  }
+  LinearTexture tile;
+  if (!LoadGuestTextureLinear(format, x_blocks * info->block_width + width,
+                              y_blocks * info->block_height + height, pitch, endian, tiled, guest,
+                              guest_bytes, tile, reason)) {
+    return false;
+  }
+  out.block_width = tile.block_width;
+  out.block_height = tile.block_height;
+  out.block_bytes = tile.block_bytes;
+  out.width_blocks = (width + tile.block_width - 1u) / tile.block_width;
+  out.height_blocks = (height + tile.block_height - 1u) / tile.block_height;
+  const size_t row = size_t(out.width_blocks) * out.block_bytes;
+  const size_t tile_row = size_t(tile.width_blocks) * tile.block_bytes;
+  out.blocks.assign(row * out.height_blocks, 0);
+  for (uint32_t by = 0; by < out.height_blocks; ++by) {
+    std::memcpy(out.blocks.data() + by * row,
+                tile.blocks.data() + (by + y_blocks) * tile_row + size_t(x_blocks) * tile.block_bytes, row);
+  }
+  return true;
+}
+
 }  // namespace broken_bond::gfx

@@ -77,4 +77,14 @@ bool LoadGuestTextureLinear(uint32_t format, uint32_t width, uint32_t height, ui
                             uint32_t endian, bool tiled, const uint8_t* guest, size_t guest_bytes,
                             LinearTexture& out, std::string& reason);
 
+// The base level of a 2D texture. With packed_mips, a texture whose shorter
+// side is at most 16 texels keeps even its base level in the packed mip tail,
+// at a block offset inside the first 32x32-block tile; the region from the
+// tile's origin is loaded and the level cropped out of it.
+uint32_t GuestTextureBaseBytes(uint32_t format, uint32_t width, uint32_t height, uint32_t pitch,
+                               bool tiled, bool packed_mips);
+bool LoadGuestTextureBase(uint32_t format, uint32_t width, uint32_t height, uint32_t pitch,
+                          uint32_t endian, bool tiled, bool packed_mips, const uint8_t* guest,
+                          size_t guest_bytes, LinearTexture& out, std::string& reason);
+
 }  // namespace broken_bond::gfx

@@ -45,6 +45,23 @@ REXCVAR_DEFINE_STRING(native_skip_shaders, "", "Game",
                       "With renderer=native, skip the draws whose vertex or pixel shader key starts with "
                       "one of these comma-separated hex prefixes (to find which pass draws something)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_STRING(native_skip_verts, "", "Game",
+                      "With renderer=native, skip the draws that use one of these comma-separated "
+                      "vertex counts (to find which mesh is which)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(native_dump_mesh, 0, "Game",
+                     "With a frame dump, write every vertex of the draws with this many vertices to "
+                     "logs/mesh-<draw>-<verts>.csv, decoded as the vertex shader gets them")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_STRING(native_tint_verts, "", "Game",
+                      "With renderer=native, tint the draws that use these comma-separated vertex counts: "
+                      "the first writes only red, the second green, the third blue, the fourth red and green")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_STRING(native_dump_texture, "", "Game",
+                      "With renderer=native, write the untiled texels of the 2D textures at this hex "
+                      "physical address, or of this <w>x<h> size, to logs/texture-<address>-f<format>-<w>x<h>.bin "
+                      "when they are uploaded")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_STRING(native_dump_constants, "", "Game",
                       "With a frame dump, list every non-zero vertex and pixel shader constant of the "
                       "draws whose vertex or pixel shader key starts with one of these comma-separated "
@@ -817,6 +834,8 @@ struct Renderer::State {
   std::string dump;  // lines for native_dump_frame
   uint64_t outline_dump = 0;  // present to dump for native_dump_outline
   std::array<uint64_t, 8> cull_modes{};  // triangle draws per PA_SU_SC_MODE_CNTL & 7
+  // Vertex streams per (fetch constant endian, element endian) pair.
+  std::array<uint64_t, 16> stream_endians{};
   bool Dumping() const {
     return REXCVAR_GET(native_dump_frame) == int32_t(presents + 1) || outline_dump == presents + 1;
   }
@@ -1139,6 +1158,14 @@ struct Renderer::State {
     for (uint32_t y = 0; y < linear.height_blocks; ++y) {
       std::memcpy(upload_cpu + offset + y * row, linear.blocks.data() + y * row_bytes, row_bytes);
     }
+    if (Dumping() && REXCVAR_GET(native_dump_texture).find("1d") != std::string::npos) {
+      const std::string path = fmt::format("logs/texture1d-{}-{:08X}-f{}-w{}.bin", next_texture1d + 1,
+                                           fetch.base_address << 12, format, width);
+      if (FILE* f = std::fopen(path.c_str(), "wb")) {
+        std::fwrite(linear.blocks.data(), 1, linear.blocks.size(), f);
+        std::fclose(f);
+      }
+    }
     if (texture1d_slots.size() <= next_texture1d) texture1d_slots.resize(next_texture1d + 1);
     Texture1DSlot& slot = texture1d_slots[next_texture1d];
     const uint32_t index = next_texture1d + 1;
@@ -1197,7 +1224,7 @@ struct Renderer::State {
     const uint32_t width = fetch.size_2d.width + 1;
     const uint32_t height = fetch.size_2d.height + 1;
     const uint32_t pitch = fetch.pitch * 32;
-    const uint32_t bytes = gfx::GuestTextureBytesAny(format, width, height, pitch, fetch.tiled);
+    const uint32_t bytes = gfx::GuestTextureBaseBytes(format, width, height, pitch, fetch.tiled, fetch.packed_mips);
     if (bytes == 0) {
       Skip("texture size");
       return 0;
@@ -1213,13 +1240,27 @@ struct Renderer::State {
     }
     gfx::LinearTexture linear;
     std::string reason;
-    if (!gfx::LoadGuestTextureLinear(format, width, height, pitch, uint32_t(fetch.endianness), fetch.tiled,
-                                     guest, bytes, linear, reason)) {
+    if (!gfx::LoadGuestTextureBase(format, width, height, pitch, uint32_t(fetch.endianness), fetch.tiled,
+                                   fetch.packed_mips, guest, bytes, linear, reason)) {
       Skip("texture layout");
       return found != textures.end() ? found->second.index : 0;
     }
     const size_t row_bytes = size_t(linear.width_blocks) * linear.block_bytes;
     const size_t row = (row_bytes + 255) & ~size_t(255);
+    bool dump_texture = false;
+    for (const auto part : std::views::split(std::string_view(REXCVAR_GET(native_dump_texture)), ',')) {
+      const std::string want(part.begin(), part.end());
+      dump_texture |= !want.empty() && (want == fmt::format("{}x{}", width, height) ||
+                                        std::strtoul(want.c_str(), nullptr, 16) == (fetch.base_address << 12));
+    }
+    if (dump_texture) {
+      const std::string path =
+          fmt::format("logs/texture-{:08X}-f{}-{}x{}.bin", fetch.base_address << 12, format, width, height);
+      if (FILE* f = std::fopen(path.c_str(), "wb")) {
+        std::fwrite(linear.blocks.data(), 1, linear.blocks.size(), f);
+        std::fclose(f);
+      }
+    }
     uint64_t offset = 0;
     if (!Upload(row * linear.height_blocks, 512, offset)) {
       Skip("upload ring full");
@@ -1488,6 +1529,15 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
       s.Skip("vertex stream bounds");
       return;
     }
+    if (slot_count == 0) {
+      for (const auto part : std::views::split(std::string_view(REXCVAR_GET(native_skip_verts)), ',')) {
+        const std::string_view want(part.begin(), part.end());
+        if (!want.empty() && want == std::to_string(vertex_count)) {
+          s.Skip("native_skip_verts");
+          return;
+        }
+      }
+    }
     std::vector<uint8_t> raw(bytes);
     std::memcpy(raw.data(), At(base, PhysicalView(vf.address * 4 + uint32_t(begin))), bytes);
     SwapDwords(raw.data(), raw.size(), uint32_t(vf.endian));
@@ -1503,6 +1553,7 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
       for (uint32_t i = 0; i < element_count; ++i) {
         const Element& e = elems[i];
         if (e.stream != stream) continue;
+        if (v == 0) ++s.stream_endians[uint32_t(vf.endian) * 4 + ((e.format_word >> 6) & 3)];
         ConvertElement(src + e.offset, dst + e.out_offset, e.in_size, e.convert, e.source,
                        uint32_t(vf.endian));
       }
@@ -1527,7 +1578,18 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
   const uint32_t depth_control = Reg(base, device, kRbDepthControl);
   const uint32_t blend_control = Reg(base, device, kRbBlendControl0);
   const uint32_t color_control = Reg(base, device, kRbColorControl);
-  const uint32_t color_mask = Reg(base, device, kRbColorMask) & 0xF;
+  uint32_t color_mask = Reg(base, device, kRbColorMask) & 0xF;
+  {
+    static constexpr uint32_t kTintMasks[] = {0x1, 0x2, 0x4, 0x3};
+    uint32_t n = 0;
+    for (const auto part : std::views::split(std::string_view(REXCVAR_GET(native_tint_verts)), ',')) {
+      const std::string_view want(part.begin(), part.end());
+      if (n < 4 && !want.empty() && want == std::to_string(vertex_count) && color_mask != 0) {
+        color_mask = kTintMasks[n];
+      }
+      ++n;
+    }
+  }
   const bool alpha_test = (color_control & 0x8) != 0;
   uint32_t spec = 0;
   const auto vs_entry = s.entries.find(vs_key);
@@ -1749,9 +1811,43 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
       line += fmt::format(" | e{} s{} +{} usage{}.{} type{:08X}", i, elems[i].stream, elems[i].offset,
                           elems[i].usage, elems[i].usage_index, elems[i].format_word);
     }
-    // Decoded positions of the first vertices (stream of the POSITION element).
+    if (REXCVAR_GET(native_dump_mesh) > 0 && uint32_t(REXCVAR_GET(native_dump_mesh)) == vertex_count) {
+      const std::string path = fmt::format("logs/mesh-{}-{}.csv", s.drawn, vertex_count);
+      if (FILE* f = std::fopen(path.c_str(), "w")) {
+        for (uint32_t v = 0; v < vertex_count; ++v) {
+          std::string row = fmt::format("{}", first + v);
+          for (uint32_t i = 0; i < element_count; ++i) {
+            const uint32_t fetch_at = device + kDeviceFetch + 8 * (95 - elems[i].stream);
+            xenos::xe_gpu_vertex_fetch_t vf;
+            vf.dword_0 = Be32(base, fetch_at);
+            vf.dword_1 = Be32(base, fetch_at + 4);
+            const uint32_t stride = uint32_t(*At(base, device + kDeviceStrides + elems[i].stream)) * 4;
+            uint8_t raw[16] = {};
+            std::memcpy(raw, At(base, PhysicalView(vf.address * 4 + (first + v) * stride + elems[i].offset)),
+                        elems[i].in_size);
+            SwapDwords(raw, sizeof(raw), uint32_t(vf.endian));
+            if (uint32_t(vf.endian) == 2 && SixteenBitComponents(elems[i].source.format)) {
+              for (uint32_t b = 0; b + 3 < sizeof(raw); b += 4) {
+                std::swap(raw[b], raw[b + 2]);
+                std::swap(raw[b + 1], raw[b + 3]);
+              }
+            }
+            float value[4];
+            DecodeElement(elems[i].source, raw, value);
+            ApplySwizzle(elems[i].source.swizzle, value);
+            row += fmt::format(",u{}.{},{:g},{:g},{:g},{:g}", elems[i].usage, elems[i].usage_index, value[0],
+                               value[1], value[2], value[3]);
+          }
+          std::fputs((row + "\n").c_str(), f);
+        }
+        std::fclose(f);
+      }
+    }
+    // Decoded positions of the first vertices, and every element of them for
+    // the shaders native_dump_constants names, as the vertex shader gets them.
+    const bool all_elements = ShaderListed(REXCVAR_GET(native_dump_constants), vs_key, ps_key);
     for (uint32_t i = 0; i < element_count; ++i) {
-      if (elems[i].usage != 0 || elems[i].usage_index != 0) continue;
+      if (!all_elements && (elems[i].usage != 0 || elems[i].usage_index != 0)) continue;
       const uint32_t fetch_at = device + kDeviceFetch + 8 * (95 - elems[i].stream);
       xenos::xe_gpu_vertex_fetch_t vf;
       vf.dword_0 = Be32(base, fetch_at);
@@ -1771,7 +1867,13 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
         }
         float pos[4];
         DecodeElement(elems[i].source, raw, pos);
-        line += fmt::format(" | v{} ({:.2f},{:.2f},{:.2f},{:.2f})", first + v, pos[0], pos[1], pos[2], pos[3]);
+        if (all_elements) {
+          ApplySwizzle(elems[i].source.swizzle, pos);
+          line += fmt::format(" | v{}.u{}.{} ({:.3f},{:.3f},{:.3f},{:.3f})", first + v, elems[i].usage,
+                              elems[i].usage_index, pos[0], pos[1], pos[2], pos[3]);
+        } else {
+          line += fmt::format(" | v{} ({:.2f},{:.2f},{:.2f},{:.2f})", first + v, pos[0], pos[1], pos[2], pos[3]);
+        }
       }
     }
     const float* c = reinterpret_cast<const float*>(s.upload_cpu + vs_constants);
@@ -1792,6 +1894,15 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
       }
     }
     for (uint32_t slot = 0; slot < DESCRIPTOR_SLOT_COUNT; ++slot) {
+      if (const uint32_t index1d = indices[DESCRIPTOR_KIND_TEXTURE1D * DESCRIPTOR_SLOT_COUNT + slot]) {
+        uint32_t fw[6];
+        for (uint32_t w = 0; w < 6; ++w) fw[w] = Be32(base, device + kDeviceFetch + 24 * slot + 4 * w);
+        xenos::xe_gpu_texture_fetch_t ff;
+        std::memcpy(&ff, fw, sizeof(fw));
+        line += fmt::format(" | t{}=1d#{}@{:08X}/f{}/w{} pitch{} [{:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]", slot,
+                            index1d, ff.base_address << 12, uint32_t(ff.format), ff.size_1d.width + 1,
+                            ff.pitch * 32, fw[0], fw[1], fw[2], fw[3], fw[4], fw[5]);
+      }
       const uint32_t index = indices[DESCRIPTOR_KIND_TEXTURE2D * DESCRIPTOR_SLOT_COUNT + slot];
       if (index == 0) continue;
       bool resolved = false;
@@ -2036,6 +2147,11 @@ std::string Renderer::TakeStats() {
     if (s.cull_modes[m]) out += fmt::format(" {}:{}", m, s.cull_modes[m]);
   }
   s.cull_modes = {};
+  out += " endian(fetch/elem)";
+  for (uint32_t m = 0; m < 16; ++m) {
+    if (s.stream_endians[m]) out += fmt::format(" {}/{}:{}", m / 4, m % 4, s.stream_endians[m]);
+  }
+  s.stream_endians = {};
   if (s.outline_dump) out += fmt::format(" outline_dump={}", s.outline_dump);
   for (const auto& [reason, count] : s.skipped) out += fmt::format(" | {}: {}", reason, count);
   if (!s.last_bounds.empty()) out += " | last bounds: " + s.last_bounds;
