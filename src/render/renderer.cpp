@@ -37,6 +37,10 @@ REXCVAR_DEFINE_INT32(native_dump_frame, 0, "Game",
                      "With renderer=native, describe every draw of this present (from 1) in "
                      "logs/native-frame-<n>.txt; 0 writes none")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_STRING(native_skip_shaders, "", "Game",
+                      "With renderer=native, skip the draws whose vertex or pixel shader key starts with "
+                      "one of these comma-separated hex prefixes (to find which pass draws something)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_STRING(native_dump_constants, "", "Game",
                       "With a frame dump, list every non-zero vertex and pixel shader constant of the "
                       "draws whose vertex or pixel shader key starts with one of these comma-separated "
@@ -99,6 +103,18 @@ float BeFloat(const uint8_t* base, uint32_t address) {
 // 0xA0000000 view reaches unshifted. Some D3D objects (index buffers) keep a
 // virtual address in the 0xE0000000 range instead; that range maps physical
 // memory 0x1000 further on, so it is read as the virtual address it is.
+// True when the vertex or pixel shader key starts with one of the
+// comma-separated hex prefixes in `list`.
+bool ShaderListed(std::string_view list, uint64_t vs_key, uint64_t ps_key) {
+  const std::string vs_hex = fmt::format("{:016X}", vs_key);
+  const std::string ps_hex = fmt::format("{:016X}", ps_key);
+  for (const auto part : std::views::split(list, ',')) {
+    const std::string_view want(part.begin(), part.end());
+    if (!want.empty() && (vs_hex.starts_with(want) || ps_hex.starts_with(want))) return true;
+  }
+  return false;
+}
+
 uint32_t PhysicalView(uint32_t address) {
   return address < 0x20000000u ? 0xA0000000u + address : address;
 }
@@ -1289,6 +1305,10 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
   const uint32_t ps_object = Be32(base, device + kDevicePixelShader);
   const uint64_t vs_key = host::ShadowShaderKey(vs_object, base);
   const uint64_t ps_key = host::ShadowShaderKey(ps_object, base);
+  if (ShaderListed(REXCVAR_GET(native_skip_shaders), vs_key, ps_key)) {
+    s.Skip("native_skip_shaders");
+    return;
+  }
   plume::RenderShader* vs = s.Shader(vs_key);
   plume::RenderShader* ps = ps_object ? s.Shader(ps_key) : nullptr;
   if (!vs || (ps_object && !ps)) {
@@ -1717,14 +1737,7 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
       line += fmt::format(" | c{} ({:g},{:g},{:g},{:g})", r, c[4 * r], c[4 * r + 1], c[4 * r + 2],
                           c[4 * r + 3]);
     }
-    bool constants = false;
-    const std::string vs_hex = fmt::format("{:016X}", vs_key);
-    const std::string ps_hex = fmt::format("{:016X}", ps_key);
-    for (const auto part : std::views::split(std::string_view(REXCVAR_GET(native_dump_constants)), ',')) {
-      const std::string_view want(part.begin(), part.end());
-      constants |= !want.empty() && (vs_hex.starts_with(want) || ps_hex.starts_with(want));
-    }
-    if (constants) {
+    if (ShaderListed(REXCVAR_GET(native_dump_constants), vs_key, ps_key)) {
       const float* ps_c = reinterpret_cast<const float*>(s.upload_cpu + ps_constants);
       for (uint32_t r = 8; r < gfx::kVertexShaderConstantsBytes / 16; ++r) {
         if (c[4 * r] == 0 && c[4 * r + 1] == 0 && c[4 * r + 2] == 0 && c[4 * r + 3] == 0) continue;
