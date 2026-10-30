@@ -35,6 +35,10 @@ REXCVAR_DEFINE_INT32(native_dump_frame, 0, "Game",
                      "With renderer=native, describe every draw of this present (from 1) in "
                      "logs/native-frame-<n>.txt; 0 writes none")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(native_dump_outline, false, "Game",
+                    "With renderer=native, dump the present 60 after the first draw that culls front "
+                    "faces (character outlines) as native_dump_frame would")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(native_debug_target, false, "Game",
                     "Debug: skip guest clears and show the render target itself at Swap")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
@@ -53,7 +57,7 @@ constexpr uint64_t kUploadBytes = 256ull << 20;
 constexpr uint32_t kTexture2DCount = 8192;
 constexpr uint32_t kTexture3DCount = 64;
 constexpr uint32_t kTextureCubeCount = 256;
-constexpr uint32_t kTexture1DCount = 64;
+constexpr uint32_t kTexture1DCount = 1024;
 constexpr uint32_t kSamplerCount = 1024;
 
 // Guest frame the D3D viewport registers describe; the host target scales it.
@@ -737,6 +741,20 @@ struct Renderer::State {
   };
   std::unordered_map<uint64_t, Texture> textures;
   uint32_t next_texture2d = 1;  // 0 is white in every heap
+  // 1D textures hold per-draw data the CPU rewrites every frame (skinned
+  // meshes fetch their bone matrices from one), so they live in a pool that
+  // is refilled each frame: slot i is heap index i + 1, and the same texels
+  // used again in the frame (shadow, body and outline passes) share a slot.
+  struct Texture1DSlot {
+    std::unique_ptr<plume::RenderTexture> texture;
+    std::unique_ptr<plume::RenderTextureView> view;
+    uint32_t width = 0;
+    plume::RenderFormat format = plume::RenderFormat::UNKNOWN;
+    uint32_t swizzle = 0;
+  };
+  std::vector<Texture1DSlot> texture1d_slots;
+  uint32_t next_texture1d = 0;
+  std::unordered_map<uint64_t, uint32_t> texture1d_frame;
   std::vector<std::unique_ptr<plume::RenderTexture>> defaults;
   std::unordered_map<uint32_t, uint32_t> sampler_index;
   std::vector<std::unique_ptr<plume::RenderSampler>> samplers;
@@ -745,7 +763,11 @@ struct Renderer::State {
   std::string last_bounds;
   std::map<std::string, uint64_t> viewports;  // VTE_CNTL and viewport per draw, for the log
   std::string dump;  // lines for native_dump_frame
-  bool Dumping() const { return REXCVAR_GET(native_dump_frame) == int32_t(presents + 1); }
+  uint64_t outline_dump = 0;  // present to dump for native_dump_outline
+  std::array<uint64_t, 8> cull_modes{};  // triangle draws per PA_SU_SC_MODE_CNTL & 7
+  bool Dumping() const {
+    return REXCVAR_GET(native_dump_frame) == int32_t(presents + 1) || outline_dump == presents + 1;
+  }
   bool recording = false;
   uint64_t clears = 0;
   uint64_t resolves = 0;
@@ -895,6 +917,8 @@ struct Renderer::State {
     if (recording) return;
     recording = true;
     upload_used = 0;
+    next_texture1d = 0;
+    texture1d_frame.clear();
     commands->begin();
     // Targets keep their contents across frames (the game draws before Swap
     // and resolves after it); a new command list only needs them rebound.
@@ -1019,6 +1043,75 @@ struct Renderer::State {
     samplers.push_back(device->createSampler(desc));
     sets[3]->setSampler(index, samplers.back().get());
     sampler_index[key] = index;
+    return index;
+  }
+
+  // Texture index in the 1D heap for one fetch constant, 0 (white) when the
+  // format is not handled or the pool is full.
+  uint32_t Texture1DFor(const uint32_t words[6], const xenos::xe_gpu_texture_fetch_t& fetch,
+                        const uint8_t* base, bool& uploaded) {
+    const uint32_t format = uint32_t(fetch.format);
+    const plume::RenderFormat host = HostTextureFormat(format);
+    if (host == plume::RenderFormat::UNKNOWN) {
+      Skip(fmt::format("1d texture format {}", format));
+      return 0;
+    }
+    const uint32_t width = fetch.size_1d.width + 1;
+    const uint32_t pitch = std::max<uint32_t>(fetch.pitch * 32, (width + 31) & ~31u);
+    const uint32_t bytes = gfx::GuestTextureBytesAny(format, width, 1, pitch, fetch.tiled);
+    if (bytes == 0 || width > 16384) {
+      Skip("1d texture size");
+      return 0;
+    }
+    const uint8_t* guest = At(base, PhysicalView(fetch.base_address << 12));
+    const uint64_t frame_key = ImageKey(words) * 0x9E3779B97F4A7C15ull ^ XXH3_64bits(guest, bytes);
+    if (auto found = texture1d_frame.find(frame_key); found != texture1d_frame.end()) return found->second;
+    if (next_texture1d + 1 >= kTexture1DCount) {
+      Skip("1d texture pool full");
+      return 0;
+    }
+    gfx::LinearTexture linear;
+    std::string reason;
+    if (!gfx::LoadGuestTextureLinear(format, width, 1, pitch, uint32_t(fetch.endianness), fetch.tiled, guest,
+                                     bytes, linear, reason)) {
+      Skip("1d texture layout");
+      return 0;
+    }
+    const size_t row_bytes = size_t(linear.width_blocks) * linear.block_bytes;
+    const size_t row = (row_bytes + 255) & ~size_t(255);
+    uint64_t offset = 0;
+    if (!Upload(row * linear.height_blocks, 512, offset)) {
+      Skip("upload ring full");
+      return 0;
+    }
+    for (uint32_t y = 0; y < linear.height_blocks; ++y) {
+      std::memcpy(upload_cpu + offset + y * row, linear.blocks.data() + y * row_bytes, row_bytes);
+    }
+    if (texture1d_slots.size() <= next_texture1d) texture1d_slots.resize(next_texture1d + 1);
+    Texture1DSlot& slot = texture1d_slots[next_texture1d];
+    const uint32_t index = next_texture1d + 1;
+    const uint32_t swizzle = HostSwizzle(fetch.swizzle, fetch.format);
+    if (!slot.texture || slot.width != width || slot.format != host || slot.swizzle != swizzle) {
+      slot.texture = device->createTexture(plume::RenderTextureDesc::Texture1D(width, 1, host));
+      plume::RenderTextureViewDesc view = plume::RenderTextureViewDesc::Texture1D(host);
+      view.componentMapping = ComponentMapping(swizzle);
+      slot.view = slot.texture->createTextureView(view);
+      slot.width = width;
+      slot.format = host;
+      slot.swizzle = swizzle;
+    }
+    commands->barriers(plume::RenderBarrierStage::COPY,
+                       plume::RenderTextureBarrier(slot.texture.get(), plume::RenderTextureLayout::COPY_DEST));
+    const uint32_t row_texels = uint32_t(row / linear.block_bytes) * linear.block_width;
+    commands->copyTextureRegion(
+        plume::RenderTextureCopyLocation::Subresource(slot.texture.get()),
+        plume::RenderTextureCopyLocation::PlacedFootprint(upload.get(), host, width, 1, 1, row_texels, offset));
+    commands->barriers(plume::RenderBarrierStage::GRAPHICS,
+                       plume::RenderTextureBarrier(slot.texture.get(), plume::RenderTextureLayout::SHADER_READ));
+    sets[5]->setTexture(index, slot.texture.get(), plume::RenderTextureLayout::SHADER_READ, slot.view.get());
+    ++next_texture1d;
+    texture1d_frame[frame_key] = index;
+    uploaded = true;
     return index;
   }
 
@@ -1395,6 +1488,11 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
   const bool triangles = topology == plume::RenderPrimitiveTopology::TRIANGLE_LIST ||
                          topology == plume::RenderPrimitiveTopology::TRIANGLE_STRIP;
   const uint32_t sc_mode = triangles ? Reg(base, device, kPaSuScModeCntl) & 7 : 0;
+  if (triangles) ++s.cull_modes[sc_mode];
+  // Anything but no culling or back faces with counter-clockwise front.
+  if (REXCVAR_GET(native_dump_outline) && s.outline_dump == 0 && sc_mode != 0 && sc_mode != 2) {
+    s.outline_dump = s.presents + 61;
+  }
   const uint32_t state_key[7] = {depth_control & 0x77, blend_control, color_mask, uint32_t(topology),
                                  spec, uint32_t(ps_object != 0), sc_mode};
   XXH3_64bits_update(&key_state, state_key, sizeof(state_key));
@@ -1478,7 +1576,9 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
     std::memcpy(&fetch, words, sizeof(words));
     if (uint32_t(fetch.type) != 2) continue;
     indices[DESCRIPTOR_KIND_SAMPLER * DESCRIPTOR_SLOT_COUNT + slot] = s.SamplerFor(fetch);
-    if (uint32_t(fetch.dimension) == 1) {
+    if (uint32_t(fetch.dimension) == 0) {
+      indices[DESCRIPTOR_KIND_TEXTURE1D * DESCRIPTOR_SLOT_COUNT + slot] = s.Texture1DFor(words, fetch, base, uploaded);
+    } else if (uint32_t(fetch.dimension) == 1) {
       const auto t0 = std::chrono::steady_clock::now();
       indices[DESCRIPTOR_KIND_TEXTURE2D * DESCRIPTOR_SLOT_COUNT + slot] =
           s.Texture2DFor(words, fetch, base, uploaded);
@@ -1840,6 +1940,12 @@ std::string Renderer::TakeStats() {
       s.drawn, s.clears, s.resolves, s.reuploads, s.color_images.size(), s.target_switches, s.pipelines.size(), s.shaders.size(), s.textures.size(), s.samplers.size(),
       s.ms_pipeline, s.ms_texture, s.ms_stream, s.ms_submit, s.last_viewport);
   s.ms_pipeline = s.ms_texture = s.ms_stream = s.ms_submit = 0;
+  out += " cull";
+  for (uint32_t m = 0; m < 8; ++m) {
+    if (s.cull_modes[m]) out += fmt::format(" {}:{}", m, s.cull_modes[m]);
+  }
+  s.cull_modes = {};
+  if (s.outline_dump) out += fmt::format(" outline_dump={}", s.outline_dump);
   for (const auto& [reason, count] : s.skipped) out += fmt::format(" | {}: {}", reason, count);
   if (!s.last_bounds.empty()) out += " | last bounds: " + s.last_bounds;
   std::vector<std::pair<uint64_t, std::string>> top;

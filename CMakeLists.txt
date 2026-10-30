@@ -231,6 +231,9 @@ if(EXISTS "${BROKEN_BOND_PLUME_DIR}/CMakeLists.txt" AND
             -DCMAKE_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}
             -DCMAKE_POLICY_VERSION_MINIMUM=3.5
         INSTALL_COMMAND ""
+        # The patched sources change with the shader contract; its own Ninja
+        # decides whether anything is out of date.
+        BUILD_ALWAYS ON
         BUILD_BYPRODUCTS "${BROKEN_BOND_XENOSRECOMP_EXE}"
         EXCLUDE_FROM_ALL ON)
 
@@ -243,7 +246,7 @@ if(EXISTS "${BROKEN_BOND_PLUME_DIR}/CMakeLists.txt" AND
         COMMAND "${BROKEN_BOND_XENOSRECOMP_EXE}" "${BROKEN_BOND_SHADER_DIR}/containers"
             "${BROKEN_BOND_SHADER_CACHE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/gfx/xenos_shader_common.h"
-        DEPENDS shader_db xenosrecomp_tool "${BROKEN_BOND_SHADER_DB}"
+        DEPENDS shader_db xenosrecomp_tool "${BROKEN_BOND_XENOSRECOMP_EXE}" "${BROKEN_BOND_SHADER_DB}"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/gfx/xenos_shader_common.h"
         COMMENT "Translating xeshader.sdb with XenosRecomp"
         VERBATIM)
