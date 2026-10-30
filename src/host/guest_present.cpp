@@ -32,6 +32,11 @@ REXCVAR_DEFINE_BOOL(dump_device_draw, false, "Game",
 REXCVAR_DEFINE_BOOL(fps_title, true, "Game",
                     "Show the frame rate and the slowest frame of the last second in the window title")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(present_interval, 0, "Game",
+                     "Most vblanks between guest flips. The game asks for 2 (30 Hz) in menus and "
+                     "cutscenes and 1 (60 Hz) in fights; 1 makes every flip wait one vblank. 0 keeps "
+                     "the game's choice")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_STRING(renderer, "xenos", "Game",
                       "xenos presents the game. host draws into a retained Vulkan target and still presents "
                       "through Xenos. native presents through the Plume renderer (with --gpu_plugin=host)");
@@ -73,6 +78,9 @@ std::atomic<int> g_call_A15B0{0};
 std::atomic<int> g_call_8740{0};
 std::atomic<int> g_call_other{0};
 std::atomic<uint32_t> g_other_lr{0};
+
+// Flips queued per vblank interval the game asked for (index 0..3, 3 = more).
+std::atomic<int> g_interval[4]{};
 
 void NoteSwapCaller(uint32_t lr) {
   switch (lr) {
@@ -147,12 +155,16 @@ void SampleLoop() {
     const int c8740 = g_call_8740.exchange(0, std::memory_order_relaxed);
     const int c_other = g_call_other.exchange(0, std::memory_order_relaxed);
     const uint32_t other_lr = g_other_lr.load(std::memory_order_relaxed);
+    int intervals[4];
+    for (int i = 0; i < 4; ++i) intervals[i] = g_interval[i].exchange(0, std::memory_order_relaxed);
     REXLOG_INFO(
         "guest present 5s: 60Hz={} 30Hz={} 24Hz={} other={} last={} us ({})",
         n60, n30, n24, n_other, last_dt, last_bucket);
     REXLOG_INFO(
         "guest swap callers 5s: 821610F0={} 821B2578={} 821A15B0={} 821B8740={} other={} other_lr={:08X}",
         c610, c2578, cA15, c8740, c_other, other_lr);
+    REXLOG_INFO("guest flip interval 5s: 0={} 1={} 2={} more={} (present_interval={})", intervals[0],
+                intervals[1], intervals[2], intervals[3], REXCVAR_GET(present_interval));
     broken_bond::host::CensusLog();
     broken_bond::host::ShadowLog();
 #if defined(BROKEN_BOND_HAS_NATIVE_RENDERER)
@@ -636,6 +648,19 @@ REX_HOOK_RAW(sub_821B1DD0) {
   const int census = broken_bond::host::CensusEnter(0x821B1DD0, ctx, base);
   __imp__sub_821B1DD0(ctx, base);
   broken_bond::host::CensusReturn(census, ctx);
+}
+
+// Queues a flip. Bits 8..11 of r3 are the vblanks to wait after the last
+// flip, the low byte a percent threshold and bits 12..31 the surface.
+extern "C" void __imp__sub_821B16B0(PPCContext& __restrict ctx, uint8_t* base);
+REX_HOOK_RAW(sub_821B16B0) {
+  const uint32_t interval = (ctx.r3.u32 >> 8) & 0xFu;
+  g_interval[interval < 3u ? interval : 3u].fetch_add(1, std::memory_order_relaxed);
+  const int limit = REXCVAR_GET(present_interval);
+  if (limit > 0 && interval > static_cast<uint32_t>(limit)) {
+    ctx.r3.u64 = (ctx.r3.u32 & ~0xF00u) | (static_cast<uint32_t>(limit & 0xF) << 8);
+  }
+  __imp__sub_821B16B0(ctx, base);
 }
 
 REX_HOOK_RAW(sub_821AE158) {
