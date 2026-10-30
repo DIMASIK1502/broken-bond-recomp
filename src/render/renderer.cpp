@@ -502,6 +502,14 @@ plume::RenderComponentMapping ComponentMapping(uint32_t swizzle) {
 
 // Names one guest image by its texture fetch constant. Clamp and filter
 // bits are sampler state and are left out.
+// Physical address of a texture base. Objects the game builds keep virtual
+// 0xE0000000-range addresses; SetTexture writes the physical one, which is
+// 0x1000 further on (the 4 KB physical heap's offset).
+uint32_t TexturePhysical(uint32_t base_address_field) {
+  const uint32_t address = base_address_field << 12;
+  return address >= 0xE0000000u ? (address & 0x1FFFFFFFu) + 0x1000u : address & 0x1FFFFFFFu;
+}
+
 uint64_t ImageKey(const uint32_t words[6]) {
   uint32_t image_words[6];
   std::memcpy(image_words, words, sizeof(image_words));
@@ -783,7 +791,7 @@ struct Renderer::State {
   // are uploaded again.
   uint32_t Texture2DFor(const uint32_t words[6], const xenos::xe_gpu_texture_fetch_t& fetch,
                         const uint8_t* base, bool& uploaded) {
-    if (auto at = resolved_at.find(fetch.base_address << 12); at != resolved_at.end()) {
+    if (auto at = resolved_at.find(TexturePhysical(fetch.base_address)); at != resolved_at.end()) {
       auto resolved = textures.find(at->second);
       if (resolved != textures.end()) return resolved->second.index;
     }
@@ -942,6 +950,10 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
   plume::RenderShader* ps = ps_object ? s.Shader(ps_key) : nullptr;
   if (!vs || (ps_object && !ps)) {
     s.Skip("shader not in cache");
+    return;
+  }
+  if (REXCVAR_GET(native_debug_target) && vs_key == 0x1089333427EFE5F2ull) {
+    s.Skip("debug: title composite");
     return;
   }
 
@@ -1324,7 +1336,12 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
       if (index == 0) continue;
       bool resolved = false;
       for (const auto& [k, t] : s.textures) resolved |= t.index == index && t.resolved;
-      line += fmt::format(" | t{}=#{}{}", slot, index, resolved ? "r" : "");
+      uint32_t fw[6];
+      for (uint32_t w = 0; w < 6; ++w) fw[w] = Be32(base, device + kDeviceFetch + 24 * slot + 4 * w);
+      xenos::xe_gpu_texture_fetch_t ff;
+      std::memcpy(&ff, fw, sizeof(fw));
+      line += fmt::format(" | t{}=#{}{}@{:08X}/f{}/{}x{}", slot, index, resolved ? "r" : "", ff.base_address << 12,
+                          uint32_t(ff.format), ff.size_2d.width + 1, ff.size_2d.height + 1);
     }
     s.dump += line + "\n";
   }
@@ -1376,7 +1393,7 @@ void Renderer::Resolve(uint32_t device, uint32_t flags, uint32_t rect, uint32_t 
     const uint32_t width = std::max(1u, uint32_t(std::lround(guest_width * float(s.width) / kGuestWidth)));
     const uint32_t height = std::max(1u, uint32_t(std::lround(guest_height * float(s.height) / kGuestHeight)));
     const uint64_t key = ImageKey(words);
-    s.resolved_at[fetch.base_address << 12] = key;
+    s.resolved_at[TexturePhysical(fetch.base_address)] = key;
     State::Texture& entry = s.textures[key];
     if (!entry.texture || !entry.resolved || entry.width != width || entry.height != height) {
       entry.texture = s.device->createTexture(plume::RenderTextureDesc::Texture2D(width, height, 1, kColorFormat));
@@ -1417,9 +1434,10 @@ void Renderer::Resolve(uint32_t device, uint32_t flags, uint32_t rect, uint32_t 
                             entry.view.get());
     }
     if (s.Dumping()) {
-      s.dump += fmt::format("resolve flags={:X} texture={:08X} {}x{} key={:016X} index=#{} src={},{}-{},{}\n",
-                            flags, texture, guest_width, guest_height, key, entry.index, src.left, src.top,
-                            src.right, src.bottom);
+      s.dump += fmt::format("resolve flags={:X} texture={:08X} @{:08X}/f{} {}x{} key={:016X} index=#{} "
+                            "src={},{}-{},{}\n",
+                            flags, texture, fetch.base_address << 12, uint32_t(fetch.format), guest_width,
+                            guest_height, key, entry.index, src.left, src.top, src.right, src.bottom);
     }
     ++s.resolves;
   }
@@ -1429,6 +1447,14 @@ void Renderer::Resolve(uint32_t device, uint32_t flags, uint32_t rect, uint32_t 
   // be cleared or the later bands would copy an empty target.
   plume::RenderRect region(0, 0, int32_t(s.width), int32_t(s.height));
   if (rect != 0) region = s.HostRect(base, rect);
+  // A tiled pass resolves each band with a clear, but on the GPU that clear
+  // runs per tile inside the replayed command buffer, before the next band is
+  // drawn. The title then copies the whole target again (flags 0) and
+  // composites that copy, so the host, which draws the frame once, must not
+  // clear here.
+  if (rect != 0 && (region.right - region.left < int32_t(s.width) || region.bottom - region.top < int32_t(s.height))) {
+    flags &= ~0x300u;
+  }
   if (REXCVAR_GET(native_debug_target)) flags &= ~0x300u;
   if (flags & 0x100) {
     plume::RenderColor value(0.0f, 0.0f, 0.0f, 0.0f);
