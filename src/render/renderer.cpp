@@ -1713,11 +1713,56 @@ struct Renderer::State {
   bool second_pending = false;
   uint64_t interp_frames = 0;
 
-  // Records the frame's journal again, on top of what the frame drew.
-  // False, with a reason counted, when an op's target is gone.
+  // The previous presented frame, for blending: each draw's key and its
+  // vertex shader constants (kVsFloats floats per draw).
+  static constexpr size_t kVsFloats = gfx::kVertexShaderConstantsBytes / 4;
+  struct PrevFrame {
+    std::vector<uint64_t> keys;
+    std::vector<float> vs_constants;
+    uint32_t interval = 0;
+    bool valid = false;
+  } prev;
+  float last_match = 0.0f;
+
+  // Keeps what the next frame blends with. Called after the frame's fence,
+  // while its upload ring still holds its data.
+  void SnapshotFrame() {
+    prev.keys.resize(draw_ops.size());
+    prev.vs_constants.resize(draw_ops.size() * kVsFloats);
+    for (size_t i = 0; i < draw_ops.size(); ++i) {
+      prev.keys[i] = draw_ops[i].key;
+      std::memcpy(prev.vs_constants.data() + i * kVsFloats, upload_cpu + draw_ops[i].vs_constants,
+                  kVsFloats * 4);
+    }
+    prev.interval = flip_interval.load(std::memory_order_relaxed);
+    prev.valid = !draw_ops.empty();
+  }
+
+  // Records the frame's journal again, on top of what the frame drew, with
+  // each paired draw's vertex constants halfway between the previous frame
+  // and this one. False, with a reason counted, when an op's target is gone,
+  // too few draws pair or the ring has no room; nothing is recorded then.
   bool ReplayFrame() {
     if (journal.empty()) {
       Skip("interp: empty journal");
+      return false;
+    }
+    if (!prev.valid) {
+      Skip("interp: no previous frame");
+      return false;
+    }
+    std::vector<uint64_t> keys(draw_ops.size());
+    for (size_t i = 0; i < draw_ops.size(); ++i) keys[i] = draw_ops[i].key;
+    const std::vector<int32_t> match = interp::MatchDraws(prev.keys, keys);
+    last_match = interp::MatchedShare(match);
+    if (last_match < 0.9f) {
+      Skip("interp: few matches");
+      return false;
+    }
+    const size_t paired = size_t(std::count_if(match.begin(), match.end(), [](int32_t m) { return m >= 0; }));
+    uint64_t blended = 0;
+    if (!Upload(paired * kVsFloats * 4, 256, blended)) {
+      Skip("interp: upload ring full");
       return false;
     }
     std::unordered_set<const Target*> live;
@@ -1742,7 +1787,21 @@ struct Renderer::State {
     }
     for (const FrameOp& op : journal) {
       switch (op.kind) {
-        case FrameOp::kDraw: ExecuteDraw(draw_ops[op.index]); break;
+        case FrameOp::kDraw: {
+          const int32_t pair = match[op.index];
+          if (pair < 0) {
+            ExecuteDraw(draw_ops[op.index]);
+            break;
+          }
+          DrawOp mid = draw_ops[op.index];
+          interp::LerpFloats(prev.vs_constants.data() + size_t(pair) * kVsFloats,
+                             reinterpret_cast<const float*>(upload_cpu + mid.vs_constants),
+                             reinterpret_cast<float*>(upload_cpu + blended), kVsFloats, 0.5f);
+          mid.vs_constants = blended;
+          blended += kVsFloats * 4;
+          ExecuteDraw(mid);
+          break;
+        }
         case FrameOp::kClear: ExecuteClear(clear_ops[op.index]); break;
         case FrameOp::kResolve: ExecuteResolve(resolve_ops[op.index]); break;
       }
@@ -3000,6 +3059,7 @@ void Renderer::Present(uint32_t frontbuffer, const uint8_t* base) {
     s.queue->waitForCommandFence(s.fence_second.get());
     s.second_pending = false;
   }
+  if (REXCVAR_GET(native_interpolate)) s.SnapshotFrame();
   s.DestroyRetired();
   // The GPU is idle now, so streams unused for a while can go.
   if ((s.presents & 63) == 0) {
@@ -3062,7 +3122,7 @@ std::string Renderer::TakeStats() {
   s.msaa_resolves = 0;
   s.depth_resolves = 0;
   if (REXCVAR_GET(native_interpolate)) {
-    out += fmt::format(" journal={} interp={}", s.journal_last, s.interp_frames);
+    out += fmt::format(" journal={} interp={} match={:.2f}", s.journal_last, s.interp_frames, s.last_match);
     s.interp_frames = 0;
   }
   s.stream_hits = s.stream_misses = 0;
