@@ -28,6 +28,8 @@
 #include "gfx/shader_cache.h"
 #include "gfx/texture.h"
 #include "gfx/xenos_shader_common.h"
+#include <unordered_set>
+
 #include <rex/logging.h>
 
 #include "render/interpolation.h"
@@ -882,6 +884,7 @@ struct Renderer::State {
     uint32_t width = 0;
     uint32_t height = 0;
     plume::RenderFormat format = kColorFormat;
+    uint32_t view_swizzle = 0x688;  // fetch swizzle of the view; identity xyzw
     // Depth resolves draw into the texture.
     std::unique_ptr<plume::RenderFramebuffer> framebuffer;
   };
@@ -1661,6 +1664,181 @@ struct Renderer::State {
                         texture.view.get());
     uploaded = true;
     return texture.index;
+  }
+
+  // Draws texture `source_index` of the 2D heap into swap chain image
+  // `image` through the gamma ramp, as the display controller shows the
+  // frontbuffer. `constants` is 16 + 256 * 4 bytes of the upload ring.
+  void DrawPresentPass(uint32_t image, uint32_t source_index, uint64_t constants) {
+    plume::RenderTexture* target = swap_chain->getTexture(image);
+    const uint32_t header[4] = {source_index, PresentSampler(), 0, 0};
+    std::memcpy(upload_cpu + constants, header, sizeof(header));
+    if (has_gamma_ramp) {
+      std::memcpy(upload_cpu + constants + 16, gamma_ramp.data(), 256 * 4);
+    } else {
+      // No ramp written yet: an identity table.
+      std::array<uint32_t, 256> identity;
+      for (uint32_t i = 0; i < 256; ++i) {
+        const uint32_t v = (i * 1023 + 127) / 255;
+        identity[i] = v | (v << 10) | (v << 20);
+      }
+      std::memcpy(upload_cpu + constants + 16, identity.data(), 256 * 4);
+    }
+    commands->barriers(plume::RenderBarrierStage::GRAPHICS,
+                       plume::RenderTextureBarrier(target, plume::RenderTextureLayout::COLOR_WRITE));
+    commands->setFramebuffer(SwapFramebuffer(image));
+    commands->setGraphicsPipelineLayout(layout.get());
+    for (uint32_t i = 0; i < 6; ++i) commands->setGraphicsDescriptorSet(sets[i].get(), i);
+    commands->setPipeline(present_pipeline.get());
+    const uint64_t push[3] = {upload_gpu + constants, 0, 0};
+    commands->setGraphicsPushConstants(0, push, 0, sizeof(push));
+    const plume::RenderViewport viewport(0.0f, 0.0f, float(width), float(height));
+    commands->setViewports(&viewport, 1);
+    const plume::RenderRect scissor(0, 0, int32_t(width), int32_t(height));
+    commands->setScissors(&scissor, 1);
+    commands->drawInstanced(3, 1, 0, 0);
+    commands->barriers(plume::RenderBarrierStage::NONE,
+                       plume::RenderTextureBarrier(target, plume::RenderTextureLayout::PRESENT));
+    current = nullptr;
+  }
+
+  // The real frame, kept while the in-between one is drawn into the same
+  // targets and shown first.
+  Texture held;
+  // The real frame's present pass is a submit of its own: Plume gives a
+  // submit one wait stage, so it waits on one swap chain image only.
+  std::unique_ptr<plume::RenderCommandSemaphore> acquire_second;
+  std::unique_ptr<plume::RenderCommandList> commands_second;
+  std::unique_ptr<plume::RenderCommandFence> fence_second;
+  bool second_pending = false;
+  uint64_t interp_frames = 0;
+
+  // Records the frame's journal again, on top of what the frame drew.
+  // False, with a reason counted, when an op's target is gone.
+  bool ReplayFrame() {
+    if (journal.empty()) {
+      Skip("interp: empty journal");
+      return false;
+    }
+    std::unordered_set<const Target*> live;
+    for (const auto& [key, target] : targets) live.insert(&target);
+    for (const DrawOp& op : draw_ops) {
+      if (!live.count(op.target)) {
+        Skip("interp: target gone");
+        return false;
+      }
+    }
+    for (const ClearOp& op : clear_ops) {
+      if (!live.count(op.target)) {
+        Skip("interp: target gone");
+        return false;
+      }
+    }
+    for (const ResolveOp& op : resolve_ops) {
+      if (!live.count(op.target)) {
+        Skip("interp: target gone");
+        return false;
+      }
+    }
+    for (const FrameOp& op : journal) {
+      switch (op.kind) {
+        case FrameOp::kDraw: ExecuteDraw(draw_ops[op.index]); break;
+        case FrameOp::kClear: ExecuteClear(clear_ops[op.index]); break;
+        case FrameOp::kResolve: ExecuteResolve(resolve_ops[op.index]); break;
+      }
+    }
+    return true;
+  }
+
+  // Shows an in-between frame, then the real one, as two presents in a row
+  // (the FIFO swap chain puts them on consecutive vblanks). `front` is the
+  // frontbuffer's entry in `textures`. Records nothing and returns false
+  // when either swap chain image or the ring space is missing, or the
+  // journal cannot be replayed; the caller then presents as usual.
+  bool PresentInterpolated(Texture& front) {
+    if (!present_pipeline || front.index == 0 || !front.texture) {
+      Skip("interp: no frontbuffer");
+      return false;
+    }
+    if (!acquire_second) {
+      acquire_second = device->createCommandSemaphore();
+      commands_second = queue->createCommandList();
+      fence_second = device->createCommandFence();
+    }
+    uint64_t constants_mid = 0, constants_real = 0;
+    if (!Upload(16 + 256 * 4, 256, constants_mid) || !Upload(16 + 256 * 4, 256, constants_real)) {
+      Skip("interp: upload ring full");
+      return false;
+    }
+    if (!held.texture || held.width != front.width || held.height != front.height ||
+        held.view_swizzle != front.view_swizzle) {
+      Retire(held.view);
+      Retire(held.texture);
+      held.texture = device->createTexture(
+          plume::RenderTextureDesc::Texture2D(front.width, front.height, 1, kColorFormat));
+      // The copy has the frontbuffer's texels, so it is read the same way.
+      plume::RenderTextureViewDesc view = plume::RenderTextureViewDesc::Texture2D(kColorFormat);
+      view.componentMapping = ComponentMapping(front.view_swizzle);
+      held.view = held.texture->createTextureView(view);
+      held.view_swizzle = front.view_swizzle;
+      if (held.index == 0) {
+        if (next_texture2d >= kTexture2DCount) return false;
+        held.index = next_texture2d++;
+      }
+      held.width = front.width;
+      held.height = front.height;
+    }
+    uint32_t mid_image = 0, real_image = 0;
+    if (!swap_chain->acquireTexture(acquire.get(), &mid_image)) {
+      Skip("interp: no swap chain image");
+      return false;
+    }
+    const bool second = swap_chain->acquireTexture(acquire_second.get(), &real_image);
+    // Keep frame N.
+    plume::RenderTextureBarrier to_copy[] = {
+        plume::RenderTextureBarrier(front.texture.get(), plume::RenderTextureLayout::COPY_SOURCE),
+        plume::RenderTextureBarrier(held.texture.get(), plume::RenderTextureLayout::COPY_DEST)};
+    commands->barriers(plume::RenderBarrierStage::COPY, to_copy, 2);
+    commands->copyTexture(held.texture.get(), front.texture.get());
+    plume::RenderTextureBarrier after[] = {
+        plume::RenderTextureBarrier(front.texture.get(), plume::RenderTextureLayout::SHADER_READ),
+        plume::RenderTextureBarrier(held.texture.get(), plume::RenderTextureLayout::SHADER_READ)};
+    commands->barriers(plume::RenderBarrierStage::GRAPHICS, after, 2);
+    sets[0]->setTexture(held.index, held.texture.get(), plume::RenderTextureLayout::SHADER_READ,
+                        held.view.get());
+    const bool replayed = second && ReplayFrame();
+    if (!second) Skip("interp: no second swap chain image");
+    if (replayed) {
+      DrawPresentPass(mid_image, front.index, constants_mid);
+      ++interp_frames;
+    } else {
+      // No in-between frame: the real one goes into both images, so each
+      // image acquired is shown.
+      DrawPresentPass(mid_image, held.index, constants_mid);
+    }
+    journal_last = journal.size();
+    commands->end();
+    recording = false;
+    const plume::RenderCommandList* list = commands.get();
+    plume::RenderCommandSemaphore* wait = acquire.get();
+    plume::RenderCommandSemaphore* signal = release[mid_image].get();
+    queue->executeCommandLists(&list, 1, &wait, 1, &signal, 1, fence.get());
+    swap_chain->present(mid_image, &signal, 1);
+    if (second) {
+      // The held frame was written above; a later submit on the queue sees it.
+      std::swap(commands, commands_second);
+      commands->begin();
+      DrawPresentPass(real_image, held.index, constants_real);
+      commands->end();
+      std::swap(commands, commands_second);
+      const plume::RenderCommandList* second_list = commands_second.get();
+      plume::RenderCommandSemaphore* second_wait = acquire_second.get();
+      plume::RenderCommandSemaphore* second_signal = release[real_image].get();
+      queue->executeCommandLists(&second_list, 1, &second_wait, 1, &second_signal, 1, fence_second.get());
+      swap_chain->present(real_image, &second_signal, 1);
+      second_pending = true;
+    }
+    return true;
   }
 
   // Frame journal (native_interpolate): what each guest call recorded, in
@@ -2673,7 +2851,8 @@ void Renderer::Resolve(uint32_t device, uint32_t flags, uint32_t rect, uint32_t 
       s.Retire(entry.texture);
       entry.texture = s.device->createTexture(plume::RenderTextureDesc::Texture2D(width, height, 1, kColorFormat));
       plume::RenderTextureViewDesc view = plume::RenderTextureViewDesc::Texture2D(kColorFormat);
-      view.componentMapping = ComponentMapping(ResolvedSwizzle(fetch.swizzle, fetch.format));
+      entry.view_swizzle = ResolvedSwizzle(fetch.swizzle, fetch.format);
+      view.componentMapping = ComponentMapping(entry.view_swizzle);
       entry.view = entry.texture->createTextureView(view);
       if (entry.index == 0) {
         if (s.next_texture2d >= kTexture2DCount) return;
@@ -2758,9 +2937,19 @@ void Renderer::Present(uint32_t frontbuffer, const uint8_t* base) {
       source_layout = plume::RenderTextureLayout::SHADER_READ;
     }
   }
-  uint32_t image = 0;
   const bool resize = s.swap_chain->needsResize();
-  const bool acquired = !resize && !s.swap_chain->isEmpty() &&
+  bool shown = false;
+  if (REXCVAR_GET(native_interpolate) && s.flip_interval.load(std::memory_order_relaxed) == 2 && !resize &&
+      !s.swap_chain->isEmpty() && source && source_layout == plume::RenderTextureLayout::SHADER_READ) {
+    for (auto& [key, texture] : s.textures) {
+      if (texture.texture.get() == source) {
+        shown = s.PresentInterpolated(texture);
+        break;
+      }
+    }
+  }
+  uint32_t image = 0;
+  const bool acquired = !shown && !resize && !s.swap_chain->isEmpty() &&
                         s.swap_chain->acquireTexture(s.acquire.get(), &image);
   plume::RenderTexture* target = acquired ? s.swap_chain->getTexture(image) : nullptr;
   uint32_t source_index = 0;
@@ -2777,37 +2966,7 @@ void Renderer::Present(uint32_t frontbuffer, const uint8_t* base) {
     s.commands->barriers(plume::RenderBarrierStage::COPY,
                          plume::RenderTextureBarrier(target, plume::RenderTextureLayout::PRESENT));
   } else if (gamma) {
-    // Draw the frontbuffer through the gamma ramp, as the display controller
-    // shows it.
-    const uint32_t header[4] = {source_index, s.PresentSampler(), 0, 0};
-    std::memcpy(s.upload_cpu + present_constants, header, sizeof(header));
-    if (s.has_gamma_ramp) {
-      std::memcpy(s.upload_cpu + present_constants + 16, s.gamma_ramp.data(), 256 * 4);
-    } else {
-      // No ramp written yet: an identity table.
-      std::array<uint32_t, 256> identity;
-      for (uint32_t i = 0; i < 256; ++i) {
-        const uint32_t v = (i * 1023 + 127) / 255;
-        identity[i] = v | (v << 10) | (v << 20);
-      }
-      std::memcpy(s.upload_cpu + present_constants + 16, identity.data(), 256 * 4);
-    }
-    s.commands->barriers(plume::RenderBarrierStage::GRAPHICS,
-                         plume::RenderTextureBarrier(target, plume::RenderTextureLayout::COLOR_WRITE));
-    s.commands->setFramebuffer(s.SwapFramebuffer(image));
-    s.commands->setGraphicsPipelineLayout(s.layout.get());
-    for (uint32_t i = 0; i < 6; ++i) s.commands->setGraphicsDescriptorSet(s.sets[i].get(), i);
-    s.commands->setPipeline(s.present_pipeline.get());
-    const uint64_t push[3] = {s.upload_gpu + present_constants, 0, 0};
-    s.commands->setGraphicsPushConstants(0, push, 0, sizeof(push));
-    const plume::RenderViewport viewport(0.0f, 0.0f, float(s.width), float(s.height));
-    s.commands->setViewports(&viewport, 1);
-    const plume::RenderRect scissor(0, 0, int32_t(s.width), int32_t(s.height));
-    s.commands->setScissors(&scissor, 1);
-    s.commands->drawInstanced(3, 1, 0, 0);
-    s.commands->barriers(plume::RenderBarrierStage::NONE,
-                         plume::RenderTextureBarrier(target, plume::RenderTextureLayout::PRESENT));
-    s.current = nullptr;
+    s.DrawPresentPass(image, source_index, present_constants);
   } else if (target) {
     plume::RenderTextureBarrier to_copy[] = {
         plume::RenderTextureBarrier(source, plume::RenderTextureLayout::COPY_SOURCE),
@@ -2819,11 +2978,15 @@ void Renderer::Present(uint32_t frontbuffer, const uint8_t* base) {
         plume::RenderTextureBarrier(source, source_layout)};
     s.commands->barriers(plume::RenderBarrierStage::NONE, after, 2);
   }
-  s.journal_last = s.journal.size();
-  s.commands->end();
-  s.recording = false;
+  if (!shown) {
+    s.journal_last = s.journal.size();
+    s.commands->end();
+    s.recording = false;
+  }
   const plume::RenderCommandList* list = s.commands.get();
-  if (target) {
+  if (shown) {
+    // Submitted and presented by PresentInterpolated.
+  } else if (target) {
     plume::RenderCommandSemaphore* wait = s.acquire.get();
     plume::RenderCommandSemaphore* signal = s.release[image].get();
     s.queue->executeCommandLists(&list, 1, &wait, 1, &signal, 1, s.fence.get());
@@ -2833,6 +2996,10 @@ void Renderer::Present(uint32_t frontbuffer, const uint8_t* base) {
   }
   const auto t_submit = std::chrono::steady_clock::now();
   s.queue->waitForCommandFence(s.fence.get());
+  if (s.second_pending) {
+    s.queue->waitForCommandFence(s.fence_second.get());
+    s.second_pending = false;
+  }
   s.DestroyRetired();
   // The GPU is idle now, so streams unused for a while can go.
   if ((s.presents & 63) == 0) {
@@ -2894,7 +3061,10 @@ std::string Renderer::TakeStats() {
                      s.stream_misses, s.stream_cache.size(), s.msaa_resolves, s.depth_resolves);
   s.msaa_resolves = 0;
   s.depth_resolves = 0;
-  if (REXCVAR_GET(native_interpolate)) out += fmt::format(" journal={}", s.journal_last);
+  if (REXCVAR_GET(native_interpolate)) {
+    out += fmt::format(" journal={} interp={}", s.journal_last, s.interp_frames);
+    s.interp_frames = 0;
+  }
   s.stream_hits = s.stream_misses = 0;
   out += " laps";
   for (const double ms : s.ms_lap) out += fmt::format(" {:.0f}", ms);
