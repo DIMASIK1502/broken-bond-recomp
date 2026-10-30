@@ -74,6 +74,10 @@ if(TARGET xxHash::xxhash)
         $<TARGET_PROPERTY:xxHash::xxhash,INTERFACE_INCLUDE_DIRECTORIES>)
 endif()
 
+# Unit test for the frame interpolation helpers (no GPU, no game data).
+add_executable(interpolation_test tools/interpolation_test.cpp src/render/interpolation.cpp)
+target_include_directories(interpolation_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+
 # Reads game/xeshader.sdb. Not part of the game link and writes no cache.
 # The installed GPU plugin is D3D12-only, so SPIR-V is compiled from the SDK
 # checkout when that tree sits next to this repo. The game plugin is not rebuilt.
