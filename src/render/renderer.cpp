@@ -208,13 +208,62 @@ plume::RenderBlendOperation BlendOp(uint32_t op) {
 // How a guest element becomes host vertex data: copied as is, or decoded to
 // four 32-bit floats (written as floats, or as their bits for the uint4
 // inputs XenosRecomp reads through asfloat).
-enum class ElementConvert : uint8_t { kCopy, kFloat4, kFloat4Bits };
+enum class ElementConvert : uint8_t { kCopy, kFloat4, kFloat4Bits, kPacked101111 };
 
 struct ElementSource {
   xenos::VertexFormat format;
   bool is_signed;
   bool is_integer;
+  // Declaration swizzle (format word bits 10-21), three bits per output
+  // component: 0-3 pick x/y/z/w, 4 is 0, 5 is 1. D3D patches it into the
+  // vfetch instructions when it binds a declaration, after the shader cache
+  // was keyed, so the host applies it while gathering the stream.
+  uint32_t swizzle;
 };
+
+uint32_t ComponentCount(xenos::VertexFormat format) {
+  switch (format) {
+    case xenos::VertexFormat::k_32_FLOAT:
+      return 1;
+    case xenos::VertexFormat::k_16_16:
+    case xenos::VertexFormat::k_16_16_FLOAT:
+    case xenos::VertexFormat::k_32_32_FLOAT:
+      return 2;
+    case xenos::VertexFormat::k_10_11_11:
+    case xenos::VertexFormat::k_11_11_10:
+    case xenos::VertexFormat::k_32_32_32_FLOAT:
+      return 3;
+    default:
+      return 4;
+  }
+}
+
+// True when the swizzle does more than the host fetch already does (absent
+// components read as 0, absent w as 1).
+bool SwizzleMatters(const ElementSource& source) {
+  const uint32_t n = ComponentCount(source.format);
+  for (uint32_t c = 0; c < 4; ++c) {
+    const uint32_t pick = (source.swizzle >> (3 * c)) & 7;
+    const uint32_t natural = c < n ? c : (c == 3 ? 5 : 4);
+    if (pick < 6 && pick != natural) return true;
+  }
+  return false;
+}
+
+void ApplySwizzle(uint32_t swizzle, float value[4]) {
+  float in[4];
+  std::memcpy(in, value, sizeof(in));
+  for (uint32_t c = 0; c < 4; ++c) {
+    const uint32_t pick = (swizzle >> (3 * c)) & 7;
+    if (pick < 4) {
+      value[c] = in[pick];
+    } else if (pick == 4) {
+      value[c] = 0.0f;
+    } else if (pick == 5) {
+      value[c] = 1.0f;
+    }
+  }
+}
 
 uint32_t GuestElementSize(xenos::VertexFormat format) {
   switch (format) {
@@ -350,6 +399,7 @@ bool ElementFormat(uint32_t usage, uint32_t format_word, plume::RenderFormat& ou
   source.format = static_cast<xenos::VertexFormat>(format_word & 0x3F);
   source.is_signed = (format_word & 0x100) != 0;
   source.is_integer = (format_word & 0x200) != 0;
+  source.swizzle = (format_word >> 10) & 0xFFF;
   in_size = GuestElementSize(source.format);
   if (in_size == 0) return false;
   const bool raw = usage == uint32_t(DeclUsage::kNormal) || usage == uint32_t(DeclUsage::kTangent) ||
@@ -362,15 +412,22 @@ bool ElementFormat(uint32_t usage, uint32_t format_word, plume::RenderFormat& ou
     out = F::R8G8B8A8_UINT;
     return true;
   }
+  const bool swizzled = SwizzleMatters(source);
   if (raw) {
-    if (source.format == xenos::VertexFormat::k_11_11_10 ||
-        source.format == xenos::VertexFormat::k_10_11_11) {
+    if (!swizzled && (source.format == xenos::VertexFormat::k_11_11_10 ||
+                      source.format == xenos::VertexFormat::k_10_11_11)) {
       out = F::R32_UINT;
       packed_normal = true;
       return true;
     }
     convert = ElementConvert::kFloat4Bits;
     out = F::R32G32B32A32_UINT;
+    out_size = 16;
+    return true;
+  }
+  if (swizzled) {
+    convert = ElementConvert::kFloat4;
+    out = F::R32G32B32A32_FLOAT;
     out_size = 16;
     return true;
   }
@@ -435,6 +492,19 @@ void ConvertElement(const uint8_t* src, uint8_t* dst, uint32_t in_size, ElementC
   }
   float value[4];
   DecodeElement(source, src, value);
+  ApplySwizzle(source.swizzle, value);
+  if (convert == ElementConvert::kPacked101111) {
+    // XenosRecomp's tfetchR11G11B10: x and y 11-bit, z 10-bit, two's
+    // complement over 1024, 1024 and 512.
+    auto field = [](float v, float scale, int32_t lo, int32_t hi, uint32_t mask) {
+      return uint32_t(std::clamp<int32_t>(int32_t(std::lround(v * scale)), lo, hi)) & mask;
+    };
+    const uint32_t packed = field(value[0], 1024.0f, -1024, 1023, 0x7FF) |
+                            (field(value[1], 1024.0f, -1024, 1023, 0x7FF) << 11) |
+                            (field(value[2], 512.0f, -512, 511, 0x3FF) << 22);
+    std::memcpy(dst, &packed, 4);
+    return;
+  }
   std::memcpy(dst, value, 16);
 }
 
@@ -498,6 +568,63 @@ plume::RenderComponentMapping ComponentMapping(uint32_t swizzle) {
     }
   };
   return plume::RenderComponentMapping(one(swizzle), one(swizzle >> 3), one(swizzle >> 6), one(swizzle >> 9));
+}
+
+// Xenos fetches of one-component formats return that component in all four
+// channels, and of two-component formats return the second one in z and w
+// too. Host views of such formats read 0 and 1 there instead, so the fetch
+// swizzle's picks are redirected to the components that exist.
+uint32_t HostSwizzle(uint32_t swizzle, xenos::TextureFormat format) {
+  uint32_t components = 4;
+  switch (format) {
+    case xenos::TextureFormat::k_8:
+    case xenos::TextureFormat::k_8_A:
+    case xenos::TextureFormat::k_8_B:
+    case xenos::TextureFormat::k_DXT3A:
+    case xenos::TextureFormat::k_DXT5A:
+    case xenos::TextureFormat::k_16:
+    case xenos::TextureFormat::k_16_EXPAND:
+    case xenos::TextureFormat::k_16_FLOAT:
+    case xenos::TextureFormat::k_32_FLOAT:
+      components = 1;
+      break;
+    case xenos::TextureFormat::k_8_8:
+    case xenos::TextureFormat::k_DXN:
+    case xenos::TextureFormat::k_16_16:
+    case xenos::TextureFormat::k_16_16_EXPAND:
+    case xenos::TextureFormat::k_16_16_FLOAT:
+    case xenos::TextureFormat::k_32_32_FLOAT:
+      components = 2;
+      break;
+    default:
+      return swizzle;
+  }
+  uint32_t out = 0;
+  for (uint32_t c = 0; c < 4; ++c) {
+    uint32_t pick = (swizzle >> (3 * c)) & 7;
+    if (pick < 4) pick = std::min(pick, components - 1);
+    out |= pick << (3 * c);
+  }
+  return out;
+}
+
+// A resolve leaves 8:8:8:8 and 2:10:10:10 pixels in guest memory in D3D's
+// ARGB order, which a fetch reads as BGRA, and the game's fetch swizzle
+// (zyxw) turns back into RGBA. The host copy of a resolve keeps the target's
+// RGBA order, so for it the swizzle's picks of x and z trade places.
+uint32_t ResolvedSwizzle(uint32_t swizzle, xenos::TextureFormat format) {
+  if (format != xenos::TextureFormat::k_8_8_8_8 && format != xenos::TextureFormat::k_2_10_10_10) return swizzle;
+  uint32_t out = 0;
+  for (uint32_t c = 0; c < 4; ++c) {
+    uint32_t pick = (swizzle >> (3 * c)) & 7;
+    if (pick == 0) {
+      pick = 2;
+    } else if (pick == 2) {
+      pick = 0;
+    }
+    out |= pick << (3 * c);
+  }
+  return out;
 }
 
 // Names one guest image by its texture fetch constant. Clamp and filter
@@ -626,7 +753,19 @@ struct Renderer::State {
   // Guest base address of every resolve destination -> its texture key. The
   // game samples a resolved image through fetch constants that differ from
   // the destination object's (format view, flags), so the address decides.
-  std::unordered_map<uint32_t, uint64_t> resolved_at;
+  // Resolve destinations by physical address. With Xenos off nothing writes
+  // the guest memory a resolve targets, so if its first page changes the CPU
+  // has put something else there (a texture streamed into freed memory) and
+  // the address no longer means the resolved image.
+  struct ResolvedAt {
+    uint64_t key;
+    uint64_t guest;
+  };
+  std::unordered_map<uint32_t, ResolvedAt> resolved_at;
+
+  static uint64_t GuestPageHash(const uint8_t* base, uint32_t physical) {
+    return XXH3_64bits(At(base, PhysicalView(physical)), 4096);
+  }
 
   // A guest D3DRECT {x1, y1, x2, y2} scaled to the host target.
   plume::RenderRect HostRect(const uint8_t* base, uint32_t rect) const {
@@ -891,9 +1030,13 @@ struct Renderer::State {
   // are uploaded again.
   uint32_t Texture2DFor(const uint32_t words[6], const xenos::xe_gpu_texture_fetch_t& fetch,
                         const uint8_t* base, bool& uploaded) {
-    if (auto at = resolved_at.find(TexturePhysical(fetch.base_address)); at != resolved_at.end()) {
-      auto resolved = textures.find(at->second);
-      if (resolved != textures.end()) return resolved->second.index;
+    const uint32_t physical = TexturePhysical(fetch.base_address);
+    if (auto at = resolved_at.find(physical); at != resolved_at.end()) {
+      auto resolved = textures.find(at->second.key);
+      if (resolved != textures.end() && at->second.guest == GuestPageHash(base, physical)) {
+        return resolved->second.index;
+      }
+      resolved_at.erase(at);
     }
     const uint64_t key = ImageKey(words);
     auto found = textures.find(key);
@@ -944,7 +1087,7 @@ struct Renderer::State {
       Texture texture;
       texture.texture = device->createTexture(plume::RenderTextureDesc::Texture2D(width, height, 1, host));
       plume::RenderTextureViewDesc view = plume::RenderTextureViewDesc::Texture2D(host);
-      view.componentMapping = ComponentMapping(fetch.swizzle);
+      view.componentMapping = ComponentMapping(HostSwizzle(fetch.swizzle, fetch.format));
       texture.view = texture.texture->createTextureView(view);
       texture.index = next_texture2d++;
       found = textures.emplace(key, std::move(texture)).first;
@@ -1145,6 +1288,18 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
       return;
     }
     packed_normals |= packed;
+  }
+  // One spec constant makes the vertex shader unpack NORMAL, TANGENT and
+  // BINORMAL alike, so when any of them is packed 11:11:10 the others are
+  // repacked that way too.
+  if (packed_normals) {
+    for (uint32_t i = 0; i < element_count; ++i) {
+      if (elems[i].convert == ElementConvert::kFloat4Bits) {
+        elems[i].convert = ElementConvert::kPacked101111;
+        elems[i].format = plume::RenderFormat::R32_UINT;
+        elems[i].out_size = 4;
+      }
+    }
   }
 
   std::array<plume::RenderInputElement, 16> elements;
@@ -1442,8 +1597,9 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
       for (uint32_t w = 0; w < 6; ++w) fw[w] = Be32(base, device + kDeviceFetch + 24 * slot + 4 * w);
       xenos::xe_gpu_texture_fetch_t ff;
       std::memcpy(&ff, fw, sizeof(fw));
-      line += fmt::format(" | t{}=#{}{}@{:08X}/f{}/{}x{}", slot, index, resolved ? "r" : "", ff.base_address << 12,
-                          uint32_t(ff.format), ff.size_2d.width + 1, ff.size_2d.height + 1);
+      line += fmt::format(" | t{}=#{}{}@{:08X}/f{}/{}x{} [{:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]", slot, index,
+                          resolved ? "r" : "", ff.base_address << 12, uint32_t(ff.format), ff.size_2d.width + 1,
+                          ff.size_2d.height + 1, fw[0], fw[1], fw[2], fw[3], fw[4], fw[5]);
     }
     s.dump += line + "\n";
   }
@@ -1505,12 +1661,13 @@ void Renderer::Resolve(uint32_t device, uint32_t flags, uint32_t rect, uint32_t 
     const uint32_t width = std::max(1u, uint32_t(std::lround(guest_width * s.scale_x)));
     const uint32_t height = std::max(1u, uint32_t(std::lround(guest_height * s.scale_y)));
     const uint64_t key = ImageKey(words);
-    s.resolved_at[TexturePhysical(fetch.base_address)] = key;
+    const uint32_t physical = TexturePhysical(fetch.base_address);
+    s.resolved_at[physical] = {key, State::GuestPageHash(base, physical)};
     State::Texture& entry = s.textures[key];
     if (!entry.texture || !entry.resolved || entry.width != width || entry.height != height) {
       entry.texture = s.device->createTexture(plume::RenderTextureDesc::Texture2D(width, height, 1, kColorFormat));
       plume::RenderTextureViewDesc view = plume::RenderTextureViewDesc::Texture2D(kColorFormat);
-      view.componentMapping = ComponentMapping(fetch.swizzle);
+      view.componentMapping = ComponentMapping(ResolvedSwizzle(fetch.swizzle, fetch.format));
       entry.view = entry.texture->createTextureView(view);
       if (entry.index == 0) {
         if (s.next_texture2d >= kTexture2DCount) return;
@@ -1640,6 +1797,13 @@ void Renderer::Present(uint32_t frontbuffer, const uint8_t* base) {
     if (FILE* f = std::fopen(path.c_str(), "w")) {
       std::fputs(s.dump.c_str(), f);
       std::fprintf(f, "present frontbuffer=%08X target=%ux%u\n", frontbuffer, s.width, s.height);
+      for (const auto& [physical, at] : s.resolved_at) {
+        auto found = s.textures.find(at.key);
+        if (found == s.textures.end()) continue;
+        std::fprintf(f, "resolved_at %08X key=%016llX index=#%u %ux%u\n", physical,
+                     static_cast<unsigned long long>(at.key), found->second.index, found->second.width,
+                     found->second.height);
+      }
       std::fclose(f);
     }
     s.dump.clear();
