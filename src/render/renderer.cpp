@@ -977,6 +977,7 @@ struct Renderer::State {
     }
     if (samples > 1 && (fresh || !image.msaa || image.msaa_samples != samples)) {
       const plume::RenderMultisampling multisampling(static_cast<plume::RenderSampleCounts>(samples));
+      Retire(image.msaa);
       image.msaa = device->createTexture(
           is_depth ? plume::RenderTextureDesc::DepthTarget(image.width, image.height, kDepthFormat, multisampling)
                    : plume::RenderTextureDesc::ColorTarget(image.width, image.height, kColorFormat, multisampling));
@@ -1008,6 +1009,12 @@ struct Renderer::State {
   }
 
   void CreateImage(Image& image, uint32_t pitch, uint32_t rows, bool is_depth) {
+    // The multisampled twin must match the new size, so it is made again
+    // the next time a multisampled surface uses the image.
+    Retire(image.msaa);
+    image.msaa_samples = 0;
+    image.msaa_newer = false;
+    Retire(image.texture);
     image.guest_width = pitch;
     image.guest_height = std::max(rows, image.guest_height);
     if (pitch == 1280) image.guest_height = std::max<uint32_t>(image.guest_height, 720);
@@ -1056,6 +1063,7 @@ struct Renderer::State {
       for (auto it = targets.begin(); it != targets.end();) {
         if ((fresh_color && it->second.color == &color_image) || (fresh_depth && it->second.depth == &depth_image)) {
           if (current == &it->second) current = nullptr;
+          Retire(it->second.framebuffer);
           it = targets.erase(it);
         } else {
           ++it;
@@ -1098,6 +1106,29 @@ struct Renderer::State {
 
   uint64_t presents = 0;
   uint64_t msaa_resolves = 0;
+
+  // GPU objects replaced while a frame is being recorded. The command list
+  // may still reference them (a framebuffer, a barrier, a copy), and
+  // destroying them invalidates it, which NVIDIA's driver does not survive.
+  // They are destroyed once the frame's fence has passed.
+  std::vector<std::unique_ptr<plume::RenderTexture>> retired_textures;
+  std::vector<std::unique_ptr<plume::RenderTextureView>> retired_views;
+  std::vector<std::unique_ptr<plume::RenderFramebuffer>> retired_framebuffers;
+
+  void Retire(std::unique_ptr<plume::RenderTexture>& texture) {
+    if (texture) retired_textures.push_back(std::move(texture));
+  }
+  void Retire(std::unique_ptr<plume::RenderTextureView>& view) {
+    if (view) retired_views.push_back(std::move(view));
+  }
+  void Retire(std::unique_ptr<plume::RenderFramebuffer>& framebuffer) {
+    if (framebuffer) retired_framebuffers.push_back(std::move(framebuffer));
+  }
+  void DestroyRetired() {
+    retired_framebuffers.clear();
+    retired_views.clear();
+    retired_textures.clear();
+  }
 
   std::mutex mutex;  // Draw and Present run on the guest thread, TakeStats on the sampler
   std::map<std::string, uint64_t> skipped;
@@ -1344,6 +1375,8 @@ struct Renderer::State {
     const uint32_t index = next_texture1d + 1;
     const uint32_t swizzle = HostSwizzle(fetch.swizzle, fetch.format);
     if (!slot.texture || slot.width != width || slot.format != host || slot.swizzle != swizzle) {
+      Retire(slot.view);
+      Retire(slot.texture);
       slot.texture = device->createTexture(plume::RenderTextureDesc::Texture1D(width, 1, host));
       plume::RenderTextureViewDesc view = plume::RenderTextureViewDesc::Texture1D(host);
       view.componentMapping = ComponentMapping(swizzle);
@@ -2306,6 +2339,8 @@ void Renderer::Resolve(uint32_t device, uint32_t flags, uint32_t rect, uint32_t 
     s.resolved_at[physical] = {key, State::GuestPageHash(base, physical)};
     State::Texture& entry = s.textures[key];
     if (!entry.texture || !entry.resolved || entry.width != width || entry.height != height) {
+      s.Retire(entry.view);
+      s.Retire(entry.texture);
       entry.texture = s.device->createTexture(plume::RenderTextureDesc::Texture2D(width, height, 1, kColorFormat));
       plume::RenderTextureViewDesc view = plume::RenderTextureViewDesc::Texture2D(kColorFormat);
       view.componentMapping = ComponentMapping(ResolvedSwizzle(fetch.swizzle, fetch.format));
@@ -2487,6 +2522,7 @@ void Renderer::Present(uint32_t frontbuffer, const uint8_t* base) {
   }
   const auto t_submit = std::chrono::steady_clock::now();
   s.queue->waitForCommandFence(s.fence.get());
+  s.DestroyRetired();
   // The GPU is idle now, so streams unused for a while can go.
   if ((s.presents & 63) == 0) {
     std::erase_if(s.stream_cache, [&](const auto& entry) { return s.presents - entry.second.last_used > 120; });
