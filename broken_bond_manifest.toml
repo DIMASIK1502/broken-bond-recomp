@@ -15,6 +15,7 @@ includes = []
 # Do not bulk-register estimated holes: that produced empty stubs and new
 # unresolved branches.
 [entrypoint.functions]
+0x8215D000 = {}  # qsort comparator passed by sub_8215D588 (trapped at runtime before the Sarutobi funeral)
 0x821C9DE0 = {}
 0x821C9DE8 = {}
 0x821CD298 = {}
@@ -29,5 +30,6 @@ includes = []
 0x82310568 = {}
 0x82310580 = {}
 0x823522F8 = {}
+0x825085F8 = {}  # qsort comparator passed by sub_8251E5A8; not trapped yet, found by checking every qsort call
 0x827545F0 = {}
 0x82754624 = {}
