@@ -1010,6 +1010,15 @@ struct Renderer::State {
                                                                             : plume::RenderTextureLayout::COLOR_WRITE));
   }
 
+  // Host samples for the surface the device's RB_SURFACE_INFO describes
+  // (bits 16-17: 1, 2 or 4 samples), capped by native_msaa. Draws build their
+  // pipeline with it before the target is bound, so both must agree.
+  static uint32_t SurfaceSamples(const uint8_t* base, uint32_t guest_device) {
+    const uint32_t surface = Reg(base, guest_device, 0x2000);
+    const uint32_t guest_samples = 1u << std::min<uint32_t>((surface >> 16) & 3, 2);
+    return std::clamp<uint32_t>(guest_samples, 1, uint32_t(std::max<int32_t>(REXCVAR_GET(native_msaa), 1)));
+  }
+
   // Binds the target the device's EDRAM registers describe, creating or
   // growing its images so they hold `rows` guest rows.
   void SelectTarget(const uint8_t* base, uint32_t guest_device, uint32_t rows) {
@@ -1017,10 +1026,7 @@ struct Renderer::State {
     const uint32_t color_info = Reg(base, guest_device, 0x2001);
     const uint32_t depth_info = Reg(base, guest_device, 0x2002);
     const uint32_t pitch = std::max<uint32_t>(surface & 0x3FFF, 1);
-    // RB_SURFACE_INFO bits 16-17: 1, 2 or 4 samples.
-    const uint32_t guest_samples = 1u << std::min<uint32_t>((surface >> 16) & 3, 2);
-    const uint32_t samples =
-        std::clamp<uint32_t>(guest_samples, 1, uint32_t(std::max<int32_t>(REXCVAR_GET(native_msaa), 1)));
+    const uint32_t samples = SurfaceSamples(base, guest_device);
     rows = std::clamp<uint32_t>(rows, 1, 2048);
     const uint64_t color_key = (uint64_t(pitch) << 32) | (color_info & 0x000F0FFF);
     const uint64_t depth_key = (uint64_t(pitch) << 32) | (depth_info & 0x00010FFF);
@@ -1897,7 +1903,8 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
   const uint32_t state_key[8] = {(depth_control & 1) ? depth_control : depth_control & 0x77,
                                  blend_control, color_mask, uint32_t(topology), spec, uint32_t(ps_object != 0),
                                  sc_mode, stencil_ref};
-  XXH3_64bits_update(&key_state, &s.current_samples, sizeof(s.current_samples));
+  const uint32_t target_samples = State::SurfaceSamples(base, device);
+  XXH3_64bits_update(&key_state, &target_samples, sizeof(target_samples));
   XXH3_64bits_update(&key_state, state_key, sizeof(state_key));
   XXH3_64bits_update(&key_state, &vs_key, 8);
   XXH3_64bits_update(&key_state, &ps_key, 8);
@@ -1937,7 +1944,7 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
       desc.stencilBackFace = (depth_control & 0x80) ? StencilFace(depth_control, 20) : desc.stencilFrontFace;
     }
     desc.depthTargetFormat = kDepthFormat;
-    desc.multisampling = plume::RenderMultisampling(static_cast<plume::RenderSampleCounts>(s.current_samples));
+    desc.multisampling = plume::RenderMultisampling(static_cast<plume::RenderSampleCounts>(target_samples));
     desc.renderTargetCount = 1;
     desc.renderTargetFormat[0] = kColorFormat;
     plume::RenderBlendDesc& blend = desc.renderTargetBlend[0];
