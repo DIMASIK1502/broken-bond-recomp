@@ -900,6 +900,10 @@ struct Renderer::State {
     uint32_t width = 0;
     plume::RenderFormat format = plume::RenderFormat::UNKNOWN;
     uint32_t swizzle = 0;
+    // This frame's texels in the upload ring.
+    uint64_t ring = 0;
+    uint32_t ring_bytes = 0;
+    uint32_t row_texels = 0;
   };
   std::vector<Texture1DSlot> texture1d_slots;
   // Present pass: the frontbuffer through the game's gamma ramp.
@@ -1448,9 +1452,21 @@ struct Renderer::State {
       }
     }
     if (texture1d_slots.size() <= next_texture1d) texture1d_slots.resize(next_texture1d + 1);
+    const uint32_t row_texels = uint32_t(row / linear.block_bytes) * linear.block_width;
+    const uint32_t index = FillTexture1DSlot(width, host, HostSwizzle(fetch.swizzle, fetch.format), offset,
+                                             uint32_t(row * linear.height_blocks), row_texels);
+    texture1d_frame[frame_key] = index;
+    uploaded = true;
+    return index;
+  }
+
+  // Takes the next 1D pool slot and copies `bytes` of texels at ring offset
+  // `ring` into it. Returns its heap index; the caller checked the pool.
+  uint32_t FillTexture1DSlot(uint32_t width, plume::RenderFormat host, uint32_t swizzle, uint64_t ring,
+                             uint32_t bytes, uint32_t row_texels) {
+    if (texture1d_slots.size() <= next_texture1d) texture1d_slots.resize(next_texture1d + 1);
     Texture1DSlot& slot = texture1d_slots[next_texture1d];
     const uint32_t index = next_texture1d + 1;
-    const uint32_t swizzle = HostSwizzle(fetch.swizzle, fetch.format);
     if (!slot.texture || slot.width != width || slot.format != host || slot.swizzle != swizzle) {
       Retire(slot.view);
       Retire(slot.texture);
@@ -1462,18 +1478,18 @@ struct Renderer::State {
       slot.format = host;
       slot.swizzle = swizzle;
     }
+    slot.ring = ring;
+    slot.ring_bytes = bytes;
+    slot.row_texels = row_texels;
     commands->barriers(plume::RenderBarrierStage::COPY,
                        plume::RenderTextureBarrier(slot.texture.get(), plume::RenderTextureLayout::COPY_DEST));
-    const uint32_t row_texels = uint32_t(row / linear.block_bytes) * linear.block_width;
     commands->copyTextureRegion(
         plume::RenderTextureCopyLocation::Subresource(slot.texture.get()),
-        plume::RenderTextureCopyLocation::PlacedFootprint(upload.get(), host, width, 1, 1, row_texels, offset));
+        plume::RenderTextureCopyLocation::PlacedFootprint(upload.get(), host, width, 1, 1, row_texels, ring));
     commands->barriers(plume::RenderBarrierStage::GRAPHICS,
                        plume::RenderTextureBarrier(slot.texture.get(), plume::RenderTextureLayout::SHADER_READ));
     sets[5]->setTexture(index, slot.texture.get(), plume::RenderTextureLayout::SHADER_READ, slot.view.get());
     ++next_texture1d;
-    texture1d_frame[frame_key] = index;
-    uploaded = true;
     return index;
   }
 
@@ -1716,12 +1732,34 @@ struct Renderer::State {
   // The previous presented frame, for blending: each draw's key and its
   // vertex shader constants (kVsFloats floats per draw).
   static constexpr size_t kVsFloats = gfx::kVertexShaderConstantsBytes / 4;
+  struct DrawOp;  // the frame journal's, below
+  struct PrevBones {
+    uint32_t fetch_slot;  // which of the draw's fetch slots
+    uint32_t width;
+    plume::RenderFormat format;
+    size_t offset;  // into PrevFrame::bones_data
+    uint32_t bytes;
+  };
   struct PrevFrame {
     std::vector<uint64_t> keys;
     std::vector<float> vs_constants;
+    // Half-float 1D textures (skinning bones) per draw: bones[bones_first[i]
+    // .. bones_first[i + 1]) belong to draw i.
+    std::vector<uint32_t> bones_first;
+    std::vector<PrevBones> bones;
+    std::vector<uint8_t> bones_data;
     uint32_t interval = 0;
     bool valid = false;
   } prev;
+  uint64_t bones_blended = 0;
+
+  // The 1D pool slot behind fetch slot `fetch_slot` of a draw, or null.
+  const Texture1DSlot* DrawTexture1D(const DrawOp& op, uint32_t fetch_slot) const {
+    const auto* indices = reinterpret_cast<const uint32_t*>(upload_cpu + op.shared);
+    const uint32_t index = indices[DESCRIPTOR_KIND_TEXTURE1D * DESCRIPTOR_SLOT_COUNT + fetch_slot];
+    if (index == 0 || index > texture1d_slots.size()) return nullptr;
+    return &texture1d_slots[index - 1];
+  }
   float last_match = 0.0f;
 
   // Keeps what the next frame blends with. Called after the frame's fence,
@@ -1734,6 +1772,20 @@ struct Renderer::State {
       std::memcpy(prev.vs_constants.data() + i * kVsFloats, upload_cpu + draw_ops[i].vs_constants,
                   kVsFloats * 4);
     }
+    prev.bones_first.assign(draw_ops.size() + 1, 0);
+    prev.bones.clear();
+    prev.bones_data.clear();
+    for (size_t i = 0; i < draw_ops.size(); ++i) {
+      prev.bones_first[i] = uint32_t(prev.bones.size());
+      for (uint32_t fetch_slot = 0; fetch_slot < DESCRIPTOR_SLOT_COUNT; ++fetch_slot) {
+        const Texture1DSlot* slot = DrawTexture1D(draw_ops[i], fetch_slot);
+        if (!slot || slot->format != plume::RenderFormat::R16G16B16A16_FLOAT) continue;
+        prev.bones.push_back({fetch_slot, slot->width, slot->format, prev.bones_data.size(), slot->ring_bytes});
+        prev.bones_data.insert(prev.bones_data.end(), upload_cpu + slot->ring,
+                               upload_cpu + slot->ring + slot->ring_bytes);
+      }
+    }
+    prev.bones_first[draw_ops.size()] = uint32_t(prev.bones.size());
     prev.interval = flip_interval.load(std::memory_order_relaxed);
     prev.valid = !draw_ops.empty();
   }
@@ -1747,8 +1799,8 @@ struct Renderer::State {
       Skip("interp: empty journal");
       return false;
     }
-    if (!prev.valid) {
-      Skip("interp: no previous frame");
+    if (!interp::ShouldInterpolate(true, flip_interval.load(std::memory_order_relaxed), prev.valid, prev.interval)) {
+      Skip(prev.valid ? "interp: mode change" : "interp: no previous frame");
       return false;
     }
     std::vector<uint64_t> keys(draw_ops.size());
@@ -1757,6 +1809,19 @@ struct Renderer::State {
     last_match = interp::MatchedShare(match);
     if (last_match < 0.9f) {
       Skip("interp: few matches");
+      return false;
+    }
+    // A cut: most paired draws' first four vertex constants (their
+    // transform) moved far in one step.
+    size_t pairs = 0, jumps = 0;
+    for (size_t i = 0; i < match.size(); ++i) {
+      if (match[i] < 0) continue;
+      ++pairs;
+      jumps += interp::Jumped(prev.vs_constants.data() + size_t(match[i]) * kVsFloats,
+                              reinterpret_cast<const float*>(upload_cpu + draw_ops[i].vs_constants), 16, 0.5f);
+    }
+    if (jumps * 2 > pairs) {
+      Skip("interp: camera jump");
       return false;
     }
     const size_t paired = size_t(std::count_if(match.begin(), match.end(), [](int32_t m) { return m >= 0; }));
@@ -1799,6 +1864,7 @@ struct Renderer::State {
                              reinterpret_cast<float*>(upload_cpu + blended), kVsFloats, 0.5f);
           mid.vs_constants = blended;
           blended += kVsFloats * 4;
+          BlendBones(mid, size_t(pair));
           ExecuteDraw(mid);
           break;
         }
@@ -1807,6 +1873,38 @@ struct Renderer::State {
       }
     }
     return true;
+  }
+
+  // Points `mid`'s half-float 1D textures (bones) at new pool slots holding
+  // texels halfway between the paired previous draw's and this one's. A
+  // texture without a counterpart of the same size, or no room in the pool
+  // or the ring, keeps this frame's texels.
+  void BlendBones(DrawOp& mid, size_t pair) {
+    if (pair + 1 >= prev.bones_first.size()) return;
+    uint64_t shared = 0;
+    bool copied = false;
+    for (uint32_t b = prev.bones_first[pair]; b < prev.bones_first[pair + 1]; ++b) {
+      const PrevBones& old = prev.bones[b];
+      const Texture1DSlot* slot = DrawTexture1D(mid, old.fetch_slot);
+      if (!slot || slot->format != old.format || slot->width != old.width || slot->ring_bytes != old.bytes) continue;
+      uint64_t ring = 0;
+      if (next_texture1d + 1 >= kTexture1DCount || !Upload(old.bytes, 512, ring)) return;
+      if (!copied) {
+        if (!Upload(gfx::kSharedConstantsBytes, 256, shared)) return;
+        std::memcpy(upload_cpu + shared, upload_cpu + mid.shared, gfx::kSharedConstantsBytes);
+        mid.shared = shared;
+        copied = true;
+      }
+      interp::LerpHalfs(reinterpret_cast<const uint16_t*>(prev.bones_data.data() + old.offset),
+                        reinterpret_cast<const uint16_t*>(upload_cpu + slot->ring),
+                        reinterpret_cast<uint16_t*>(upload_cpu + ring), old.bytes / 2, 0.5f);
+      const uint32_t index = FillTexture1DSlot(slot->width, slot->format, slot->swizzle, ring, old.bytes,
+                                               slot->row_texels);
+      auto* indices = reinterpret_cast<uint32_t*>(upload_cpu + mid.shared);
+      indices[DESCRIPTOR_KIND_TEXTURE1D * DESCRIPTOR_SLOT_COUNT + old.fetch_slot] = index;
+      mid.uploaded = true;
+      ++bones_blended;
+    }
   }
 
   // Shows an in-between frame, then the real one, as two presents in a row
@@ -3122,7 +3220,9 @@ std::string Renderer::TakeStats() {
   s.msaa_resolves = 0;
   s.depth_resolves = 0;
   if (REXCVAR_GET(native_interpolate)) {
-    out += fmt::format(" journal={} interp={} match={:.2f}", s.journal_last, s.interp_frames, s.last_match);
+    out += fmt::format(" journal={} interp={} match={:.2f} bones={}", s.journal_last, s.interp_frames, s.last_match,
+                       s.bones_blended);
+    s.bones_blended = 0;
     s.interp_frames = 0;
   }
   s.stream_hits = s.stream_misses = 0;
