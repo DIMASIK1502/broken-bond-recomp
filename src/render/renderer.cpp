@@ -405,8 +405,27 @@ bool ElementFormat(uint32_t usage, uint32_t format_word, plume::RenderFormat& ou
   return true;
 }
 
+bool SixteenBitComponents(xenos::VertexFormat format) {
+  return format == xenos::VertexFormat::k_16_16 || format == xenos::VertexFormat::k_16_16_16_16 ||
+         format == xenos::VertexFormat::k_16_16_FLOAT || format == xenos::VertexFormat::k_16_16_16_16_FLOAT;
+}
+
+// src is the element after the fetch endian swap. With an 8in32 swap the two
+// 16-bit components of each dword come out in reverse order, but Xenos
+// fetches the one at the lower guest address as x (seen on the boot screens:
+// SHORT2 positions only fill the screen with x and y in guest order).
 void ConvertElement(const uint8_t* src, uint8_t* dst, uint32_t in_size, ElementConvert convert,
-                    const ElementSource& source) {
+                    const ElementSource& source, uint32_t endian) {
+  uint8_t fixed[16];
+  if (endian == 2 && SixteenBitComponents(source.format)) {
+    for (uint32_t i = 0; i + 3 < in_size; i += 4) {
+      fixed[i] = src[i + 2];
+      fixed[i + 1] = src[i + 3];
+      fixed[i + 2] = src[i];
+      fixed[i + 3] = src[i + 1];
+    }
+    src = fixed;
+  }
   if (convert == ElementConvert::kCopy) {
     std::memcpy(dst, src, in_size);
     return;
@@ -619,8 +638,13 @@ struct Renderer::State {
         plume::RenderTextureBarrier(depth.get(), plume::RenderTextureLayout::DEPTH_WRITE)};
     commands->barriers(plume::RenderBarrierStage::GRAPHICS, barriers, 2);
     BindTarget();
-    commands->clearColor(0, plume::RenderColor(0.0f, 0.0f, 0.0f, 1.0f));
-    commands->clearDepthStencil(true, true, 1.0f, 0);
+    // The game clears through ClearF and Resolve. It draws before Swap and
+    // resolves its tiles after it, so the target carries over between frames;
+    // only the very first frame starts from a defined state.
+    if (presents == 0) {
+      commands->clearColor(0, plume::RenderColor(0.0f, 0.0f, 0.0f, 1.0f));
+      commands->clearDepthStencil(true, true, 1.0f, 0);
+    }
   }
 
   void BindTarget() {
@@ -1050,7 +1074,8 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
       for (uint32_t i = 0; i < element_count; ++i) {
         const Element& e = elems[i];
         if (e.stream != stream) continue;
-        ConvertElement(src + e.offset, dst + e.out_offset, e.in_size, e.convert, e.source);
+        ConvertElement(src + e.offset, dst + e.out_offset, e.in_size, e.convert, e.source,
+                       uint32_t(vf.endian));
       }
     }
     slots[slot_count] = plume::RenderInputSlot(slot_count, out_stride);
@@ -1280,7 +1305,7 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
     }
     const float* c = reinterpret_cast<const float*>(s.upload_cpu + vs_constants);
     for (uint32_t r = 0; r < 8; ++r) {
-      line += fmt::format(" | c{} ({:.3f},{:.3f},{:.3f},{:.3f})", r, c[4 * r], c[4 * r + 1], c[4 * r + 2],
+      line += fmt::format(" | c{} ({:g},{:g},{:g},{:g})", r, c[4 * r], c[4 * r + 1], c[4 * r + 2],
                           c[4 * r + 3]);
     }
     for (uint32_t slot = 0; slot < DESCRIPTOR_SLOT_COUNT; ++slot) {
