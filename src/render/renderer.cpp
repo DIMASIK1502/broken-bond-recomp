@@ -8,6 +8,8 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <ranges>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -34,6 +36,11 @@ std::unique_ptr<RenderInterface> CreateVulkanInterface();
 REXCVAR_DEFINE_INT32(native_dump_frame, 0, "Game",
                      "With renderer=native, describe every draw of this present (from 1) in "
                      "logs/native-frame-<n>.txt; 0 writes none")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_STRING(native_dump_constants, "", "Game",
+                      "With a frame dump, list every non-zero vertex and pixel shader constant of the "
+                      "draws whose vertex or pixel shader key starts with one of these comma-separated "
+                      "hex prefixes")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(native_dump_outline, false, "Game",
                     "With renderer=native, dump the present 60 after the first draw that culls front "
@@ -1591,6 +1598,8 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
   std::memcpy(shared_cpu + gfx::kSharedBooleansOffset, &booleans, 4);
   const float alpha_ref = RegFloat(base, device, kRbAlphaRef);
   std::memcpy(shared_cpu + gfx::kSharedAlphaThresholdOffset, &alpha_ref, 4);
+  const uint32_t alpha_func = color_control & 7;
+  std::memcpy(shared_cpu + gfx::kSharedAlphaFuncOffset, &alpha_func, 4);
 
   // Host index list, relative to the first copied vertex.
   const bool use_indices = draw.indexed || quads;
@@ -1668,11 +1677,12 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
   if (s.Dumping()) {
     std::string line = fmt::format("draw {} indexed={} prim={} start={} count={} base={} first={} verts={} "
                                    "vs={:016X} ps={:016X} depth={:08X} blend={:08X} mask={:X} vp={} cull={:08X} "
-                                   "clip={:08X} rt={:08X}/{:08X}/{:08X}",
+                                   "clip={:08X} rt={:08X}/{:08X}/{:08X} cc={:08X} aref={:g}",
                                    s.drawn, draw.indexed, draw.prim, draw.start, draw.count, draw.base_vertex,
                                    first, vertex_count, vs_key, ps_key, depth_control, blend_control, color_mask,
                                    s.last_viewport, Reg(base, device, kPaSuScModeCntl), Reg(base, device, 0x2204),
-                                   Reg(base, device, 0x2000), Reg(base, device, 0x2001), Reg(base, device, 0x2002));
+                                   Reg(base, device, 0x2000), Reg(base, device, 0x2001), Reg(base, device, 0x2002),
+                                   color_control, alpha_ref);
     for (uint32_t i = 0; i < element_count; ++i) {
       line += fmt::format(" | e{} s{} +{} usage{}.{} type{:08X}", i, elems[i].stream, elems[i].offset,
                           elems[i].usage, elems[i].usage_index, elems[i].format_word);
@@ -1690,6 +1700,13 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
         std::memcpy(raw, At(base, PhysicalView(vf.address * 4 + (first + v) * stride + elems[i].offset)),
                     elems[i].in_size);
         SwapDwords(raw, sizeof(raw), uint32_t(vf.endian));
+        // The same 16-bit component order fix as ConvertElement.
+        if (uint32_t(vf.endian) == 2 && SixteenBitComponents(elems[i].source.format)) {
+          for (uint32_t b = 0; b + 3 < sizeof(raw); b += 4) {
+            std::swap(raw[b], raw[b + 2]);
+            std::swap(raw[b + 1], raw[b + 3]);
+          }
+        }
         float pos[4];
         DecodeElement(elems[i].source, raw, pos);
         line += fmt::format(" | v{} ({:.2f},{:.2f},{:.2f},{:.2f})", first + v, pos[0], pos[1], pos[2], pos[3]);
@@ -1699,6 +1716,25 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
     for (uint32_t r = 0; r < 8; ++r) {
       line += fmt::format(" | c{} ({:g},{:g},{:g},{:g})", r, c[4 * r], c[4 * r + 1], c[4 * r + 2],
                           c[4 * r + 3]);
+    }
+    bool constants = false;
+    const std::string vs_hex = fmt::format("{:016X}", vs_key);
+    const std::string ps_hex = fmt::format("{:016X}", ps_key);
+    for (const auto part : std::views::split(std::string_view(REXCVAR_GET(native_dump_constants)), ',')) {
+      const std::string_view want(part.begin(), part.end());
+      constants |= !want.empty() && (vs_hex.starts_with(want) || ps_hex.starts_with(want));
+    }
+    if (constants) {
+      const float* ps_c = reinterpret_cast<const float*>(s.upload_cpu + ps_constants);
+      for (uint32_t r = 8; r < gfx::kVertexShaderConstantsBytes / 16; ++r) {
+        if (c[4 * r] == 0 && c[4 * r + 1] == 0 && c[4 * r + 2] == 0 && c[4 * r + 3] == 0) continue;
+        line += fmt::format(" | c{} ({:g},{:g},{:g},{:g})", r, c[4 * r], c[4 * r + 1], c[4 * r + 2], c[4 * r + 3]);
+      }
+      for (uint32_t r = 0; r < gfx::kPixelShaderConstantsBytes / 16; ++r) {
+        const float* v = ps_c + 4 * r;
+        if (v[0] == 0 && v[1] == 0 && v[2] == 0 && v[3] == 0) continue;
+        line += fmt::format(" | p{} ({:g},{:g},{:g},{:g})", r, v[0], v[1], v[2], v[3]);
+      }
     }
     for (uint32_t slot = 0; slot < DESCRIPTOR_SLOT_COUNT; ++slot) {
       const uint32_t index = indices[DESCRIPTOR_KIND_TEXTURE2D * DESCRIPTOR_SLOT_COUNT + slot];

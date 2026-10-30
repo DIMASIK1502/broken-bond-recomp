@@ -48,6 +48,8 @@ inline constexpr uint32_t kSharedBooleansOffset = kDescriptorIndexBytes + 0;
 inline constexpr uint32_t kSharedSwappedTexcoordsOffset = kDescriptorIndexBytes + 4;
 inline constexpr uint32_t kSharedHalfPixelOffsetOffset = kDescriptorIndexBytes + 8;
 inline constexpr uint32_t kSharedAlphaThresholdOffset = kDescriptorIndexBytes + 16;
+// RB_COLORCONTROL alpha function: 0 never ... 7 always, as D3DCMP_* minus one.
+inline constexpr uint32_t kSharedAlphaFuncOffset = kDescriptorIndexBytes + 20;
 inline constexpr uint32_t kSharedConstantsBytes = kDescriptorIndexBytes + 32;
 
 inline constexpr uint32_t kVertexShaderConstantsBytes = 256 * 16;
@@ -107,6 +109,7 @@ struct PushConstants
 #define g_SwappedTexcoords         vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 644)
 #define g_HalfPixelOffset          vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 648)
 #define g_AlphaThreshold           vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 656)
+#define g_AlphaFunc                vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 660)
 
 [[vk::constant_id(0)]] const uint g_SpecConstants = 0;
 
@@ -123,7 +126,8 @@ struct PushConstants
     uint g_Booleans : packoffset(c40.x); \
     uint g_SwappedTexcoords : packoffset(c40.y); \
     float2 g_HalfPixelOffset : packoffset(c40.z); \
-    float g_AlphaThreshold : packoffset(c41.x);
+    float g_AlphaThreshold : packoffset(c41.x); \
+    uint g_AlphaFunc : packoffset(c41.y);
 
 uint g_SpecConstants();
 
@@ -147,6 +151,16 @@ uint2 getTexture2DDimensions(Texture2D<float4> texture)
     texture.GetDimensions(dimensions.x, dimensions.y);
     return dimensions;
 }
+
+// Xenos alpha test: keep the pixel when alpha compares true against the
+// reference with RB_COLORCONTROL's function (bit 0 less, bit 1 equal, bit 2
+// greater). A macro, since the DXIL constant buffer is declared after this
+// header.
+#define alphaTest(ALPHA) \
+    if (!((((g_AlphaFunc) & 1) != 0 && (ALPHA) < g_AlphaThreshold) || \
+          (((g_AlphaFunc) & 2) != 0 && (ALPHA) == g_AlphaThreshold) || \
+          (((g_AlphaFunc) & 4) != 0 && (ALPHA) > g_AlphaThreshold))) \
+        discard
 
 float4 tfetch1D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float texCoord, float offset)
 {
