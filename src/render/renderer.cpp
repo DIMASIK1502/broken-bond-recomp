@@ -1391,8 +1391,12 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
       (ps_entry->second->specConstantsMask & SPEC_CONSTANT_ALPHA_TEST)) {
     spec |= SPEC_CONSTANT_ALPHA_TEST;
   }
-  const uint32_t state_key[6] = {depth_control & 0x77, blend_control, color_mask, uint32_t(topology),
-                                 spec, uint32_t(ps_object != 0)};
+  // Culling only applies to triangles; both bits set is treated as none.
+  const bool triangles = topology == plume::RenderPrimitiveTopology::TRIANGLE_LIST ||
+                         topology == plume::RenderPrimitiveTopology::TRIANGLE_STRIP;
+  const uint32_t sc_mode = triangles ? Reg(base, device, kPaSuScModeCntl) & 7 : 0;
+  const uint32_t state_key[7] = {depth_control & 0x77, blend_control, color_mask, uint32_t(topology),
+                                 spec, uint32_t(ps_object != 0), sc_mode};
   XXH3_64bits_update(&key_state, state_key, sizeof(state_key));
   XXH3_64bits_update(&key_state, &vs_key, 8);
   XXH3_64bits_update(&key_state, &ps_key, 8);
@@ -1407,7 +1411,15 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
     desc.vertexShader = vs;
     desc.pixelShader = ps;
     desc.primitiveTopology = topology;
-    desc.cullMode = plume::RenderCullMode::NONE;
+    // PA_SU_SC_MODE_CNTL: bit 0 culls front faces, bit 1 back faces, bit 2
+    // makes clockwise triangles the front ones. Characters draw their
+    // outline as an inflated shell with front faces culled.
+    switch (sc_mode & 3) {
+      case 1: desc.cullMode = plume::RenderCullMode::FRONT; break;
+      case 2: desc.cullMode = plume::RenderCullMode::BACK; break;
+      default: desc.cullMode = plume::RenderCullMode::NONE; break;
+    }
+    desc.frontFace = (sc_mode & 4) ? plume::RenderFrontFace::CLOCKWISE : plume::RenderFrontFace::COUNTER_CLOCKWISE;
     desc.depthClipEnabled = true;
     desc.depthEnabled = (depth_control & 0x2) != 0 && !REXCVAR_GET(native_debug_target);
     desc.depthWriteEnabled = (depth_control & 0x4) != 0;
