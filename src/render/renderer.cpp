@@ -79,6 +79,16 @@ namespace broken_bond::render {
 
 namespace {
 
+// Adds the wall time of a scope to a millisecond counter.
+struct ScopedMs {
+  double& total;
+  std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+  explicit ScopedMs(double& counter) : total(counter) {}
+  ~ScopedMs() {
+    total += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+  }
+};
+
 namespace xenos = rex::graphics::xenos;
 using broken_bond::gfx::DeclUsage;
 
@@ -211,6 +221,18 @@ void SwapDwords(uint8_t* data, size_t bytes, uint32_t endian) {
       std::swap(data[i], data[i + 2]);
       std::swap(data[i + 1], data[i + 3]);
     }
+  }
+}
+
+// Copies big-endian dwords to `dst` as little-endian ones. The upload ring is
+// write-combined GPU memory, so it is only ever written: swapping in place
+// there reads it back, which is many times slower than the copy.
+void CopySwappedDwords(uint8_t* dst, const uint8_t* src, size_t bytes) {
+  for (size_t i = 0; i + 3 < bytes; i += 4) {
+    uint32_t v;
+    std::memcpy(&v, src + i, 4);
+    v = (v >> 24) | ((v >> 8) & 0xFF00u) | ((v << 8) & 0xFF0000u) | (v << 24);
+    std::memcpy(dst + i, &v, 4);
   }
 }
 
@@ -958,6 +980,30 @@ struct Renderer::State {
   std::map<std::string, uint64_t> skipped;
   uint64_t drawn = 0;
   double ms_pipeline = 0, ms_texture = 0, ms_stream = 0, ms_submit = 0;
+  // Wall time inside each entry point, for the 5 s stats.
+  double ms_draw = 0, ms_clear = 0, ms_resolve = 0, ms_present = 0;
+  // Draw split in sections: setup, streams, state, constants+textures, indices, record, dump.
+  std::array<double, 7> ms_lap{};
+  // Reused CPU buffers for gathering a stream before it goes to the
+  // write-combined upload ring in one copy.
+  std::vector<uint8_t> stream_raw, stream_out;
+  // Converted vertex streams kept in their own buffers, keyed by the guest
+  // bytes and the layout they were converted with. Static geometry is then
+  // converted once instead of every frame. A stream gets a buffer the second
+  // time it is seen, so data rewritten every frame stays in the ring.
+  struct CachedStream {
+    std::unique_ptr<plume::RenderBuffer> buffer;
+    uint64_t last_used = 0;
+    uint32_t seen = 0;
+  };
+  std::unordered_map<uint64_t, CachedStream> stream_cache;
+  uint64_t stream_hits = 0, stream_misses = 0;
+  std::chrono::steady_clock::time_point lap_start;
+  void Lap(size_t section) {
+    const auto now = std::chrono::steady_clock::now();
+    ms_lap[section] += std::chrono::duration<double, std::milli>(now - lap_start).count();
+    lap_start = now;
+  }
 
   bool Upload(size_t bytes, size_t align, uint64_t& offset) {
     const uint64_t start = (upload_used + align - 1) & ~uint64_t(align - 1);
@@ -1366,6 +1412,8 @@ bool Renderer::Open(void* native_window, std::string& reason) {
 void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
   State& s = *state_;
   std::lock_guard<std::mutex> lock(s.mutex);
+  ScopedMs timer(s.ms_draw);
+  s.lap_start = std::chrono::steady_clock::now();
   s.BeginFrame();
   s.UploadDefaults();
   const uint32_t device = draw.device;
@@ -1447,6 +1495,7 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
     return;
   }
 
+  s.Lap(0);
   // Declaration: every element is gathered into a host stream per guest
   // stream, converting what Vulkan cannot fetch (16-bit integers) to float.
   struct Element {
@@ -1538,28 +1587,67 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
         }
       }
     }
-    std::vector<uint8_t> raw(bytes);
-    std::memcpy(raw.data(), At(base, PhysicalView(vf.address * 4 + uint32_t(begin))), bytes);
-    SwapDwords(raw.data(), raw.size(), uint32_t(vf.endian));
-    uint64_t ring = 0;
-    if (!s.Upload(size_t(vertex_count) * out_stride, 16, ring)) {
-      s.Skip("upload ring full");
-      return;
+    const uint8_t* guest_stream = At(base, PhysicalView(vf.address * 4 + uint32_t(begin)));
+    const size_t out_bytes = size_t(vertex_count) * out_stride;
+    XXH3_state_t layout_state;
+    XXH3_64bits_reset(&layout_state);
+    const uint32_t stream_layout[4] = {stride, out_stride, uint32_t(vf.endian), uint32_t(bytes)};
+    XXH3_64bits_update(&layout_state, stream_layout, sizeof(stream_layout));
+    for (uint32_t i = 0; i < element_count; ++i) {
+      const Element& e = elems[i];
+      if (e.stream != stream) continue;
+      const uint32_t element_layout[6] = {e.offset, e.format_word, e.out_offset, uint32_t(e.convert),
+                                          uint32_t(e.format), e.source.swizzle};
+      XXH3_64bits_update(&layout_state, element_layout, sizeof(element_layout));
     }
-    uint8_t* out = s.upload_cpu + ring;
-    for (uint32_t v = 0; v < vertex_count; ++v) {
-      const uint8_t* src = raw.data() + size_t(v) * stride;
-      uint8_t* dst = out + size_t(v) * out_stride;
-      for (uint32_t i = 0; i < element_count; ++i) {
-        const Element& e = elems[i];
-        if (e.stream != stream) continue;
-        if (v == 0) ++s.stream_endians[uint32_t(vf.endian) * 4 + ((e.format_word >> 6) & 3)];
-        ConvertElement(src + e.offset, dst + e.out_offset, e.in_size, e.convert, e.source,
-                       uint32_t(vf.endian));
+    const uint64_t stream_key =
+        XXH3_64bits_withSeed(guest_stream, size_t(bytes), XXH3_64bits_digest(&layout_state));
+    State::CachedStream& cached = s.stream_cache[stream_key];
+    cached.last_used = s.presents;
+    plume::RenderBufferReference stream_ref;
+    if (cached.buffer) {
+      ++s.stream_hits;
+      stream_ref = cached.buffer->at(0);
+    } else {
+      ++s.stream_misses;
+      std::vector<uint8_t>& raw = s.stream_raw;
+      raw.resize(bytes);
+      std::memcpy(raw.data(), guest_stream, bytes);
+      SwapDwords(raw.data(), raw.size(), uint32_t(vf.endian));
+      s.stream_out.assign(out_bytes, 0);
+      uint8_t* out = s.stream_out.data();
+      for (uint32_t v = 0; v < vertex_count; ++v) {
+        const uint8_t* src = raw.data() + size_t(v) * stride;
+        uint8_t* dst = out + size_t(v) * out_stride;
+        for (uint32_t i = 0; i < element_count; ++i) {
+          const Element& e = elems[i];
+          if (e.stream != stream) continue;
+          if (v == 0) ++s.stream_endians[uint32_t(vf.endian) * 4 + ((e.format_word >> 6) & 3)];
+          ConvertElement(src + e.offset, dst + e.out_offset, e.in_size, e.convert, e.source,
+                         uint32_t(vf.endian));
+        }
+      }
+      if (++cached.seen >= 2 && out_bytes >= 4096) {
+        cached.buffer = s.device->createBuffer(
+            plume::RenderBufferDesc::UploadBuffer(out_bytes, plume::RenderBufferFlag::VERTEX));
+      }
+      if (cached.buffer) {
+        void* mapped = cached.buffer->map();
+        std::memcpy(mapped, out, out_bytes);
+        cached.buffer->unmap();
+        stream_ref = cached.buffer->at(0);
+      } else {
+        uint64_t ring = 0;
+        if (!s.Upload(out_bytes, 16, ring)) {
+          s.Skip("upload ring full");
+          return;
+        }
+        std::memcpy(s.upload_cpu + ring, out, out_bytes);
+        stream_ref = s.upload->at(ring);
       }
     }
     slots[slot_count] = plume::RenderInputSlot(slot_count, out_stride);
-    views[slot_count] = plume::RenderVertexBufferView(s.upload->at(ring), vertex_count * out_stride);
+    views[slot_count] = plume::RenderVertexBufferView(stream_ref, uint32_t(out_bytes));
     for (uint32_t i = 0; i < element_count; ++i) {
       if (elems[i].stream != stream) continue;
       elements[i] = plume::RenderInputElement(UsageSemantic(elems[i].usage), elems[i].usage_index,
@@ -1574,6 +1662,7 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
   }
   s.ms_stream += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_stream).count();
 
+  s.Lap(1);
   // Render state.
   const uint32_t depth_control = Reg(base, device, kRbDepthControl);
   const uint32_t blend_control = Reg(base, device, kRbBlendControl0);
@@ -1691,13 +1780,14 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
     s.Skip("upload ring full");
     return;
   }
-  std::memcpy(s.upload_cpu + vs_constants, At(base, device + kDeviceVsConstants), gfx::kVertexShaderConstantsBytes);
-  SwapDwords(s.upload_cpu + vs_constants, gfx::kVertexShaderConstantsBytes, 2);
-  std::memcpy(s.upload_cpu + ps_constants, At(base, device + kDevicePsConstants), gfx::kPixelShaderConstantsBytes);
-  SwapDwords(s.upload_cpu + ps_constants, gfx::kPixelShaderConstantsBytes, 2);
+  s.Lap(2);
+  CopySwappedDwords(s.upload_cpu + vs_constants, At(base, device + kDeviceVsConstants),
+                    gfx::kVertexShaderConstantsBytes);
+  CopySwappedDwords(s.upload_cpu + ps_constants, At(base, device + kDevicePsConstants),
+                    gfx::kPixelShaderConstantsBytes);
 
-  uint8_t* shared_cpu = s.upload_cpu + shared;
-  std::memset(shared_cpu, 0, gfx::kSharedConstantsBytes);
+  // Shared constants are built in local memory and copied once.
+  alignas(16) uint8_t shared_cpu[gfx::kSharedConstantsBytes] = {};
   auto* indices = reinterpret_cast<uint32_t*>(shared_cpu);
   bool uploaded = false;
   for (uint32_t slot = 0; slot < DESCRIPTOR_SLOT_COUNT; ++slot) {
@@ -1724,7 +1814,9 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
   std::memcpy(shared_cpu + gfx::kSharedAlphaThresholdOffset, &alpha_ref, 4);
   const uint32_t alpha_func = color_control & 7;
   std::memcpy(shared_cpu + gfx::kSharedAlphaFuncOffset, &alpha_func, 4);
+  std::memcpy(s.upload_cpu + shared, shared_cpu, sizeof(shared_cpu));
 
+  s.Lap(3);
   // Host index list, relative to the first copied vertex.
   const bool use_indices = draw.indexed || quads;
   uint32_t index_count = draw.count;
@@ -1782,6 +1874,7 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
   s.last_viewport = fmt::format("{:.1f},{:.1f} {:.1f}x{:.1f}", xoffset - xscale, yoffset - yscale,
                                 2.0f * xscale, 2.0f * yscale);
 
+  s.Lap(4);
   if (uploaded) s.BindTarget();
   s.commands->setPipeline(pipeline);
   const uint64_t push[3] = {s.upload_gpu + vs_constants, s.upload_gpu + ps_constants, s.upload_gpu + shared};
@@ -1798,6 +1891,7 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
   } else {
     s.commands->drawInstanced(draw.count, 1, 0, 0);
   }
+  s.Lap(5);
   if (s.Dumping()) {
     std::string line = fmt::format("draw {} indexed={} prim={} start={} count={} base={} first={} verts={} "
                                    "vs={:016X} ps={:016X} depth={:08X} blend={:08X} mask={:X} vp={} cull={:08X} "
@@ -1917,6 +2011,7 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
     }
     s.dump += line + "\n";
   }
+  s.Lap(6);
   ++s.drawn;
 }
 
@@ -1924,6 +2019,7 @@ void Renderer::Clear(uint32_t device, uint32_t flags, uint32_t rect, uint32_t co
                      uint32_t stencil, const uint8_t* base) {
   State& s = *state_;
   std::lock_guard<std::mutex> lock(s.mutex);
+  ScopedMs timer(s.ms_clear);
   s.BeginFrame();
   s.UploadDefaults();
   s.SelectTarget(base, device, std::max<uint32_t>(State::RectBottom(base, rect), 1));
@@ -1961,6 +2057,7 @@ void Renderer::Resolve(uint32_t device, uint32_t flags, uint32_t rect, uint32_t 
                        uint32_t clear_color, float z, const uint8_t* base) {
   State& s = *state_;
   std::lock_guard<std::mutex> lock(s.mutex);
+  ScopedMs timer(s.ms_resolve);
   s.BeginFrame();
   s.UploadDefaults();
   s.SelectTarget(base, device, std::max<uint32_t>(State::RectBottom(base, rect), 1));
@@ -2055,6 +2152,7 @@ void Renderer::Resolve(uint32_t device, uint32_t flags, uint32_t rect, uint32_t 
 void Renderer::Present(uint32_t frontbuffer, const uint8_t* base) {
   State& s = *state_;
   std::lock_guard<std::mutex> lock(s.mutex);
+  ScopedMs timer(s.ms_present);
   s.BeginFrame();
   s.UploadDefaults();
   // Swap shows a texture: the last resolve into it when there was one, else
@@ -2105,7 +2203,11 @@ void Renderer::Present(uint32_t frontbuffer, const uint8_t* base) {
   }
   const auto t_submit = std::chrono::steady_clock::now();
   s.queue->waitForCommandFence(s.fence.get());
-  s.ms_submit += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_submit).count();
+  // The GPU is idle now, so streams unused for a while can go.
+  if ((s.presents & 63) == 0) {
+    std::erase_if(s.stream_cache, [&](const auto& entry) { return s.presents - entry.second.last_used > 120; });
+  }
+  s.ms_submit +=std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_submit).count();
   if (s.Dumping()) {
     const std::string path = fmt::format("logs/native-frame-{}.txt", s.presents + 1);
     if (FILE* f = std::fopen(path.c_str(), "w")) {
@@ -2138,10 +2240,17 @@ std::string Renderer::TakeStats() {
   std::lock_guard<std::mutex> lock(s.mutex);
   std::string out = fmt::format(
       "drawn={} clears={} resolves={} reuploads={} targets={} switches={} pipelines={} shaders={} textures={} samplers={} ms pipeline={:.0f} texture={:.0f} "
-      "stream={:.0f} gpu_wait={:.0f} viewport={}",
+      "stream={:.0f} gpu_wait={:.0f} | draw={:.0f} clear={:.0f} resolve={:.0f} present={:.0f} viewport={}",
       s.drawn, s.clears, s.resolves, s.reuploads, s.color_images.size(), s.target_switches, s.pipelines.size(), s.shaders.size(), s.textures.size(), s.samplers.size(),
-      s.ms_pipeline, s.ms_texture, s.ms_stream, s.ms_submit, s.last_viewport);
+      s.ms_pipeline, s.ms_texture, s.ms_stream, s.ms_submit, s.ms_draw, s.ms_clear, s.ms_resolve,
+      s.ms_present, s.last_viewport);
   s.ms_pipeline = s.ms_texture = s.ms_stream = s.ms_submit = 0;
+  s.ms_draw = s.ms_clear = s.ms_resolve = s.ms_present = 0;
+  out += fmt::format(" streams hit={} miss={} cached={}", s.stream_hits, s.stream_misses, s.stream_cache.size());
+  s.stream_hits = s.stream_misses = 0;
+  out += " laps";
+  for (const double ms : s.ms_lap) out += fmt::format(" {:.0f}", ms);
+  s.ms_lap = {};
   out += " cull";
   for (uint32_t m = 0; m < 8; ++m) {
     if (s.cull_modes[m]) out += fmt::format(" {}:{}", m, s.cull_modes[m]);
