@@ -19,6 +19,7 @@
 #include <fmt/format.h>
 #include <rex/cvar.h>
 #include <plume_render_interface.h>
+#include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/xenos.h>
 #include <rex/system/xmemory.h>
 #include <smolv.h>
@@ -844,6 +845,9 @@ struct Renderer::State {
     uint32_t swizzle = 0;
   };
   std::vector<Texture1DSlot> texture1d_slots;
+  // Cube textures, keyed like 2D ones, in the cube heap.
+  std::unordered_map<uint64_t, Texture> cube_textures;
+  uint32_t next_texture_cube = 1;
   uint32_t next_texture1d = 0;
   std::unordered_map<uint64_t, uint32_t> texture1d_frame;
   std::vector<std::unique_ptr<plume::RenderTexture>> defaults;
@@ -1238,6 +1242,93 @@ struct Renderer::State {
     texture1d_frame[frame_key] = index;
     uploaded = true;
     return index;
+  }
+
+  // Texture index in the cube heap for one fetch constant, 0 (white) when the
+  // format or layout is not handled. Xenos keeps the six faces as array
+  // slices of the base level, each aligned like a separate 2D level.
+  uint32_t TextureCubeFor(const uint32_t words[6], const xenos::xe_gpu_texture_fetch_t& fetch,
+                          const uint8_t* base, bool& uploaded) {
+    const uint64_t key = ImageKey(words);
+    auto found = cube_textures.find(key);
+    if (found != cube_textures.end() && found->second.checked == presents) return found->second.index;
+    const uint32_t format = uint32_t(fetch.format);
+    const plume::RenderFormat host = HostTextureFormat(format);
+    if (host == plume::RenderFormat::UNKNOWN) {
+      Skip(fmt::format("cube texture format {}", format));
+      return 0;
+    }
+    const uint32_t width = fetch.size_2d.width + 1;
+    const uint32_t height = fetch.size_2d.height + 1;
+    const uint32_t pitch = fetch.pitch * 32;
+    const auto layout = rex::graphics::texture_util::GetGuestTextureLayout(
+        xenos::DataDimension::kCube, fetch.pitch, width, height, 6, fetch.tiled, fetch.format, fetch.packed_mips,
+        true, 0);
+    const uint32_t face_stride = layout.base.array_slice_stride_bytes;
+    const uint32_t face_bytes =
+        gfx::GuestTextureBaseBytes(format, width, height, pitch, fetch.tiled, fetch.packed_mips);
+    if (face_bytes == 0 || face_stride == 0) {
+      Skip("cube texture size");
+      return 0;
+    }
+    const uint8_t* guest = At(base, PhysicalView(fetch.base_address << 12));
+    const uint64_t content = XXH3_64bits(guest, size_t(face_stride) * 5 + face_bytes);
+    if (found != cube_textures.end()) {
+      found->second.checked = presents;
+      if (found->second.content == content) return found->second.index;
+      ++reuploads;
+    } else if (next_texture_cube >= kTextureCubeCount) {
+      return 0;
+    }
+    std::array<gfx::LinearTexture, 6> faces;
+    for (uint32_t face = 0; face < 6; ++face) {
+      std::string reason;
+      if (!gfx::LoadGuestTextureBase(format, width, height, pitch, uint32_t(fetch.endianness), fetch.tiled,
+                                     fetch.packed_mips, guest + size_t(face) * face_stride, face_bytes,
+                                     faces[face], reason)) {
+        Skip("cube texture layout");
+        return found != cube_textures.end() ? found->second.index : 0;
+      }
+    }
+    if (found == cube_textures.end()) {
+      Texture texture;
+      texture.texture = device->createTexture(plume::RenderTextureDesc::Texture(
+          plume::RenderTextureDimension::TEXTURE_2D, width, height, 1, 1, 6, host, plume::RenderTextureFlag::CUBE));
+      plume::RenderTextureViewDesc view = plume::RenderTextureViewDesc::TextureCube(host);
+      view.componentMapping = ComponentMapping(HostSwizzle(fetch.swizzle, fetch.format));
+      texture.view = texture.texture->createTextureView(view);
+      texture.index = next_texture_cube++;
+      found = cube_textures.emplace(key, std::move(texture)).first;
+    }
+    Texture& texture = found->second;
+    texture.content = content;
+    texture.checked = presents;
+    commands->barriers(plume::RenderBarrierStage::COPY,
+                       plume::RenderTextureBarrier(texture.texture.get(), plume::RenderTextureLayout::COPY_DEST));
+    for (uint32_t face = 0; face < 6; ++face) {
+      const gfx::LinearTexture& linear = faces[face];
+      const size_t row_bytes = size_t(linear.width_blocks) * linear.block_bytes;
+      const size_t row = (row_bytes + 255) & ~size_t(255);
+      uint64_t offset = 0;
+      if (!Upload(row * linear.height_blocks, 512, offset)) {
+        Skip("upload ring full");
+        return texture.index;
+      }
+      for (uint32_t y = 0; y < linear.height_blocks; ++y) {
+        std::memcpy(upload_cpu + offset + y * row, linear.blocks.data() + y * row_bytes, row_bytes);
+      }
+      const uint32_t row_texels = uint32_t(row / linear.block_bytes) * linear.block_width;
+      commands->copyTextureRegion(
+          plume::RenderTextureCopyLocation::Subresource(texture.texture.get(), 0, face),
+          plume::RenderTextureCopyLocation::PlacedFootprint(upload.get(), host, width, height, 1, row_texels,
+                                                            offset));
+    }
+    commands->barriers(plume::RenderBarrierStage::GRAPHICS,
+                       plume::RenderTextureBarrier(texture.texture.get(), plume::RenderTextureLayout::SHADER_READ));
+    sets[2]->setTexture(texture.index, texture.texture.get(), plume::RenderTextureLayout::SHADER_READ,
+                        texture.view.get());
+    uploaded = true;
+    return texture.index;
   }
 
   // Texture index in the 2D heap for one fetch constant, 0 (white) when the
@@ -1799,6 +1890,10 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
     indices[DESCRIPTOR_KIND_SAMPLER * DESCRIPTOR_SLOT_COUNT + slot] = s.SamplerFor(fetch);
     if (uint32_t(fetch.dimension) == 0) {
       indices[DESCRIPTOR_KIND_TEXTURE1D * DESCRIPTOR_SLOT_COUNT + slot] = s.Texture1DFor(words, fetch, base, uploaded);
+    } else if (uint32_t(fetch.dimension) == 3) {
+      indices[DESCRIPTOR_KIND_TEXTURECUBE * DESCRIPTOR_SLOT_COUNT + slot] = s.TextureCubeFor(words, fetch, base, uploaded);
+    } else if (uint32_t(fetch.dimension) == 2) {
+      s.Skip("3d texture");
     } else if (uint32_t(fetch.dimension) == 1) {
       const auto t0 = std::chrono::steady_clock::now();
       indices[DESCRIPTOR_KIND_TEXTURE2D * DESCRIPTOR_SLOT_COUNT + slot] =
@@ -2062,6 +2157,15 @@ void Renderer::Resolve(uint32_t device, uint32_t flags, uint32_t rect, uint32_t 
   s.UploadDefaults();
   s.SelectTarget(base, device, std::max<uint32_t>(State::RectBottom(base, rect), 1));
   const uint32_t source = flags & 7;
+  if (texture != 0 && source >= 4) {
+    s.Skip("depth resolve");
+    if (s.Dumping()) {
+      s.dump += fmt::format("resolve depth flags={:X} texture={:08X} fetch={:08X} {:08X} {:08X} rt={:08X}/{:08X}/{:08X}\n",
+                            flags, texture, Be32(base, texture + 28), Be32(base, texture + 32),
+                            Be32(base, texture + 36), Reg(base, device, 0x2000), Reg(base, device, 0x2001),
+                            Reg(base, device, 0x2002));
+    }
+  }
   if (texture != 0 && source < 4) {
     uint32_t words[6];
     for (uint32_t w = 0; w < 6; ++w) words[w] = Be32(base, texture + 28 + 4 * w);
