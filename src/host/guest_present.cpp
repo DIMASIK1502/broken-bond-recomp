@@ -29,6 +29,9 @@
 
 REXCVAR_DEFINE_BOOL(dump_device_draw, false, "Game",
                     "Write up to eight textured triangle draws with different pixel shaders");
+REXCVAR_DEFINE_BOOL(fps_title, true, "Game",
+                    "Show the frame rate and the slowest frame of the last second in the window title")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_STRING(renderer, "xenos", "Game",
                       "xenos presents the game. host draws into a retained Vulkan target and still presents "
                       "through Xenos. native presents through the Plume renderer (with --gpu_plugin=host)");
@@ -41,6 +44,9 @@ std::unique_ptr<broken_bond::render::Renderer> g_native;
 // The GPU plugin's graphics system; its command processor keeps the gamma
 // ramp the game writes through DC_LUT registers.
 rex::graphics::GraphicsSystem* g_graphics = nullptr;
+// The game window and its title before the frame rate was added to it.
+rex::ui::Window* g_window = nullptr;
+std::string g_window_title;
 
 // gamma_ramp_256_entry_table() is protected; a derived class may name it, and
 // the pointer to member it yields can be called on any command processor.
@@ -95,6 +101,9 @@ void SampleLoop() {
   int64_t last_dt = 0;
   const char* last_bucket = "none";
   auto window_start = std::chrono::steady_clock::now();
+  auto title_start = window_start;
+  int title_frames = 0;
+  int64_t title_max_dt = 0;
   while (!g_stop.load(std::memory_order_relaxed)) {
     std::this_thread::sleep_for(std::chrono::milliseconds(4));
     const uint64_t serial = rex::perf::GetPresentedFrameSerial();
@@ -112,8 +121,23 @@ void SampleLoop() {
       else
         ++n_other;
       if (missed) n_other += static_cast<int>(missed > 1000 ? 1000 : missed);
+      ++title_frames;
+      title_max_dt = std::max(title_max_dt, last_dt);
     }
     const auto now = std::chrono::steady_clock::now();
+    if (now - title_start >= std::chrono::seconds(1)) {
+      const double seconds = std::chrono::duration<double>(now - title_start).count();
+      const std::string title = fmt::format("{} | {:.0f} fps | max {:.1f} ms", g_window_title,
+                                            title_frames / seconds, title_max_dt / 1000.0);
+      title_start = now;
+      title_frames = 0;
+      title_max_dt = 0;
+      if (g_window && REXCVAR_GET(fps_title)) {
+        g_window->app_context().CallInUIThreadDeferred([title] {
+          if (g_window && !g_stop.load(std::memory_order_relaxed)) g_window->SetTitle(title);
+        });
+      }
+    }
     if (now - window_start < std::chrono::seconds(5)) continue;
     window_start = now;
     if (n60 + n30 + n24 + n_other == 0) continue;
@@ -695,6 +719,10 @@ REX_HOOK_RAW(sub_821AD328) {
 void BrokenBondApp::OnPostLaunchModule(rex::system::XThread*) {
 #if defined(BROKEN_BOND_HAS_NATIVE_RENDERER)
   if (runtime()) g_graphics = static_cast<rex::graphics::GraphicsSystem*>(runtime()->graphics_system());
+  if (window() && !g_window) {
+    g_window = window();
+    g_window_title = g_window->GetTitle();
+  }
   if (REXCVAR_GET(renderer) == "native" && !g_native && window()) {
     auto native = std::make_unique<broken_bond::render::Renderer>();
     std::string reason;
@@ -725,4 +753,5 @@ void BrokenBondApp::OnPostLaunchModule(rex::system::XThread*) {
 void BrokenBondApp::OnShutdown() {
   g_stop.store(true);
   if (g_thread.joinable()) g_thread.join();
+  g_window = nullptr;
 }
