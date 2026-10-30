@@ -656,6 +656,9 @@ extern "C" void __imp__sub_821B16B0(PPCContext& __restrict ctx, uint8_t* base);
 REX_HOOK_RAW(sub_821B16B0) {
   const uint32_t interval = (ctx.r3.u32 >> 8) & 0xFu;
   g_interval[interval < 3u ? interval : 3u].fetch_add(1, std::memory_order_relaxed);
+#if defined(BROKEN_BOND_HAS_NATIVE_RENDERER)
+  if (g_native) g_native->SetFlipInterval(interval);
+#endif
   const int limit = REXCVAR_GET(present_interval);
   if (limit > 0 && interval > static_cast<uint32_t>(limit)) {
     ctx.r3.u64 = (ctx.r3.u32 & ~0xF00u) | (static_cast<uint32_t>(limit & 0xF) << 8);

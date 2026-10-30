@@ -52,6 +52,10 @@ class Renderer {
   // in bits 0-9, green 10-19, red 20-29), applied when presenting.
   void SetGammaRamp(const uint32_t table[256]);
 
+  // Vblanks between flips the game asked for: 2 when it steps at 30 Hz, 1 at
+  // 60 Hz. Any thread.
+  void SetFlipInterval(uint32_t interval);
+
   // Counts since the last call, for the 5 s log.
   std::string TakeStats();
 

@@ -52,6 +52,10 @@ REXCVAR_DEFINE_DOUBLE(native_resolution_scale, 0.0, "Game",
                       "With renderer=native, the internal resolution as a multiple of the game's 1280x720 "
                       "(1 is 720p, 1.5 is 1080p); 0 matches the window")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(native_interpolate, false, "Game",
+                    "With renderer=native, draw an in-between frame when the game steps at 30 Hz "
+                    "(shows 60 FPS one step late)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_INT32(native_msaa, 4, "Game",
                      "With renderer=native, the most samples a multisampled guest surface gets on the "
                      "host (1 turns MSAA off)")
@@ -111,7 +115,9 @@ constexpr plume::RenderFormat kColorFormat = plume::RenderFormat::B8G8R8A8_UNORM
 constexpr plume::RenderFormat kDepthFormat = plume::RenderFormat::D32_FLOAT_S8_UINT;
 // What a guest depth resolve becomes on the host: the depth value itself.
 constexpr plume::RenderFormat kDepthCopyFormat = plume::RenderFormat::R32_FLOAT;
+// Interpolation queues two presents per guest frame and needs a third.
 constexpr uint32_t kSwapChainBuffers = 2;
+constexpr uint32_t kInterpolationSwapChainBuffers = 3;
 constexpr uint64_t kUploadBytes = 256ull << 20;
 constexpr uint32_t kTexture2DCount = 8192;
 constexpr uint32_t kTexture3DCount = 64;
@@ -1154,6 +1160,8 @@ struct Renderer::State {
 
   uint64_t presents = 0;
   uint64_t msaa_resolves = 0;
+  // Vblanks per flip the game last asked for (2 at 30 Hz, 1 at 60 Hz).
+  std::atomic<uint32_t> flip_interval{0};
   uint64_t depth_resolves = 0;
 
   // GPU objects replaced while a frame is being recorded. The command list
@@ -1674,7 +1682,8 @@ bool Renderer::Open(void* native_window, std::string& reason) {
   s.commands = s.queue->createCommandList();
   s.acquire = s.device->createCommandSemaphore();
   s.swap_chain = s.queue->createSwapChain(plume::RenderSwapChainDesc(
-      static_cast<plume::RenderWindow>(native_window), kColorFormat, kSwapChainBuffers));
+      static_cast<plume::RenderWindow>(native_window), kColorFormat,
+      REXCVAR_GET(native_interpolate) ? kInterpolationSwapChainBuffers : kSwapChainBuffers));
   if (!s.swap_chain || !s.swap_chain->resize()) {
     reason = "no swapchain on the game window";
     return false;
@@ -2707,6 +2716,10 @@ void Renderer::Present(uint32_t frontbuffer, const uint8_t* base) {
       s.CreateTarget();
     }
   }
+}
+
+void Renderer::SetFlipInterval(uint32_t interval) {
+  state_->flip_interval.store(interval, std::memory_order_relaxed);
 }
 
 void Renderer::SetGammaRamp(const uint32_t table[256]) {
