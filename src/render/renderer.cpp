@@ -547,12 +547,41 @@ struct Renderer::State {
   std::vector<std::unique_ptr<plume::RenderCommandSemaphore>> release;
   std::string device_name;
 
-  // Target the guest frame is drawn into, at swapchain size.
-  std::unique_ptr<plume::RenderTexture> color;
-  std::unique_ptr<plume::RenderTexture> depth;
-  std::unique_ptr<plume::RenderFramebuffer> framebuffer;
+  // Swapchain size; the guest's 1280x720 frame is scaled to it, and every
+  // render target uses the same scale.
   uint32_t width = 0;
   uint32_t height = 0;
+  float scale_x = 1.0f;
+  float scale_y = 1.0f;
+
+  // Host render targets. Xenos keeps colour and depth in EDRAM, and surfaces
+  // that share an EDRAM base share their pixels whatever their MSAA or the
+  // other attachment (the title draws its scene at 4x and resolves the same
+  // EDRAM through a 1x surface). So colour images are keyed by colour base,
+  // format and pitch, depth images by depth base and pitch, and a framebuffer
+  // pairs them. MSAA is not emulated: everything is one sample.
+  struct Image {
+    std::unique_ptr<plume::RenderTexture> texture;
+    uint32_t guest_width = 0;
+    uint32_t guest_height = 0;
+    uint32_t width = 0;  // host pixels
+    uint32_t height = 0;
+  };
+  struct Target {
+    Image* color = nullptr;
+    Image* depth = nullptr;
+    std::unique_ptr<plume::RenderFramebuffer> framebuffer;
+  };
+  std::unordered_map<uint64_t, Image> color_images;
+  std::unordered_map<uint64_t, Image> depth_images;
+  std::unordered_map<uint64_t, Target> targets;
+  Target* current = nullptr;
+  plume::RenderTexture* color = nullptr;  // current target's
+  plume::RenderTexture* depth = nullptr;
+  plume::RenderFramebuffer* framebuffer = nullptr;
+  uint32_t target_width = 0;  // current target, host pixels
+  uint32_t target_height = 0;
+  uint64_t target_switches = 0;
 
   // Per-frame upload ring: constants, vertices, indices, texels.
   std::unique_ptr<plume::RenderBuffer> upload;
@@ -601,17 +630,96 @@ struct Renderer::State {
 
   // A guest D3DRECT {x1, y1, x2, y2} scaled to the host target.
   plume::RenderRect HostRect(const uint8_t* base, uint32_t rect) const {
-    const float sx = float(width) / kGuestWidth;
-    const float sy = float(height) / kGuestHeight;
     auto at = [&](uint32_t i) { return int32_t(Be32(base, rect + 4 * i)); };
-    plume::RenderRect out(int32_t(std::lround(at(0) * sx)), int32_t(std::lround(at(1) * sy)),
-                          int32_t(std::lround(at(2) * sx)), int32_t(std::lround(at(3) * sy)));
-    out.left = std::clamp<int32_t>(out.left, 0, int32_t(width));
-    out.right = std::clamp<int32_t>(out.right, out.left, int32_t(width));
-    out.top = std::clamp<int32_t>(out.top, 0, int32_t(height));
-    out.bottom = std::clamp<int32_t>(out.bottom, out.top, int32_t(height));
+    plume::RenderRect out(int32_t(std::lround(at(0) * scale_x)), int32_t(std::lround(at(1) * scale_y)),
+                          int32_t(std::lround(at(2) * scale_x)), int32_t(std::lround(at(3) * scale_y)));
+    out.left = std::clamp<int32_t>(out.left, 0, int32_t(target_width));
+    out.right = std::clamp<int32_t>(out.right, out.left, int32_t(target_width));
+    out.top = std::clamp<int32_t>(out.top, 0, int32_t(target_height));
+    out.bottom = std::clamp<int32_t>(out.bottom, out.top, int32_t(target_height));
     return out;
   }
+
+  // Guest rows a rect reaches (its bottom), for sizing the target.
+  static uint32_t RectBottom(const uint8_t* base, uint32_t rect) {
+    return rect ? uint32_t(std::max<int32_t>(0, int32_t(Be32(base, rect + 12)))) : 0;
+  }
+
+  // Makes sure `image` holds `rows` guest rows of `pitch` pixels. Returns
+  // true when it was (re)created, which drops framebuffers built on it.
+  bool EnsureImage(Image& image, uint32_t pitch, uint32_t rows, bool is_depth) {
+    if (image.texture && image.guest_width == pitch && image.guest_height >= rows) return false;
+    image.guest_width = pitch;
+    image.guest_height = std::max(rows, image.guest_height);
+    if (pitch == 1280) image.guest_height = std::max<uint32_t>(image.guest_height, 720);
+    image.width = std::max(1u, uint32_t(std::lround(image.guest_width * scale_x)));
+    image.height = std::max(1u, uint32_t(std::lround(image.guest_height * scale_y)));
+    image.texture = device->createTexture(
+        is_depth ? plume::RenderTextureDesc::DepthTarget(image.width, image.height, kDepthFormat)
+                 : plume::RenderTextureDesc::ColorTarget(image.width, image.height, kColorFormat));
+    commands->barriers(plume::RenderBarrierStage::GRAPHICS,
+                       plume::RenderTextureBarrier(image.texture.get(), is_depth
+                                                                            ? plume::RenderTextureLayout::DEPTH_WRITE
+                                                                            : plume::RenderTextureLayout::COLOR_WRITE));
+    return true;
+  }
+
+  // Binds the target the device's EDRAM registers describe, creating or
+  // growing its images so they hold `rows` guest rows.
+  void SelectTarget(const uint8_t* base, uint32_t guest_device, uint32_t rows) {
+    const uint32_t surface = Reg(base, guest_device, 0x2000);  // RB_SURFACE_INFO
+    const uint32_t color_info = Reg(base, guest_device, 0x2001);
+    const uint32_t depth_info = Reg(base, guest_device, 0x2002);
+    const uint32_t pitch = std::max<uint32_t>(surface & 0x3FFF, 1);
+    rows = std::clamp<uint32_t>(rows, 1, 2048);
+    const uint64_t color_key = (uint64_t(pitch) << 32) | (color_info & 0x000F0FFF);
+    const uint64_t depth_key = (uint64_t(pitch) << 32) | (depth_info & 0x00010FFF);
+    Image& color_image = color_images[color_key];
+    Image& depth_image = depth_images[depth_key];
+    bool fresh_color = EnsureImage(color_image, pitch, rows, false);
+    bool fresh_depth = EnsureImage(depth_image, pitch, rows, true);
+    // Both attachments must be the same size.
+    if (depth_image.guest_height < color_image.guest_height) {
+      fresh_depth |= EnsureImage(depth_image, pitch, color_image.guest_height, true);
+    } else if (color_image.guest_height < depth_image.guest_height) {
+      fresh_color |= EnsureImage(color_image, pitch, depth_image.guest_height, false);
+    }
+    if (fresh_color || fresh_depth) {
+      for (auto it = targets.begin(); it != targets.end();) {
+        if ((fresh_color && it->second.color == &color_image) || (fresh_depth && it->second.depth == &depth_image)) {
+          if (current == &it->second) current = nullptr;
+          it = targets.erase(it);
+        } else {
+          ++it;
+        }
+      }
+    }
+    Target& target = targets[color_key * 1000003u ^ depth_key];
+    if (!target.framebuffer) {
+      target.color = &color_image;
+      target.depth = &depth_image;
+      const plume::RenderTexture* attachment = color_image.texture.get();
+      plume::RenderFramebufferDesc desc;
+      desc.colorAttachments = &attachment;
+      desc.colorAttachmentsCount = 1;
+      desc.depthAttachment = depth_image.texture.get();
+      target.framebuffer = device->createFramebuffer(desc);
+      current = nullptr;
+    }
+    if (current != &target) {
+      ++target_switches;
+      current = &target;
+      color = color_image.texture.get();
+      depth = depth_image.texture.get();
+      framebuffer = target.framebuffer.get();
+      target_width = color_image.width;
+      target_height = color_image.height;
+      BindTarget();
+      if (fresh_color) commands->clearColor(0, plume::RenderColor(0.0f, 0.0f, 0.0f, 1.0f));
+      if (fresh_depth) commands->clearDepthStencil(true, true, 1.0f, 0);
+    }
+  }
+
   uint64_t presents = 0;
 
   std::mutex mutex;  // Draw and Present run on the guest thread, TakeStats on the sampler
@@ -632,15 +740,16 @@ struct Renderer::State {
   bool CreateTarget() {
     width = swap_chain->getWidth();
     height = swap_chain->getHeight();
-    color = device->createTexture(plume::RenderTextureDesc::ColorTarget(width, height, kColorFormat));
-    depth = device->createTexture(plume::RenderTextureDesc::DepthTarget(width, height, kDepthFormat));
-    const plume::RenderTexture* attachment = color.get();
-    plume::RenderFramebufferDesc desc;
-    desc.colorAttachments = &attachment;
-    desc.colorAttachmentsCount = 1;
-    desc.depthAttachment = depth.get();
-    framebuffer = device->createFramebuffer(desc);
-    return color && depth && framebuffer;
+    scale_x = float(width) / kGuestWidth;
+    scale_y = float(height) / kGuestHeight;
+    targets.clear();
+    color_images.clear();
+    depth_images.clear();
+    current = nullptr;
+    color = nullptr;
+    depth = nullptr;
+    framebuffer = nullptr;
+    return width > 0 && height > 0;
   }
 
   void BeginFrame() {
@@ -648,22 +757,13 @@ struct Renderer::State {
     recording = true;
     upload_used = 0;
     commands->begin();
-    plume::RenderTextureBarrier barriers[] = {
-        plume::RenderTextureBarrier(color.get(), plume::RenderTextureLayout::COLOR_WRITE),
-        plume::RenderTextureBarrier(depth.get(), plume::RenderTextureLayout::DEPTH_WRITE)};
-    commands->barriers(plume::RenderBarrierStage::GRAPHICS, barriers, 2);
-    BindTarget();
-    // The game clears through ClearF and Resolve. It draws before Swap and
-    // resolves its tiles after it, so the target carries over between frames;
-    // only the very first frame starts from a defined state.
-    if (presents == 0) {
-      commands->clearColor(0, plume::RenderColor(0.0f, 0.0f, 0.0f, 1.0f));
-      commands->clearDepthStencil(true, true, 1.0f, 0);
-    }
+    // Targets keep their contents across frames (the game draws before Swap
+    // and resolves after it); a new command list only needs them rebound.
+    current = nullptr;
   }
 
   void BindTarget() {
-    commands->setFramebuffer(framebuffer.get());
+    if (framebuffer) commands->setFramebuffer(framebuffer);
     commands->setGraphicsPipelineLayout(layout.get());
     for (uint32_t i = 0; i < 6; ++i) commands->setGraphicsDescriptorSet(sets[i].get(), i);
   }
@@ -1260,8 +1360,8 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
   }
 
   // Viewport from the D3D registers, scaled to the host target.
-  const float sx = float(s.width) / kGuestWidth;
-  const float sy = float(s.height) / kGuestHeight;
+  const float sx = s.scale_x;
+  const float sy = s.scale_y;
   const float xscale = std::fabs(RegFloat(base, device, kPaClVportXScale));
   const float yscale = std::fabs(RegFloat(base, device, kPaClVportYScale));
   const float xoffset = RegFloat(base, device, kPaClVportXOffset);
@@ -1271,8 +1371,9 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
   plume::RenderViewport viewport((xoffset - xscale) * sx, (yoffset - yscale) * sy, 2.0f * xscale * sx,
                                  2.0f * yscale * sy, std::clamp(zoffset, 0.0f, 1.0f),
                                  std::clamp(zoffset + zscale, 0.0f, 1.0f));
+  s.SelectTarget(base, device, uint32_t(std::ceil(yoffset + yscale)));
   if (!(viewport.width > 0.0f) || !(viewport.height > 0.0f)) {
-    viewport = plume::RenderViewport(0.0f, 0.0f, float(s.width), float(s.height));
+    viewport = plume::RenderViewport(0.0f, 0.0f, float(s.target_width), float(s.target_height));
   }
   ++s.viewports[fmt::format("vte={:03X} vp={:.0f},{:.0f},{:.0f}x{:.0f} z={:.2f}+{:.2f} surf={:08X} wo={:08X} sc={:08X}-{:08X}",
                               Reg(base, device, 0x2206), xoffset - xscale, yoffset - yscale, 2 * xscale,
@@ -1286,7 +1387,7 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
   const uint64_t push[3] = {s.upload_gpu + vs_constants, s.upload_gpu + ps_constants, s.upload_gpu + shared};
   s.commands->setGraphicsPushConstants(0, push, 0, sizeof(push));
   s.commands->setViewports(&viewport, 1);
-  const plume::RenderRect scissor(0, 0, int32_t(s.width), int32_t(s.height));
+  const plume::RenderRect scissor(0, 0, int32_t(s.target_width), int32_t(s.target_height));
   s.commands->setScissors(&scissor, 1);
   if (slot_count) s.commands->setVertexBuffers(0, views.data(), slot_count, slots.data());
   if (use_indices) {
@@ -1300,10 +1401,11 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
   if (s.Dumping()) {
     std::string line = fmt::format("draw {} indexed={} prim={} start={} count={} base={} first={} verts={} "
                                    "vs={:016X} ps={:016X} depth={:08X} blend={:08X} mask={:X} vp={} cull={:08X} "
-                                   "clip={:08X}",
+                                   "clip={:08X} rt={:08X}/{:08X}/{:08X}",
                                    s.drawn, draw.indexed, draw.prim, draw.start, draw.count, draw.base_vertex,
                                    first, vertex_count, vs_key, ps_key, depth_control, blend_control, color_mask,
-                                   s.last_viewport, Reg(base, device, kPaSuScModeCntl), Reg(base, device, 0x2204));
+                                   s.last_viewport, Reg(base, device, kPaSuScModeCntl), Reg(base, device, 0x2204),
+                                   Reg(base, device, 0x2000), Reg(base, device, 0x2001), Reg(base, device, 0x2002));
     for (uint32_t i = 0; i < element_count; ++i) {
       line += fmt::format(" | e{} s{} +{} usage{}.{} type{:08X}", i, elems[i].stream, elems[i].offset,
                           elems[i].usage, elems[i].usage_index, elems[i].format_word);
@@ -1352,13 +1454,20 @@ void Renderer::Clear(uint32_t device, uint32_t flags, uint32_t rect, uint32_t co
                      uint32_t stencil, const uint8_t* base) {
   State& s = *state_;
   std::lock_guard<std::mutex> lock(s.mutex);
-  (void)device;
   s.BeginFrame();
   s.UploadDefaults();
-  s.BindTarget();
+  s.SelectTarget(base, device, std::max<uint32_t>(State::RectBottom(base, rect), 1));
   if (REXCVAR_GET(native_debug_target)) return;
-  plume::RenderRect host_rect(0, 0, int32_t(s.width), int32_t(s.height));
-  if (rect != 0) host_rect = s.HostRect(base, rect);
+  plume::RenderRect host_rect(0, 0, int32_t(s.target_width), int32_t(s.target_height));
+  if (rect != 0) {
+    host_rect = s.HostRect(base, rect);
+    // In a tiled pass the clear is replayed for every band with that band's
+    // offset, but the title passes the first band's rect. A full-width rect
+    // from the top therefore stands for the whole surface.
+    if (host_rect.left == 0 && host_rect.top == 0 && host_rect.right >= int32_t(s.target_width)) {
+      host_rect.bottom = int32_t(s.target_height);
+    }
+  }
   if (flags & 0xF) {
     plume::RenderColor value(0.0f, 0.0f, 0.0f, 0.0f);
     if (color != 0) {
@@ -1371,7 +1480,10 @@ void Renderer::Clear(uint32_t device, uint32_t flags, uint32_t rect, uint32_t co
     s.commands->clearDepthStencil((flags & 0x10) != 0, (flags & 0x20) != 0, std::clamp(z, 0.0f, 1.0f),
                                   stencil & 0xFF, &host_rect, 1);
   }
-  if (s.Dumping()) s.dump += fmt::format("clear flags={:X} rect={:08X} z={}\n", flags, rect, z);
+  if (s.Dumping()) {
+    s.dump += fmt::format("clear flags={:X} rect={:08X} z={} rt={:08X}/{:08X}/{:08X}\n", flags, rect, z,
+                          Reg(base, device, 0x2000), Reg(base, device, 0x2001), Reg(base, device, 0x2002));
+  }
   ++s.clears;
 }
 
@@ -1379,9 +1491,9 @@ void Renderer::Resolve(uint32_t device, uint32_t flags, uint32_t rect, uint32_t 
                        uint32_t clear_color, float z, const uint8_t* base) {
   State& s = *state_;
   std::lock_guard<std::mutex> lock(s.mutex);
-  (void)device;
   s.BeginFrame();
   s.UploadDefaults();
+  s.SelectTarget(base, device, std::max<uint32_t>(State::RectBottom(base, rect), 1));
   const uint32_t source = flags & 7;
   if (texture != 0 && source < 4) {
     uint32_t words[6];
@@ -1390,8 +1502,8 @@ void Renderer::Resolve(uint32_t device, uint32_t flags, uint32_t rect, uint32_t 
     std::memcpy(&fetch, words, sizeof(words));
     const uint32_t guest_width = fetch.size_2d.width + 1;
     const uint32_t guest_height = fetch.size_2d.height + 1;
-    const uint32_t width = std::max(1u, uint32_t(std::lround(guest_width * float(s.width) / kGuestWidth)));
-    const uint32_t height = std::max(1u, uint32_t(std::lround(guest_height * float(s.height) / kGuestHeight)));
+    const uint32_t width = std::max(1u, uint32_t(std::lround(guest_width * s.scale_x)));
+    const uint32_t height = std::max(1u, uint32_t(std::lround(guest_height * s.scale_y)));
     const uint64_t key = ImageKey(words);
     s.resolved_at[TexturePhysical(fetch.base_address)] = key;
     State::Texture& entry = s.textures[key];
@@ -1408,26 +1520,26 @@ void Renderer::Resolve(uint32_t device, uint32_t flags, uint32_t rect, uint32_t 
       entry.width = width;
       entry.height = height;
     }
-    plume::RenderRect src(0, 0, int32_t(s.width), int32_t(s.height));
+    plume::RenderRect src(0, 0, int32_t(s.target_width), int32_t(s.target_height));
     if (rect != 0) src = s.HostRect(base, rect);
     int32_t dst_x = 0, dst_y = 0;
     if (point != 0) {
-      dst_x = int32_t(std::lround(int32_t(Be32(base, point)) * float(s.width) / kGuestWidth));
-      dst_y = int32_t(std::lround(int32_t(Be32(base, point + 4)) * float(s.height) / kGuestHeight));
+      dst_x = int32_t(std::lround(int32_t(Be32(base, point)) * s.scale_x));
+      dst_y = int32_t(std::lround(int32_t(Be32(base, point + 4)) * s.scale_y));
     }
     src.right = std::min<int32_t>(src.right, src.left + int32_t(width) - dst_x);
     src.bottom = std::min<int32_t>(src.bottom, src.top + int32_t(height) - dst_y);
     if (src.right > src.left && src.bottom > src.top) {
       plume::RenderTextureBarrier to_copy[] = {
-          plume::RenderTextureBarrier(s.color.get(), plume::RenderTextureLayout::COPY_SOURCE),
+          plume::RenderTextureBarrier(s.color, plume::RenderTextureLayout::COPY_SOURCE),
           plume::RenderTextureBarrier(entry.texture.get(), plume::RenderTextureLayout::COPY_DEST)};
       s.commands->barriers(plume::RenderBarrierStage::COPY, to_copy, 2);
       const plume::RenderBox box(src.left, src.top, src.right, src.bottom);
       s.commands->copyTextureRegion(plume::RenderTextureCopyLocation::Subresource(entry.texture.get()),
-                                    plume::RenderTextureCopyLocation::Subresource(s.color.get()), uint32_t(dst_x),
+                                    plume::RenderTextureCopyLocation::Subresource(s.color), uint32_t(dst_x),
                                     uint32_t(dst_y), 0, &box);
       plume::RenderTextureBarrier back[] = {
-          plume::RenderTextureBarrier(s.color.get(), plume::RenderTextureLayout::COLOR_WRITE),
+          plume::RenderTextureBarrier(s.color, plume::RenderTextureLayout::COLOR_WRITE),
           plume::RenderTextureBarrier(entry.texture.get(), plume::RenderTextureLayout::SHADER_READ)};
       s.commands->barriers(plume::RenderBarrierStage::GRAPHICS, back, 2);
       s.sets[0]->setTexture(entry.index, entry.texture.get(), plume::RenderTextureLayout::SHADER_READ,
@@ -1435,9 +1547,10 @@ void Renderer::Resolve(uint32_t device, uint32_t flags, uint32_t rect, uint32_t 
     }
     if (s.Dumping()) {
       s.dump += fmt::format("resolve flags={:X} texture={:08X} @{:08X}/f{} {}x{} key={:016X} index=#{} "
-                            "src={},{}-{},{}\n",
+                            "src={},{}-{},{} rt={:08X}/{:08X}/{:08X}\n",
                             flags, texture, fetch.base_address << 12, uint32_t(fetch.format), guest_width,
-                            guest_height, key, entry.index, src.left, src.top, src.right, src.bottom);
+                            guest_height, key, entry.index, src.left, src.top, src.right, src.bottom,
+                            Reg(base, device, 0x2000), Reg(base, device, 0x2001), Reg(base, device, 0x2002));
     }
     ++s.resolves;
   }
@@ -1445,14 +1558,15 @@ void Renderer::Resolve(uint32_t device, uint32_t flags, uint32_t rect, uint32_t 
   // Xenos clears the EDRAM the resolve read. A tiled pass resolves and clears
   // one band at a time; the host draws the frame once, so only that band may
   // be cleared or the later bands would copy an empty target.
-  plume::RenderRect region(0, 0, int32_t(s.width), int32_t(s.height));
+  plume::RenderRect region(0, 0, int32_t(s.target_width), int32_t(s.target_height));
   if (rect != 0) region = s.HostRect(base, rect);
   // A tiled pass resolves each band with a clear, but on the GPU that clear
   // runs per tile inside the replayed command buffer, before the next band is
   // drawn. The title then copies the whole target again (flags 0) and
   // composites that copy, so the host, which draws the frame once, must not
   // clear here.
-  if (rect != 0 && (region.right - region.left < int32_t(s.width) || region.bottom - region.top < int32_t(s.height))) {
+  if (rect != 0 && (region.right - region.left < int32_t(s.target_width) ||
+                    region.bottom - region.top < int32_t(s.target_height))) {
     flags &= ~0x300u;
   }
   if (REXCVAR_GET(native_debug_target)) flags &= ~0x300u;
@@ -1474,8 +1588,9 @@ void Renderer::Present(uint32_t frontbuffer, const uint8_t* base) {
   s.UploadDefaults();
   // Swap shows a texture: the last resolve into it when there was one, else
   // whatever the target holds.
-  plume::RenderTexture* source = s.color.get();
+  plume::RenderTexture* source = s.color;
   plume::RenderTextureLayout source_layout = plume::RenderTextureLayout::COLOR_WRITE;
+  if (source && (s.target_width != s.width || s.target_height != s.height)) source = nullptr;
   if (frontbuffer != 0 && !REXCVAR_GET(native_debug_target)) {
     uint32_t words[6];
     for (uint32_t w = 0; w < 6; ++w) words[w] = Be32(base, frontbuffer + 28 + 4 * w);
@@ -1491,7 +1606,11 @@ void Renderer::Present(uint32_t frontbuffer, const uint8_t* base) {
   const bool acquired = !resize && !s.swap_chain->isEmpty() &&
                         s.swap_chain->acquireTexture(s.acquire.get(), &image);
   plume::RenderTexture* target = acquired ? s.swap_chain->getTexture(image) : nullptr;
-  if (target) {
+  if (target && !source) {
+    // Nothing the size of the window to show yet.
+    s.commands->barriers(plume::RenderBarrierStage::COPY,
+                         plume::RenderTextureBarrier(target, plume::RenderTextureLayout::PRESENT));
+  } else if (target) {
     plume::RenderTextureBarrier to_copy[] = {
         plume::RenderTextureBarrier(source, plume::RenderTextureLayout::COPY_SOURCE),
         plume::RenderTextureBarrier(target, plume::RenderTextureLayout::COPY_DEST)};
@@ -1540,9 +1659,9 @@ std::string Renderer::TakeStats() {
   State& s = *state_;
   std::lock_guard<std::mutex> lock(s.mutex);
   std::string out = fmt::format(
-      "drawn={} clears={} resolves={} reuploads={} pipelines={} shaders={} textures={} samplers={} ms pipeline={:.0f} texture={:.0f} "
+      "drawn={} clears={} resolves={} reuploads={} targets={} switches={} pipelines={} shaders={} textures={} samplers={} ms pipeline={:.0f} texture={:.0f} "
       "stream={:.0f} gpu_wait={:.0f} viewport={}",
-      s.drawn, s.clears, s.resolves, s.reuploads, s.pipelines.size(), s.shaders.size(), s.textures.size(), s.samplers.size(),
+      s.drawn, s.clears, s.resolves, s.reuploads, s.color_images.size(), s.target_switches, s.pipelines.size(), s.shaders.size(), s.textures.size(), s.samplers.size(),
       s.ms_pipeline, s.ms_texture, s.ms_stream, s.ms_submit, s.last_viewport);
   s.ms_pipeline = s.ms_texture = s.ms_stream = s.ms_submit = 0;
   for (const auto& [reason, count] : s.skipped) out += fmt::format(" | {}: {}", reason, count);
@@ -1557,6 +1676,7 @@ std::string Renderer::TakeStats() {
   s.clears = 0;
   s.resolves = 0;
   s.reuploads = 0;
+  s.target_switches = 0;
   s.skipped.clear();
   return out;
 }
