@@ -44,6 +44,10 @@ REXCVAR_DEFINE_BOOL(native_decl_swizzle, true, "Game",
                     "With renderer=native, apply the vertex declaration swizzle (D3DCOLOR is zyxw) "
                     "while gathering streams")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_DOUBLE(native_resolution_scale, 0.0, "Game",
+                      "With renderer=native, the internal resolution as a multiple of the game's 1280x720 "
+                      "(1 is 720p, 1.5 is 1080p); 0 matches the window")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_INT32(native_msaa, 4, "Game",
                      "With renderer=native, the most samples a multisampled guest surface gets on the "
                      "host (1 turns MSAA off)")
@@ -882,6 +886,14 @@ struct Renderer::State {
     present_pipeline = device->createGraphicsPipeline(desc);
   }
 
+  // Bilinear, clamped sampler for scaling the frontbuffer to the window.
+  uint32_t PresentSampler() {
+    xenos::xe_gpu_texture_fetch_t fetch{};
+    fetch.clamp_x = fetch.clamp_y = fetch.clamp_z = xenos::ClampMode::kClampToEdge;
+    fetch.mag_filter = fetch.min_filter = xenos::TextureFilter::kLinear;
+    return SamplerFor(fetch);
+  }
+
   plume::RenderFramebuffer* SwapFramebuffer(uint32_t image) {
     if (swap_framebuffers.size() != swap_chain->getTextureCount()) {
       swap_framebuffers.clear();
@@ -1131,6 +1143,9 @@ struct Renderer::State {
     height = swap_chain->getHeight();
     scale_x = float(width) / kGuestWidth;
     scale_y = float(height) / kGuestHeight;
+    if (const double scale = REXCVAR_GET(native_resolution_scale); scale > 0.0) {
+      scale_x = scale_y = float(std::clamp(scale, 0.25, 4.0));
+    }
     targets.clear();
     color_images.clear();
     depth_images.clear();
@@ -2392,8 +2407,8 @@ void Renderer::Present(uint32_t frontbuffer, const uint8_t* base) {
     uint32_t words[6];
     for (uint32_t w = 0; w < 6; ++w) words[w] = Be32(base, frontbuffer + 28 + 4 * w);
     auto found = s.textures.find(ImageKey(words));
-    if (found != s.textures.end() && found->second.resolved && found->second.width == s.width &&
-        found->second.height == s.height) {
+    if (found != s.textures.end() && found->second.resolved &&
+        (s.present_pipeline || (found->second.width == s.width && found->second.height == s.height))) {
       source = found->second.texture.get();
       source_layout = plume::RenderTextureLayout::SHADER_READ;
     }
@@ -2410,7 +2425,7 @@ void Renderer::Present(uint32_t frontbuffer, const uint8_t* base) {
     }
   }
   uint64_t present_constants = 0;
-  const bool gamma = target && source_index != 0 && s.has_gamma_ramp && s.present_pipeline &&
+  const bool gamma = target && source_index != 0 && s.present_pipeline &&
                      s.Upload(16 + 256 * 4, 256, present_constants);
   if (target && !source) {
     // Nothing the size of the window to show yet.
@@ -2419,9 +2434,19 @@ void Renderer::Present(uint32_t frontbuffer, const uint8_t* base) {
   } else if (gamma) {
     // Draw the frontbuffer through the gamma ramp, as the display controller
     // shows it.
-    const uint32_t header[4] = {source_index, 0, 0, 0};
+    const uint32_t header[4] = {source_index, s.PresentSampler(), 0, 0};
     std::memcpy(s.upload_cpu + present_constants, header, sizeof(header));
-    std::memcpy(s.upload_cpu + present_constants + 16, s.gamma_ramp.data(), 256 * 4);
+    if (s.has_gamma_ramp) {
+      std::memcpy(s.upload_cpu + present_constants + 16, s.gamma_ramp.data(), 256 * 4);
+    } else {
+      // No ramp written yet: an identity table.
+      std::array<uint32_t, 256> identity;
+      for (uint32_t i = 0; i < 256; ++i) {
+        const uint32_t v = (i * 1023 + 127) / 255;
+        identity[i] = v | (v << 10) | (v << 20);
+      }
+      std::memcpy(s.upload_cpu + present_constants + 16, identity.data(), 256 * 4);
+    }
     s.commands->barriers(plume::RenderBarrierStage::GRAPHICS,
                          plume::RenderTextureBarrier(target, plume::RenderTextureLayout::COLOR_WRITE));
     s.commands->setFramebuffer(s.SwapFramebuffer(image));
