@@ -37,6 +37,10 @@ REXCVAR_DEFINE_INT32(native_dump_frame, 0, "Game",
                      "With renderer=native, describe every draw of this present (from 1) in "
                      "logs/native-frame-<n>.txt; 0 writes none")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(native_decl_swizzle, true, "Game",
+                    "With renderer=native, apply the vertex declaration swizzle (D3DCOLOR is zyxw) "
+                    "while gathering streams")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_STRING(native_skip_shaders, "", "Game",
                       "With renderer=native, skip the draws whose vertex or pixel shader key starts with "
                       "one of these comma-separated hex prefixes (to find which pass draws something)")
@@ -62,7 +66,7 @@ namespace xenos = rex::graphics::xenos;
 using broken_bond::gfx::DeclUsage;
 
 constexpr plume::RenderFormat kColorFormat = plume::RenderFormat::B8G8R8A8_UNORM;
-constexpr plume::RenderFormat kDepthFormat = plume::RenderFormat::D32_FLOAT;
+constexpr plume::RenderFormat kDepthFormat = plume::RenderFormat::D32_FLOAT_S8_UINT;
 constexpr uint32_t kSwapChainBuffers = 2;
 constexpr uint64_t kUploadBytes = 256ull << 20;
 constexpr uint32_t kTexture2DCount = 8192;
@@ -162,6 +166,8 @@ float RegFloat(const uint8_t* base, uint32_t device, uint32_t reg) {
 }
 
 constexpr uint32_t kRbDepthControl = 0x2200;
+constexpr uint32_t kRbStencilRefMaskBf = 0x210C;
+constexpr uint32_t kRbStencilRefMask = 0x210D;
 constexpr uint32_t kRbBlendControl0 = 0x2201;
 constexpr uint32_t kRbColorControl = 0x2202;
 constexpr uint32_t kPaSuScModeCntl = 0x2205;
@@ -198,6 +204,23 @@ plume::RenderComparisonFunction CompareFunction(uint32_t xenos_func) {
   // xenos::CompareFunction 0..7 is never, less, equal, lequal, greater,
   // notequal, gequal, always: Plume's order after UNKNOWN.
   return static_cast<plume::RenderComparisonFunction>(1 + (xenos_func & 7));
+}
+
+plume::RenderStencilOp StencilOp(uint32_t xenos_op) {
+  // keep, zero, replace, incr_sat, decr_sat, invert, incr_wrap, decr_wrap:
+  // Plume's order after UNKNOWN.
+  return static_cast<plume::RenderStencilOp>(1 + (xenos_op & 7));
+}
+
+// One face of RB_DEPTHCONTROL's stencil state: function, then the fail,
+// depth-pass and depth-fail operations, three bits each from `shift`.
+plume::RenderStencilFaceDesc StencilFace(uint32_t depth_control, uint32_t shift) {
+  plume::RenderStencilFaceDesc face;
+  face.compareFunction = CompareFunction(depth_control >> shift);
+  face.failOp = StencilOp(depth_control >> (shift + 3));
+  face.passOp = StencilOp(depth_control >> (shift + 6));
+  face.depthFailOp = StencilOp(depth_control >> (shift + 9));
+  return face;
 }
 
 plume::RenderBlend BlendFactor(uint32_t factor) {
@@ -427,6 +450,12 @@ bool ElementFormat(uint32_t usage, uint32_t format_word, plume::RenderFormat& ou
   source.is_signed = (format_word & 0x100) != 0;
   source.is_integer = (format_word & 0x200) != 0;
   source.swizzle = (format_word >> 10) & 0xFFF;
+  if (!REXCVAR_GET(native_decl_swizzle)) {
+    // The fetch as is: present components in order, absent ones 0, w 1.
+    const uint32_t n = ComponentCount(source.format);
+    source.swizzle = 0;
+    for (uint32_t c = 0; c < 4; ++c) source.swizzle |= (c < n ? c : (c == 3 ? 5u : 4u)) << (3 * c);
+  }
   in_size = GuestElementSize(source.format);
   if (in_size == 0) return false;
   const bool raw = usage == uint32_t(DeclUsage::kNormal) || usage == uint32_t(DeclUsage::kTangent) ||
@@ -1520,8 +1549,10 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
   if (REXCVAR_GET(native_dump_outline) && s.outline_dump == 0 && sc_mode != 0 && sc_mode != 2) {
     s.outline_dump = s.presents + 61;
   }
-  const uint32_t state_key[7] = {depth_control & 0x77, blend_control, color_mask, uint32_t(topology),
-                                 spec, uint32_t(ps_object != 0), sc_mode};
+  const uint32_t stencil_ref = (depth_control & 1) ? Reg(base, device, kRbStencilRefMask) & 0xFFFFFF : 0;
+  const uint32_t state_key[8] = {(depth_control & 1) ? depth_control : depth_control & 0x77,
+                                 blend_control, color_mask, uint32_t(topology), spec, uint32_t(ps_object != 0),
+                                 sc_mode, stencil_ref};
   XXH3_64bits_update(&key_state, state_key, sizeof(state_key));
   XXH3_64bits_update(&key_state, &vs_key, 8);
   XXH3_64bits_update(&key_state, &ps_key, 8);
@@ -1549,6 +1580,17 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
     desc.depthEnabled = (depth_control & 0x2) != 0 && !REXCVAR_GET(native_debug_target);
     desc.depthWriteEnabled = (depth_control & 0x4) != 0;
     desc.depthFunction = CompareFunction((depth_control >> 4) & 7);
+    // Stencil: characters mark their pixels so the outline shell drawn after
+    // them only shows outside the body. One reference and read mask serve
+    // both faces on the host; Xenos keeps a set per face.
+    desc.stencilEnabled = (depth_control & 1) != 0;
+    if (desc.stencilEnabled) {
+      desc.stencilReference = stencil_ref & 0xFF;
+      desc.stencilReadMask = (stencil_ref >> 8) & 0xFF;
+      desc.stencilWriteMask = (stencil_ref >> 16) & 0xFF;
+      desc.stencilFrontFace = StencilFace(depth_control, 8);
+      desc.stencilBackFace = (depth_control & 0x80) ? StencilFace(depth_control, 20) : desc.stencilFrontFace;
+    }
     desc.depthTargetFormat = kDepthFormat;
     desc.renderTargetCount = 1;
     desc.renderTargetFormat[0] = kColorFormat;
