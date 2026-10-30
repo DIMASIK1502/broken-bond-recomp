@@ -284,8 +284,19 @@ if(EXISTS "${BROKEN_BOND_PLUME_DIR}/CMakeLists.txt" AND
         DEPENDS "${BROKEN_BOND_PRESENT_HLSL}"
         COMMENT "Compiling the native renderer's present shader"
         VERBATIM)
+    set(BROKEN_BOND_DEPTH_RESOLVE_HLSL "${CMAKE_CURRENT_SOURCE_DIR}/src/render/shaders/depth_resolve.hlsl")
+    add_custom_command(
+        OUTPUT "${BROKEN_BOND_SHADER_DIR}/depth_resolve_vs.h" "${BROKEN_BOND_SHADER_DIR}/depth_resolve_ps.h"
+        COMMAND "${BROKEN_BOND_DXC}" -spirv -fvk-use-dx-layout -HV 2021 -T vs_6_0 -E VSMain
+            -Fh "${BROKEN_BOND_SHADER_DIR}/depth_resolve_vs.h" -Vn g_depth_resolve_vs "${BROKEN_BOND_DEPTH_RESOLVE_HLSL}"
+        COMMAND "${BROKEN_BOND_DXC}" -spirv -fvk-use-dx-layout -HV 2021 -T ps_6_0 -E PSMain
+            -Fh "${BROKEN_BOND_SHADER_DIR}/depth_resolve_ps.h" -Vn g_depth_resolve_ps "${BROKEN_BOND_DEPTH_RESOLVE_HLSL}"
+        DEPENDS "${BROKEN_BOND_DEPTH_RESOLVE_HLSL}"
+        COMMENT "Compiling the native renderer's depth resolve shader"
+        VERBATIM)
     target_sources(broken_bond PRIVATE src/render/renderer.cpp
-        "${BROKEN_BOND_SHADER_DIR}/present_vs.h" "${BROKEN_BOND_SHADER_DIR}/present_ps.h")
+        "${BROKEN_BOND_SHADER_DIR}/present_vs.h" "${BROKEN_BOND_SHADER_DIR}/present_ps.h"
+        "${BROKEN_BOND_SHADER_DIR}/depth_resolve_vs.h" "${BROKEN_BOND_SHADER_DIR}/depth_resolve_ps.h")
     target_include_directories(broken_bond PRIVATE "${BROKEN_BOND_SHADER_DIR}")
     target_link_libraries(broken_bond PRIVATE plume)
     target_compile_definitions(broken_bond PRIVATE BROKEN_BOND_HAS_NATIVE_RENDERER)
