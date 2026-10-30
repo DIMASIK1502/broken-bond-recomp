@@ -77,6 +77,10 @@ endif()
 # The installed GPU plugin is D3D12-only, so SPIR-V is compiled from the SDK
 # checkout when that tree sits next to this repo. The game plugin is not rebuilt.
 add_executable(shader_db tools/shader_db.cpp)
+if(TARGET xxHash::xxhash)
+    target_include_directories(shader_db PRIVATE
+        $<TARGET_PROPERTY:xxHash::xxhash,INTERFACE_INCLUDE_DIRECTORIES>)
+endif()
 
 set(BROKEN_BOND_REXGLUE_SOURCE "" CACHE PATH
     "rexglue-sdk checkout used to compile the SPIR-V translator into shader_db")

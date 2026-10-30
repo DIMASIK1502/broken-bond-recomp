@@ -35,6 +35,9 @@ REXCVAR_DEFINE_INT32(native_dump_frame, 0, "Game",
                      "With renderer=native, describe every draw of this present (from 1) in "
                      "logs/native-frame-<n>.txt; 0 writes none")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(native_debug_target, false, "Game",
+                    "Debug: skip guest clears and show the render target itself at Swap")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace broken_bond::render {
 
@@ -583,6 +586,10 @@ struct Renderer::State {
   uint64_t clears = 0;
   uint64_t resolves = 0;
   uint64_t reuploads = 0;
+  // Guest base address of every resolve destination -> its texture key. The
+  // game samples a resolved image through fetch constants that differ from
+  // the destination object's (format view, flags), so the address decides.
+  std::unordered_map<uint32_t, uint64_t> resolved_at;
 
   // A guest D3DRECT {x1, y1, x2, y2} scaled to the host target.
   plume::RenderRect HostRect(const uint8_t* base, uint32_t rect) const {
@@ -776,6 +783,10 @@ struct Renderer::State {
   // are uploaded again.
   uint32_t Texture2DFor(const uint32_t words[6], const xenos::xe_gpu_texture_fetch_t& fetch,
                         const uint8_t* base, bool& uploaded) {
+    if (auto at = resolved_at.find(fetch.base_address << 12); at != resolved_at.end()) {
+      auto resolved = textures.find(at->second);
+      if (resolved != textures.end()) return resolved->second.index;
+    }
     const uint64_t key = ImageKey(words);
     auto found = textures.find(key);
     if (found != textures.end() && (found->second.resolved || found->second.checked == presents)) {
@@ -996,6 +1007,7 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
   struct Element {
     uint32_t stream, offset, usage, usage_index, location;
     uint32_t in_size, out_size, out_offset;
+    uint32_t format_word;
     ElementConvert convert;
     ElementSource source;
     plume::RenderFormat format;
@@ -1010,6 +1022,7 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
     e.stream = Be16(base, at);
     e.offset = Be16(base, at + 2);
     const uint32_t format_word = Be32(base, at + 4);
+    e.format_word = format_word;
     e.usage = *At(base, at + 9);
     e.usage_index = *At(base, at + 10);
     e.location = UsageLocation(e.usage, e.usage_index);
@@ -1129,7 +1142,7 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
     desc.primitiveTopology = topology;
     desc.cullMode = plume::RenderCullMode::NONE;
     desc.depthClipEnabled = true;
-    desc.depthEnabled = (depth_control & 0x2) != 0;
+    desc.depthEnabled = (depth_control & 0x2) != 0 && !REXCVAR_GET(native_debug_target);
     desc.depthWriteEnabled = (depth_control & 0x4) != 0;
     desc.depthFunction = CompareFunction((depth_control >> 4) & 7);
     desc.depthTargetFormat = kDepthFormat;
@@ -1280,10 +1293,8 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
                                    first, vertex_count, vs_key, ps_key, depth_control, blend_control, color_mask,
                                    s.last_viewport, Reg(base, device, kPaSuScModeCntl), Reg(base, device, 0x2204));
     for (uint32_t i = 0; i < element_count; ++i) {
-      line += fmt::format(" | e{} s{} +{} usage{}.{} fmt{:03X}", i, elems[i].stream, elems[i].offset,
-                          elems[i].usage, elems[i].usage_index,
-                          uint32_t(elems[i].source.format) | (elems[i].source.is_signed ? 0x100 : 0) |
-                              (elems[i].source.is_integer ? 0x200 : 0));
+      line += fmt::format(" | e{} s{} +{} usage{}.{} type{:08X}", i, elems[i].stream, elems[i].offset,
+                          elems[i].usage, elems[i].usage_index, elems[i].format_word);
     }
     // Decoded positions of the first vertices (stream of the POSITION element).
     for (uint32_t i = 0; i < element_count; ++i) {
@@ -1310,7 +1321,10 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
     }
     for (uint32_t slot = 0; slot < DESCRIPTOR_SLOT_COUNT; ++slot) {
       const uint32_t index = indices[DESCRIPTOR_KIND_TEXTURE2D * DESCRIPTOR_SLOT_COUNT + slot];
-      if (index != 0) line += fmt::format(" | t{}=#{}", slot, index);
+      if (index == 0) continue;
+      bool resolved = false;
+      for (const auto& [k, t] : s.textures) resolved |= t.index == index && t.resolved;
+      line += fmt::format(" | t{}=#{}{}", slot, index, resolved ? "r" : "");
     }
     s.dump += line + "\n";
   }
@@ -1325,6 +1339,7 @@ void Renderer::Clear(uint32_t device, uint32_t flags, uint32_t rect, uint32_t co
   s.BeginFrame();
   s.UploadDefaults();
   s.BindTarget();
+  if (REXCVAR_GET(native_debug_target)) return;
   plume::RenderRect host_rect(0, 0, int32_t(s.width), int32_t(s.height));
   if (rect != 0) host_rect = s.HostRect(base, rect);
   if (flags & 0xF) {
@@ -1361,6 +1376,7 @@ void Renderer::Resolve(uint32_t device, uint32_t flags, uint32_t rect, uint32_t 
     const uint32_t width = std::max(1u, uint32_t(std::lround(guest_width * float(s.width) / kGuestWidth)));
     const uint32_t height = std::max(1u, uint32_t(std::lround(guest_height * float(s.height) / kGuestHeight)));
     const uint64_t key = ImageKey(words);
+    s.resolved_at[fetch.base_address << 12] = key;
     State::Texture& entry = s.textures[key];
     if (!entry.texture || !entry.resolved || entry.width != width || entry.height != height) {
       entry.texture = s.device->createTexture(plume::RenderTextureDesc::Texture2D(width, height, 1, kColorFormat));
@@ -1401,21 +1417,28 @@ void Renderer::Resolve(uint32_t device, uint32_t flags, uint32_t rect, uint32_t 
                             entry.view.get());
     }
     if (s.Dumping()) {
-      s.dump += fmt::format("resolve flags={:X} texture={:08X} {}x{} key={:016X} src={},{}-{},{}\n", flags,
-                            texture, guest_width, guest_height, key, src.left, src.top, src.right, src.bottom);
+      s.dump += fmt::format("resolve flags={:X} texture={:08X} {}x{} key={:016X} index=#{} src={},{}-{},{}\n",
+                            flags, texture, guest_width, guest_height, key, entry.index, src.left, src.top,
+                            src.right, src.bottom);
     }
     ++s.resolves;
   }
   s.BindTarget();
+  // Xenos clears the EDRAM the resolve read. A tiled pass resolves and clears
+  // one band at a time; the host draws the frame once, so only that band may
+  // be cleared or the later bands would copy an empty target.
+  plume::RenderRect region(0, 0, int32_t(s.width), int32_t(s.height));
+  if (rect != 0) region = s.HostRect(base, rect);
+  if (REXCVAR_GET(native_debug_target)) flags &= ~0x300u;
   if (flags & 0x100) {
     plume::RenderColor value(0.0f, 0.0f, 0.0f, 0.0f);
     if (clear_color != 0) {
       value = plume::RenderColor(BeFloat(base, clear_color), BeFloat(base, clear_color + 4),
                                  BeFloat(base, clear_color + 8), BeFloat(base, clear_color + 12));
     }
-    s.commands->clearColor(0, value);
+    s.commands->clearColor(0, value, &region, 1);
   }
-  if (flags & 0x200) s.commands->clearDepthStencil(true, true, std::clamp(z, 0.0f, 1.0f), 0);
+  if (flags & 0x200) s.commands->clearDepthStencil(true, true, std::clamp(z, 0.0f, 1.0f), 0, &region, 1);
 }
 
 void Renderer::Present(uint32_t frontbuffer, const uint8_t* base) {
@@ -1427,7 +1450,7 @@ void Renderer::Present(uint32_t frontbuffer, const uint8_t* base) {
   // whatever the target holds.
   plume::RenderTexture* source = s.color.get();
   plume::RenderTextureLayout source_layout = plume::RenderTextureLayout::COLOR_WRITE;
-  if (frontbuffer != 0) {
+  if (frontbuffer != 0 && !REXCVAR_GET(native_debug_target)) {
     uint32_t words[6];
     for (uint32_t w = 0; w < 6; ++w) words[w] = Be32(base, frontbuffer + 28 + 4 * w);
     auto found = s.textures.find(ImageKey(words));

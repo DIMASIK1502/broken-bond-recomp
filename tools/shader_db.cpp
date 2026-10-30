@@ -23,6 +23,9 @@
 //   memory. Nothing is written.
 
 #include <cstdint>
+#include <cstdio>
+#define XXH_INLINE_ALL
+#include <xxhash.h>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -2927,7 +2930,9 @@ void CheckTiling3D(TileResult& result) {
 }
 #endif
 
-// Writes shader record i as <dir>/<i>.vs or .ps, the inflated object as is.
+// Writes shader record i as <dir>/<i>.vs or .ps, the inflated object as is,
+// and <dir>/keys.txt: record index and XenosRecomp cache key (XXH3 of the
+// object) per line.
 int Extract(const char* path, const char* dir) {
   std::ifstream in(path, std::ios::binary);
   if (!in) {
@@ -2946,6 +2951,7 @@ int Extract(const char* path, const char* dir) {
     Fail("shader table runs past the file");
   }
   std::filesystem::create_directories(dir);
+  FILE* keys = std::fopen((std::filesystem::path(dir) / "keys.txt").string().c_str(), "w");
   uint32_t vertex = 0;
   uint32_t pixel = 0;
   for (uint32_t i = 0; i < shader_count; ++i) {
@@ -2970,7 +2976,12 @@ int Extract(const char* path, const char* dir) {
     if (!file_out) {
       Fail("cannot write " + out.string());
     }
+    if (keys) {
+      std::fprintf(keys, "%u %016llX\n", i,
+                   static_cast<unsigned long long>(XXH3_64bits(object.data(), object.size())));
+    }
   }
+  if (keys) std::fclose(keys);
   std::cout << "extracted " << shader_count << " vs " << vertex << " ps " << pixel << "\n";
   return 0;
 }
