@@ -2259,8 +2259,7 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
   std::array<plume::RenderInputSlot, 16> slots;
   std::array<plume::RenderVertexBufferView, 16> views;
   uint32_t slot_count = 0;
-  std::array<uint32_t, 16> stream_addresses{};
-  uint32_t stream_address_count = 0;
+
   XXH3_state_t key_state;
   XXH3_64bits_reset(&key_state);
   const auto t_stream = std::chrono::steady_clock::now();
@@ -2364,7 +2363,6 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
     }
     slots[slot_count] = plume::RenderInputSlot(slot_count, out_stride);
     views[slot_count] = plume::RenderVertexBufferView(stream_ref, uint32_t(out_bytes));
-    stream_addresses[stream_address_count++] = vf.address;
     for (uint32_t i = 0; i < element_count; ++i) {
       if (elems[i].stream != stream) continue;
       elements[i] = plume::RenderInputElement(UsageSemantic(elems[i].usage), elems[i].usage_index,
@@ -2619,9 +2617,11 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
     for (uint32_t slot = 0; slot < DESCRIPTOR_SLOT_COUNT; ++slot) {
       texture_indices[slot] = indices[DESCRIPTOR_KIND_TEXTURE2D * DESCRIPTOR_SLOT_COUNT + slot];
     }
-    op.key = interp::DrawKey(vs_key, ps_key, stream_addresses.data(), stream_address_count,
-                             draw.indexed ? index_address : 0, draw.start, draw.count, texture_indices,
-                             DESCRIPTOR_SLOT_COUNT);
+    // Streams are left out: the game writes dynamic geometry (UI quads,
+    // cables) to a different buffer each frame, and such draws must still
+    // pair. Same-looking draws pair in order.
+    op.key = interp::DrawKey(vs_key, ps_key, nullptr, 0, draw.indexed ? index_address : 0, draw.start,
+                             draw.count, texture_indices, DESCRIPTOR_SLOT_COUNT);
   }
   s.ExecuteDraw(op);
   s.Record(op);
