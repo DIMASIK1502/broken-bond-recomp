@@ -298,7 +298,7 @@ if(EXISTS "${BROKEN_BOND_PLUME_DIR}/CMakeLists.txt" AND
         DEPENDS "${BROKEN_BOND_DEPTH_RESOLVE_HLSL}"
         COMMENT "Compiling the native renderer's depth resolve shader"
         VERBATIM)
-    target_sources(broken_bond PRIVATE src/render/renderer.cpp
+    target_sources(broken_bond PRIVATE src/render/renderer.cpp src/render/interpolation.cpp
         "${BROKEN_BOND_SHADER_DIR}/present_vs.h" "${BROKEN_BOND_SHADER_DIR}/present_ps.h"
         "${BROKEN_BOND_SHADER_DIR}/depth_resolve_vs.h" "${BROKEN_BOND_SHADER_DIR}/depth_resolve_ps.h")
     target_include_directories(broken_bond PRIVATE "${BROKEN_BOND_SHADER_DIR}")

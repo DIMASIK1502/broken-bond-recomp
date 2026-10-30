@@ -30,6 +30,8 @@
 #include "gfx/xenos_shader_common.h"
 #include <rex/logging.h>
 
+#include "render/interpolation.h"
+
 #include "depth_resolve_ps.h"
 #include "depth_resolve_vs.h"
 #include "present_ps.h"
@@ -1138,24 +1140,32 @@ struct Renderer::State {
       target.framebuffer = device->createFramebuffer(desc);
       current = nullptr;
     }
-    if (samples > 1) {
+    if (UseTarget(target)) {
+      if (fresh_color) commands->clearColor(0, plume::RenderColor(0.0f, 0.0f, 0.0f, 1.0f));
+      if (fresh_depth) commands->clearDepthStencil(true, true, 1.0f, 0);
+    }
+  }
+
+  // Makes `target` the one draws go to. Returns true when it was not already.
+  bool UseTarget(Target& target) {
+    Image& color_image = *target.color;
+    Image& depth_image = *target.depth;
+    if (target.samples > 1) {
       color_image.msaa_newer = true;
     } else {
       ResolveMsaa(color_image);
     }
-    if (current != &target) {
-      ++target_switches;
-      current = &target;
-      current_samples = samples;
-      color = samples > 1 ? color_image.msaa.get() : color_image.texture.get();
-      depth = samples > 1 ? depth_image.msaa.get() : depth_image.texture.get();
-      framebuffer = target.framebuffer.get();
-      target_width = color_image.width;
-      target_height = color_image.height;
-      BindTarget();
-      if (fresh_color) commands->clearColor(0, plume::RenderColor(0.0f, 0.0f, 0.0f, 1.0f));
-      if (fresh_depth) commands->clearDepthStencil(true, true, 1.0f, 0);
-    }
+    if (current == &target) return false;
+    ++target_switches;
+    current = &target;
+    current_samples = target.samples;
+    color = target.samples > 1 ? color_image.msaa.get() : color_image.texture.get();
+    depth = target.samples > 1 ? depth_image.msaa.get() : depth_image.texture.get();
+    framebuffer = target.framebuffer.get();
+    target_width = color_image.width;
+    target_height = color_image.height;
+    BindTarget();
+    return true;
   }
 
   uint64_t presents = 0;
@@ -1250,6 +1260,10 @@ struct Renderer::State {
     upload_used = 0;
     next_texture1d = 0;
     texture1d_frame.clear();
+    journal.clear();
+    draw_ops.clear();
+    clear_ops.clear();
+    resolve_ops.clear();
     commands->begin();
     // Targets keep their contents across frames (the game draws before Swap
     // and resolves after it); a new command list only needs them rebound.
@@ -1649,6 +1663,159 @@ struct Renderer::State {
     return texture.index;
   }
 
+  // Frame journal (native_interpolate): what each guest call recorded, in
+  // order, so the frame can be recorded a second time. Everything a call read
+  // from guest memory is resolved into the op; data lives in the upload ring,
+  // which holds until the next BeginFrame.
+  struct DrawOp {
+    Target* target = nullptr;
+    plume::RenderPipeline* pipeline = nullptr;
+    uint64_t vs_constants = 0, ps_constants = 0, shared = 0;  // upload ring offsets
+    plume::RenderViewport viewport;
+    std::array<plume::RenderVertexBufferView, 16> views;
+    std::array<plume::RenderInputSlot, 16> slots;
+    uint32_t slot_count = 0;
+    bool indexed = false;
+    uint64_t index_ring = 0;
+    uint32_t index_count = 0;
+    uint32_t vertex_count = 0;
+    bool uploaded = false;  // textures were uploaded first, so rebind
+    uint64_t key = 0;       // interp::DrawKey
+  };
+  struct ClearOp {
+    Target* target = nullptr;
+    uint32_t flags = 0;
+    plume::RenderRect rect;
+    plume::RenderColor color;
+    float z = 0.0f;
+    uint32_t stencil = 0;
+  };
+  struct ResolveOp {
+    Target* target = nullptr;
+    enum Kind { kNone, kColor, kDepth } kind = kNone;
+    uint64_t key = 0;  // destination in `textures`
+    plume::RenderRect src;
+    int32_t dst_x = 0, dst_y = 0;
+    int32_t copy_w = 0, copy_h = 0;  // depth
+    uint64_t constants = 0;          // depth pass constants in the upload ring
+    uint32_t clear_flags = 0;        // 0x100 color, 0x200 depth and stencil
+    plume::RenderRect clear_region;
+    plume::RenderColor clear_color;
+    float z = 0.0f;
+  };
+  struct FrameOp {
+    enum Kind { kDraw, kClear, kResolve } kind;
+    uint32_t index;
+  };
+  std::vector<FrameOp> journal;
+  std::vector<DrawOp> draw_ops;
+  std::vector<ClearOp> clear_ops;
+  std::vector<ResolveOp> resolve_ops;
+  size_t journal_last = 0;  // ops the last presented frame recorded
+
+  void Record(const DrawOp& op) {
+    if (!REXCVAR_GET(native_interpolate)) return;
+    journal.push_back({FrameOp::kDraw, uint32_t(draw_ops.size())});
+    draw_ops.push_back(op);
+  }
+  void Record(const ClearOp& op) {
+    if (!REXCVAR_GET(native_interpolate)) return;
+    journal.push_back({FrameOp::kClear, uint32_t(clear_ops.size())});
+    clear_ops.push_back(op);
+  }
+  void Record(const ResolveOp& op) {
+    if (!REXCVAR_GET(native_interpolate)) return;
+    journal.push_back({FrameOp::kResolve, uint32_t(resolve_ops.size())});
+    resolve_ops.push_back(op);
+  }
+
+  void ExecuteDraw(const DrawOp& op) {
+    UseTarget(*op.target);
+    if (op.uploaded) BindTarget();
+    commands->setPipeline(op.pipeline);
+    const uint64_t push[3] = {upload_gpu + op.vs_constants, upload_gpu + op.ps_constants, upload_gpu + op.shared};
+    commands->setGraphicsPushConstants(0, push, 0, sizeof(push));
+    commands->setViewports(&op.viewport, 1);
+    const plume::RenderRect scissor(0, 0, int32_t(target_width), int32_t(target_height));
+    commands->setScissors(&scissor, 1);
+    if (op.slot_count) commands->setVertexBuffers(0, op.views.data(), op.slot_count, op.slots.data());
+    if (op.indexed) {
+      const plume::RenderIndexBufferView view(upload->at(op.index_ring), op.index_count * 4,
+                                              plume::RenderFormat::R32_UINT);
+      commands->setIndexBuffer(&view);
+      commands->drawIndexedInstanced(op.index_count, 1, 0, 0, 0);
+    } else {
+      commands->drawInstanced(op.vertex_count, 1, 0, 0);
+    }
+  }
+
+  void ExecuteClear(const ClearOp& op) {
+    UseTarget(*op.target);
+    if (op.flags & 0xF) commands->clearColor(0, op.color, &op.rect, 1);
+    if (op.flags & 0x30) {
+      commands->clearDepthStencil((op.flags & 0x10) != 0, (op.flags & 0x20) != 0, std::clamp(op.z, 0.0f, 1.0f),
+                                  op.stencil & 0xFF, &op.rect, 1);
+    }
+  }
+
+  void ExecuteResolve(const ResolveOp& op) {
+    UseTarget(*op.target);
+    if (op.kind == ResolveOp::kDepth) {
+      Texture& entry = textures[op.key];
+      Image& depth_image = *op.target->depth;
+      plume::RenderTextureBarrier to_pass[] = {
+          plume::RenderTextureBarrier(depth, plume::RenderTextureLayout::DEPTH_READ),
+          plume::RenderTextureBarrier(entry.texture.get(), plume::RenderTextureLayout::COLOR_WRITE)};
+      commands->barriers(plume::RenderBarrierStage::GRAPHICS, to_pass, 2);
+      sets[0]->setTexture(depth_image.depth_index, depth, plume::RenderTextureLayout::DEPTH_READ,
+                          depth_image.depth_view.get());
+      commands->setFramebuffer(entry.framebuffer.get());
+      commands->setGraphicsPipelineLayout(layout.get());
+      for (uint32_t i = 0; i < 6; ++i) commands->setGraphicsDescriptorSet(sets[i].get(), i);
+      commands->setPipeline(depth_resolve_pipeline.get());
+      const uint64_t push[3] = {upload_gpu + op.constants, 0, 0};
+      commands->setGraphicsPushConstants(0, push, 0, sizeof(push));
+      const plume::RenderViewport viewport{float(op.dst_x), float(op.dst_y), float(op.copy_w), float(op.copy_h)};
+      commands->setViewports(&viewport, 1);
+      const plume::RenderRect scissor(op.dst_x, op.dst_y, op.dst_x + op.copy_w, op.dst_y + op.copy_h);
+      commands->setScissors(&scissor, 1);
+      commands->drawInstanced(3, 1, 0, 0);
+      plume::RenderTextureBarrier back[] = {
+          plume::RenderTextureBarrier(depth, plume::RenderTextureLayout::DEPTH_WRITE),
+          plume::RenderTextureBarrier(entry.texture.get(), plume::RenderTextureLayout::SHADER_READ)};
+      commands->barriers(plume::RenderBarrierStage::GRAPHICS, back, 2);
+      sets[0]->setTexture(entry.index, entry.texture.get(), plume::RenderTextureLayout::SHADER_READ,
+                          entry.view.get());
+    } else if (op.kind == ResolveOp::kColor) {
+      Texture& entry = textures[op.key];
+      const bool multisampled = current_samples > 1;
+      plume::RenderTextureBarrier to_copy[] = {
+          plume::RenderTextureBarrier(color, multisampled ? plume::RenderTextureLayout::RESOLVE_SOURCE
+                                                          : plume::RenderTextureLayout::COPY_SOURCE),
+          plume::RenderTextureBarrier(entry.texture.get(), multisampled ? plume::RenderTextureLayout::RESOLVE_DEST
+                                                                        : plume::RenderTextureLayout::COPY_DEST)};
+      commands->barriers(plume::RenderBarrierStage::COPY, to_copy, 2);
+      if (multisampled) {
+        commands->resolveTextureRegion(entry.texture.get(), uint32_t(op.dst_x), uint32_t(op.dst_y), color, &op.src);
+      } else {
+        const plume::RenderBox box(op.src.left, op.src.top, op.src.right, op.src.bottom);
+        commands->copyTextureRegion(plume::RenderTextureCopyLocation::Subresource(entry.texture.get()),
+                                    plume::RenderTextureCopyLocation::Subresource(color), uint32_t(op.dst_x),
+                                    uint32_t(op.dst_y), 0, &box);
+      }
+      plume::RenderTextureBarrier back[] = {
+          plume::RenderTextureBarrier(color, plume::RenderTextureLayout::COLOR_WRITE),
+          plume::RenderTextureBarrier(entry.texture.get(), plume::RenderTextureLayout::SHADER_READ)};
+      commands->barriers(plume::RenderBarrierStage::GRAPHICS, back, 2);
+      sets[0]->setTexture(entry.index, entry.texture.get(), plume::RenderTextureLayout::SHADER_READ,
+                          entry.view.get());
+    }
+    BindTarget();
+    if (op.clear_flags & 0x100) commands->clearColor(0, op.clear_color, &op.clear_region, 1);
+    if (op.clear_flags & 0x200) {
+      commands->clearDepthStencil(true, true, std::clamp(op.z, 0.0f, 1.0f), 0, &op.clear_region, 1);
+    }
+  }
 };
 
 Renderer::Renderer() : state_(std::make_unique<State>()) {}
@@ -1769,6 +1936,7 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
   // Guest vertex indices of the draw. Vertex v of the draw lives at guest
   // vertex base_vertex + v (indexed) or v (auto).
   std::vector<uint32_t> list;
+  uint32_t index_address = 0;
   if (draw.indexed) {
     const uint32_t ib = Be32(base, device + kDeviceIndices);
     if (ib == 0) {
@@ -1777,6 +1945,7 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
     }
     const bool index32 = (Be32(base, ib) & 0x80000000u) != 0;
     const uint32_t address = PhysicalView(Be32(base, ib + 24));
+    index_address = address;
     list.resize(draw.count);
     for (uint32_t i = 0; i < draw.count; ++i) {
       list[i] = index32 ? Be32(base, address + 4 * (draw.start + i)) : Be16(base, address + 2 * (draw.start + i));
@@ -1853,6 +2022,8 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
   std::array<plume::RenderInputSlot, 16> slots;
   std::array<plume::RenderVertexBufferView, 16> views;
   uint32_t slot_count = 0;
+  std::array<uint32_t, 16> stream_addresses{};
+  uint32_t stream_address_count = 0;
   XXH3_state_t key_state;
   XXH3_64bits_reset(&key_state);
   const auto t_stream = std::chrono::steady_clock::now();
@@ -1956,6 +2127,7 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
     }
     slots[slot_count] = plume::RenderInputSlot(slot_count, out_stride);
     views[slot_count] = plume::RenderVertexBufferView(stream_ref, uint32_t(out_bytes));
+    stream_addresses[stream_address_count++] = vf.address;
     for (uint32_t i = 0; i < element_count; ++i) {
       if (elems[i].stream != stream) continue;
       elements[i] = plume::RenderInputElement(UsageSemantic(elems[i].usage), elems[i].usage_index,
@@ -2190,22 +2362,32 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
                                 2.0f * xscale, 2.0f * yscale);
 
   s.Lap(4);
-  if (uploaded) s.BindTarget();
-  s.commands->setPipeline(pipeline);
-  const uint64_t push[3] = {s.upload_gpu + vs_constants, s.upload_gpu + ps_constants, s.upload_gpu + shared};
-  s.commands->setGraphicsPushConstants(0, push, 0, sizeof(push));
-  s.commands->setViewports(&viewport, 1);
-  const plume::RenderRect scissor(0, 0, int32_t(s.target_width), int32_t(s.target_height));
-  s.commands->setScissors(&scissor, 1);
-  if (slot_count) s.commands->setVertexBuffers(0, views.data(), slot_count, slots.data());
-  if (use_indices) {
-    const plume::RenderIndexBufferView view(s.upload->at(index_ring), index_count * 4,
-                                            plume::RenderFormat::R32_UINT);
-    s.commands->setIndexBuffer(&view);
-    s.commands->drawIndexedInstanced(index_count, 1, 0, 0, 0);
-  } else {
-    s.commands->drawInstanced(draw.count, 1, 0, 0);
+  State::DrawOp op;
+  op.target = s.current;
+  op.pipeline = pipeline;
+  op.vs_constants = vs_constants;
+  op.ps_constants = ps_constants;
+  op.shared = shared;
+  op.viewport = viewport;
+  op.views = views;
+  op.slots = slots;
+  op.slot_count = slot_count;
+  op.indexed = use_indices;
+  op.index_ring = index_ring;
+  op.index_count = index_count;
+  op.vertex_count = draw.count;
+  op.uploaded = uploaded;
+  if (REXCVAR_GET(native_interpolate)) {
+    uint32_t texture_indices[DESCRIPTOR_SLOT_COUNT];
+    for (uint32_t slot = 0; slot < DESCRIPTOR_SLOT_COUNT; ++slot) {
+      texture_indices[slot] = indices[DESCRIPTOR_KIND_TEXTURE2D * DESCRIPTOR_SLOT_COUNT + slot];
+    }
+    op.key = interp::DrawKey(vs_key, ps_key, stream_addresses.data(), stream_address_count,
+                             draw.indexed ? index_address : 0, draw.start, draw.count, texture_indices,
+                             DESCRIPTOR_SLOT_COUNT);
   }
+  s.ExecuteDraw(op);
+  s.Record(op);
   s.Lap(5);
   if (s.Dumping()) {
     std::string line = fmt::format("draw {} indexed={} prim={} start={} count={} base={} first={} verts={} "
@@ -2349,18 +2531,19 @@ void Renderer::Clear(uint32_t device, uint32_t flags, uint32_t rect, uint32_t co
       host_rect.bottom = int32_t(s.target_height);
     }
   }
-  if (flags & 0xF) {
-    plume::RenderColor value(0.0f, 0.0f, 0.0f, 0.0f);
-    if (color != 0) {
-      value = plume::RenderColor(BeFloat(base, color), BeFloat(base, color + 4), BeFloat(base, color + 8),
-                                 BeFloat(base, color + 12));
-    }
-    s.commands->clearColor(0, value, &host_rect, 1);
+  State::ClearOp op;
+  op.target = s.current;
+  op.flags = flags;
+  op.rect = host_rect;
+  op.color = plume::RenderColor(0.0f, 0.0f, 0.0f, 0.0f);
+  if ((flags & 0xF) && color != 0) {
+    op.color = plume::RenderColor(BeFloat(base, color), BeFloat(base, color + 4), BeFloat(base, color + 8),
+                                  BeFloat(base, color + 12));
   }
-  if (flags & 0x30) {
-    s.commands->clearDepthStencil((flags & 0x10) != 0, (flags & 0x20) != 0, std::clamp(z, 0.0f, 1.0f),
-                                  stencil & 0xFF, &host_rect, 1);
-  }
+  op.z = z;
+  op.stencil = stencil;
+  s.ExecuteClear(op);
+  s.Record(op);
   if (s.Dumping()) {
     s.dump += fmt::format("clear flags={:X} rect={:08X} z={} rt={:08X}/{:08X}/{:08X}\n", flags, rect, z,
                           Reg(base, device, 0x2000), Reg(base, device, 0x2001), Reg(base, device, 0x2002));
@@ -2377,6 +2560,8 @@ void Renderer::Resolve(uint32_t device, uint32_t flags, uint32_t rect, uint32_t 
   s.UploadDefaults();
   s.SelectTarget(base, device, std::max<uint32_t>(State::RectBottom(base, rect), 1));
   const uint32_t source = flags & 7;
+  State::ResolveOp op;
+  op.target = s.current;
   if (texture != 0 && source >= 4) {
     // The EDRAM depth into a texture the game samples later (the cutscene
     // depth of field). The host copy holds the depth value as R32_FLOAT.
@@ -2446,29 +2631,13 @@ void Renderer::Resolve(uint32_t device, uint32_t flags, uint32_t rect, uint32_t 
       const int32_t header[4] = {int32_t(depth_image->depth_index), s.current_samples > 1 ? 1 : 0,
                                  src.left - dst_x, src.top - dst_y};
       std::memcpy(s.upload_cpu + constants, header, sizeof(header));
-      plume::RenderTextureBarrier to_pass[] = {
-          plume::RenderTextureBarrier(s.depth, plume::RenderTextureLayout::DEPTH_READ),
-          plume::RenderTextureBarrier(entry.texture.get(), plume::RenderTextureLayout::COLOR_WRITE)};
-      s.commands->barriers(plume::RenderBarrierStage::GRAPHICS, to_pass, 2);
-      s.sets[0]->setTexture(depth_image->depth_index, s.depth, plume::RenderTextureLayout::DEPTH_READ,
-                            depth_image->depth_view.get());
-      s.commands->setFramebuffer(entry.framebuffer.get());
-      s.commands->setGraphicsPipelineLayout(s.layout.get());
-      for (uint32_t i = 0; i < 6; ++i) s.commands->setGraphicsDescriptorSet(s.sets[i].get(), i);
-      s.commands->setPipeline(s.depth_resolve_pipeline.get());
-      const uint64_t push[3] = {s.upload_gpu + constants, 0, 0};
-      s.commands->setGraphicsPushConstants(0, push, 0, sizeof(push));
-      const plume::RenderViewport viewport{float(dst_x), float(dst_y), float(copy_w), float(copy_h)};
-      s.commands->setViewports(&viewport, 1);
-      const plume::RenderRect scissor(dst_x, dst_y, dst_x + copy_w, dst_y + copy_h);
-      s.commands->setScissors(&scissor, 1);
-      s.commands->drawInstanced(3, 1, 0, 0);
-      plume::RenderTextureBarrier back[] = {
-          plume::RenderTextureBarrier(s.depth, plume::RenderTextureLayout::DEPTH_WRITE),
-          plume::RenderTextureBarrier(entry.texture.get(), plume::RenderTextureLayout::SHADER_READ)};
-      s.commands->barriers(plume::RenderBarrierStage::GRAPHICS, back, 2);
-      s.sets[0]->setTexture(entry.index, entry.texture.get(), plume::RenderTextureLayout::SHADER_READ,
-                            entry.view.get());
+      op.kind = State::ResolveOp::kDepth;
+      op.key = key;
+      op.dst_x = dst_x;
+      op.dst_y = dst_y;
+      op.copy_w = copy_w;
+      op.copy_h = copy_h;
+      op.constants = constants;
       const uint32_t physical = TexturePhysical(fetch.base_address);
       s.resolved_at[physical] = {key, State::GuestPageHash(base, physical)};
       ++s.depth_resolves;
@@ -2524,33 +2693,12 @@ void Renderer::Resolve(uint32_t device, uint32_t flags, uint32_t rect, uint32_t 
     }
     src.right = std::min<int32_t>(src.right, src.left + int32_t(width) - dst_x);
     src.bottom = std::min<int32_t>(src.bottom, src.top + int32_t(height) - dst_y);
-    if (src.right > src.left && src.bottom > src.top && s.current_samples > 1) {
-      plume::RenderTextureBarrier to_resolve[] = {
-          plume::RenderTextureBarrier(s.color, plume::RenderTextureLayout::RESOLVE_SOURCE),
-          plume::RenderTextureBarrier(entry.texture.get(), plume::RenderTextureLayout::RESOLVE_DEST)};
-      s.commands->barriers(plume::RenderBarrierStage::COPY, to_resolve, 2);
-      s.commands->resolveTextureRegion(entry.texture.get(), uint32_t(dst_x), uint32_t(dst_y), s.color, &src);
-      plume::RenderTextureBarrier back[] = {
-          plume::RenderTextureBarrier(s.color, plume::RenderTextureLayout::COLOR_WRITE),
-          plume::RenderTextureBarrier(entry.texture.get(), plume::RenderTextureLayout::SHADER_READ)};
-      s.commands->barriers(plume::RenderBarrierStage::GRAPHICS, back, 2);
-      s.sets[0]->setTexture(entry.index, entry.texture.get(), plume::RenderTextureLayout::SHADER_READ,
-                            entry.view.get());
-    } else if (src.right > src.left && src.bottom > src.top) {
-      plume::RenderTextureBarrier to_copy[] = {
-          plume::RenderTextureBarrier(s.color, plume::RenderTextureLayout::COPY_SOURCE),
-          plume::RenderTextureBarrier(entry.texture.get(), plume::RenderTextureLayout::COPY_DEST)};
-      s.commands->barriers(plume::RenderBarrierStage::COPY, to_copy, 2);
-      const plume::RenderBox box(src.left, src.top, src.right, src.bottom);
-      s.commands->copyTextureRegion(plume::RenderTextureCopyLocation::Subresource(entry.texture.get()),
-                                    plume::RenderTextureCopyLocation::Subresource(s.color), uint32_t(dst_x),
-                                    uint32_t(dst_y), 0, &box);
-      plume::RenderTextureBarrier back[] = {
-          plume::RenderTextureBarrier(s.color, plume::RenderTextureLayout::COLOR_WRITE),
-          plume::RenderTextureBarrier(entry.texture.get(), plume::RenderTextureLayout::SHADER_READ)};
-      s.commands->barriers(plume::RenderBarrierStage::GRAPHICS, back, 2);
-      s.sets[0]->setTexture(entry.index, entry.texture.get(), plume::RenderTextureLayout::SHADER_READ,
-                            entry.view.get());
+    if (src.right > src.left && src.bottom > src.top) {
+      op.kind = State::ResolveOp::kColor;
+      op.key = key;
+      op.src = src;
+      op.dst_x = dst_x;
+      op.dst_y = dst_y;
     }
     if (s.Dumping()) {
       s.dump += fmt::format("resolve flags={:X} texture={:08X} @{:08X}/f{} {}x{} key={:016X} index=#{} "
@@ -2561,7 +2709,6 @@ void Renderer::Resolve(uint32_t device, uint32_t flags, uint32_t rect, uint32_t 
     }
     ++s.resolves;
   }
-  s.BindTarget();
   // Xenos clears the EDRAM the resolve read. A tiled pass resolves and clears
   // one band at a time; the host draws the frame once, so only that band may
   // be cleared or the later bands would copy an empty target.
@@ -2577,15 +2724,16 @@ void Renderer::Resolve(uint32_t device, uint32_t flags, uint32_t rect, uint32_t 
     flags &= ~0x300u;
   }
   if (REXCVAR_GET(native_debug_target)) flags &= ~0x300u;
-  if (flags & 0x100) {
-    plume::RenderColor value(0.0f, 0.0f, 0.0f, 0.0f);
-    if (clear_color != 0) {
-      value = plume::RenderColor(BeFloat(base, clear_color), BeFloat(base, clear_color + 4),
-                                 BeFloat(base, clear_color + 8), BeFloat(base, clear_color + 12));
-    }
-    s.commands->clearColor(0, value, &region, 1);
+  op.clear_flags = flags & 0x300u;
+  op.clear_region = region;
+  op.clear_color = plume::RenderColor(0.0f, 0.0f, 0.0f, 0.0f);
+  if ((flags & 0x100) && clear_color != 0) {
+    op.clear_color = plume::RenderColor(BeFloat(base, clear_color), BeFloat(base, clear_color + 4),
+                                        BeFloat(base, clear_color + 8), BeFloat(base, clear_color + 12));
   }
-  if (flags & 0x200) s.commands->clearDepthStencil(true, true, std::clamp(z, 0.0f, 1.0f), 0, &region, 1);
+  op.z = z;
+  s.ExecuteResolve(op);
+  s.Record(op);
 }
 
 void Renderer::Present(uint32_t frontbuffer, const uint8_t* base) {
@@ -2671,6 +2819,7 @@ void Renderer::Present(uint32_t frontbuffer, const uint8_t* base) {
         plume::RenderTextureBarrier(source, source_layout)};
     s.commands->barriers(plume::RenderBarrierStage::NONE, after, 2);
   }
+  s.journal_last = s.journal.size();
   s.commands->end();
   s.recording = false;
   const plume::RenderCommandList* list = s.commands.get();
@@ -2745,6 +2894,7 @@ std::string Renderer::TakeStats() {
                      s.stream_misses, s.stream_cache.size(), s.msaa_resolves, s.depth_resolves);
   s.msaa_resolves = 0;
   s.depth_resolves = 0;
+  if (REXCVAR_GET(native_interpolate)) out += fmt::format(" journal={}", s.journal_last);
   s.stream_hits = s.stream_misses = 0;
   out += " laps";
   for (const double ms : s.ms_lap) out += fmt::format(" {:.0f}", ms);
