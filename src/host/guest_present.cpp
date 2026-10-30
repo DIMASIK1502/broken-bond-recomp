@@ -9,6 +9,8 @@
 #include <vector>
 
 #include <rex/cvar.h>
+#include <rex/graphics/command_processor.h>
+#include <rex/graphics/graphics_system.h>
 #include <rex/logging.h>
 #include <rex/perf/counter.h>
 #include <rex/system/xthread.h>
@@ -36,6 +38,17 @@ namespace {
 std::atomic<bool> g_stop{false};
 #if defined(BROKEN_BOND_HAS_NATIVE_RENDERER)
 std::unique_ptr<broken_bond::render::Renderer> g_native;
+// The GPU plugin's graphics system; its command processor keeps the gamma
+// ramp the game writes through DC_LUT registers.
+rex::graphics::GraphicsSystem* g_graphics = nullptr;
+
+// gamma_ramp_256_entry_table() is protected; a derived class may name it, and
+// the pointer to member it yields can be called on any command processor.
+struct GammaRampAccess : rex::graphics::CommandProcessor {
+  static const rex::graphics::reg::DC_LUT_30_COLOR* Table(const rex::graphics::CommandProcessor& processor) {
+    return (processor.*&GammaRampAccess::gamma_ramp_256_entry_table)();
+  }
+};
 #endif
 std::thread g_thread;
 
@@ -587,7 +600,14 @@ REX_HOOK_RAW(sub_821B1DD0) {
   }
   broken_bond::host::ShadowSwap(base);
 #if defined(BROKEN_BOND_HAS_NATIVE_RENDERER)
-  if (g_native) g_native->Present(ctx.r4.u32, base);
+  if (g_native) {
+    if (g_graphics && g_graphics->command_processor()) {
+      uint32_t ramp[256];
+      std::memcpy(ramp, GammaRampAccess::Table(*g_graphics->command_processor()), sizeof(ramp));
+      g_native->SetGammaRamp(ramp);
+    }
+    g_native->Present(ctx.r4.u32, base);
+  }
 #endif
   const int census = broken_bond::host::CensusEnter(0x821B1DD0, ctx, base);
   __imp__sub_821B1DD0(ctx, base);
@@ -674,6 +694,7 @@ REX_HOOK_RAW(sub_821AD328) {
 
 void BrokenBondApp::OnPostLaunchModule(rex::system::XThread*) {
 #if defined(BROKEN_BOND_HAS_NATIVE_RENDERER)
+  if (runtime()) g_graphics = static_cast<rex::graphics::GraphicsSystem*>(runtime()->graphics_system());
   if (REXCVAR_GET(renderer) == "native" && !g_native && window()) {
     auto native = std::make_unique<broken_bond::render::Renderer>();
     std::string reason;

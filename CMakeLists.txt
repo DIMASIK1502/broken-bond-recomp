@@ -270,8 +270,22 @@ if(EXISTS "${BROKEN_BOND_PLUME_DIR}/CMakeLists.txt" AND
     target_link_libraries(broken_bond PRIVATE broken_bond_shader_cache)
     target_compile_definitions(broken_bond PRIVATE BROKEN_BOND_HAS_SHADER_CACHE)
 
-    # Native renderer (--renderer=native with --gpu_plugin=host).
-    target_sources(broken_bond PRIVATE src/render/renderer.cpp)
+    # Native renderer (--renderer=native with --gpu_plugin=host). Its own
+    # passes are HLSL compiled to SPIR-V headers with XenosRecomp's DXC.
+    set(BROKEN_BOND_DXC "${BROKEN_BOND_XENOSRECOMP_DIR}/thirdparty/dxc-bin/bin/x64/dxc${CMAKE_EXECUTABLE_SUFFIX}")
+    set(BROKEN_BOND_PRESENT_HLSL "${CMAKE_CURRENT_SOURCE_DIR}/src/render/shaders/present.hlsl")
+    add_custom_command(
+        OUTPUT "${BROKEN_BOND_SHADER_DIR}/present_vs.h" "${BROKEN_BOND_SHADER_DIR}/present_ps.h"
+        COMMAND "${BROKEN_BOND_DXC}" -spirv -fvk-use-dx-layout -HV 2021 -T vs_6_0 -E VSMain
+            -Fh "${BROKEN_BOND_SHADER_DIR}/present_vs.h" -Vn g_present_vs "${BROKEN_BOND_PRESENT_HLSL}"
+        COMMAND "${BROKEN_BOND_DXC}" -spirv -fvk-use-dx-layout -HV 2021 -T ps_6_0 -E PSMain
+            -Fh "${BROKEN_BOND_SHADER_DIR}/present_ps.h" -Vn g_present_ps "${BROKEN_BOND_PRESENT_HLSL}"
+        DEPENDS "${BROKEN_BOND_PRESENT_HLSL}"
+        COMMENT "Compiling the native renderer's present shader"
+        VERBATIM)
+    target_sources(broken_bond PRIVATE src/render/renderer.cpp
+        "${BROKEN_BOND_SHADER_DIR}/present_vs.h" "${BROKEN_BOND_SHADER_DIR}/present_ps.h")
+    target_include_directories(broken_bond PRIVATE "${BROKEN_BOND_SHADER_DIR}")
     target_link_libraries(broken_bond PRIVATE plume)
     target_compile_definitions(broken_bond PRIVATE BROKEN_BOND_HAS_NATIVE_RENDERER)
 endif()

@@ -28,6 +28,8 @@
 #include "gfx/shader_cache.h"
 #include "gfx/texture.h"
 #include "gfx/xenos_shader_common.h"
+#include "present_ps.h"
+#include "present_vs.h"
 #include "host/shadow_draw.h"
 
 namespace plume {
@@ -845,6 +847,43 @@ struct Renderer::State {
     uint32_t swizzle = 0;
   };
   std::vector<Texture1DSlot> texture1d_slots;
+  // Present pass: the frontbuffer through the game's gamma ramp.
+  std::unique_ptr<plume::RenderShader> present_vs, present_ps;
+  std::unique_ptr<plume::RenderPipeline> present_pipeline;
+  std::vector<std::unique_ptr<plume::RenderFramebuffer>> swap_framebuffers;
+  std::array<uint32_t, 256> gamma_ramp{};
+  bool has_gamma_ramp = false;
+
+  void CreatePresentPipeline() {
+    present_vs = device->createShader(g_present_vs, sizeof(g_present_vs), "VSMain", plume::RenderShaderFormat::SPIRV);
+    present_ps = device->createShader(g_present_ps, sizeof(g_present_ps), "PSMain", plume::RenderShaderFormat::SPIRV);
+    plume::RenderGraphicsPipelineDesc desc;
+    desc.pipelineLayout = layout.get();
+    desc.vertexShader = present_vs.get();
+    desc.pixelShader = present_ps.get();
+    desc.primitiveTopology = plume::RenderPrimitiveTopology::TRIANGLE_LIST;
+    desc.cullMode = plume::RenderCullMode::NONE;
+    desc.renderTargetCount = 1;
+    desc.renderTargetFormat[0] = kColorFormat;
+    desc.renderTargetBlend[0] = plume::RenderBlendDesc::Copy();
+    present_pipeline = device->createGraphicsPipeline(desc);
+  }
+
+  plume::RenderFramebuffer* SwapFramebuffer(uint32_t image) {
+    if (swap_framebuffers.size() != swap_chain->getTextureCount()) {
+      swap_framebuffers.clear();
+      swap_framebuffers.resize(swap_chain->getTextureCount());
+    }
+    auto& framebuffer = swap_framebuffers[image];
+    if (!framebuffer) {
+      const plume::RenderTexture* attachment = swap_chain->getTexture(image);
+      plume::RenderFramebufferDesc desc;
+      desc.colorAttachments = &attachment;
+      desc.colorAttachmentsCount = 1;
+      framebuffer = device->createFramebuffer(desc);
+    }
+    return framebuffer.get();
+  }
   // Cube textures, keyed like 2D ones, in the cube heap.
   std::unordered_map<uint64_t, Texture> cube_textures;
   uint32_t next_texture_cube = 1;
@@ -1075,6 +1114,7 @@ struct Renderer::State {
                                                   plume::RenderShaderStageFlag::PIXEL);
     plume::RenderPipelineLayoutDesc desc(&push, 1, set_descs, 6, false, true);
     layout = device->createPipelineLayout(desc);
+    if (layout) CreatePresentPipeline();
     return layout != nullptr;
   }
 
@@ -2279,10 +2319,41 @@ void Renderer::Present(uint32_t frontbuffer, const uint8_t* base) {
   const bool acquired = !resize && !s.swap_chain->isEmpty() &&
                         s.swap_chain->acquireTexture(s.acquire.get(), &image);
   plume::RenderTexture* target = acquired ? s.swap_chain->getTexture(image) : nullptr;
+  uint32_t source_index = 0;
+  if (source && source_layout == plume::RenderTextureLayout::SHADER_READ) {
+    for (const auto& [key, texture] : s.textures) {
+      if (texture.texture.get() == source) source_index = texture.index;
+    }
+  }
+  uint64_t present_constants = 0;
+  const bool gamma = target && source_index != 0 && s.has_gamma_ramp && s.present_pipeline &&
+                     s.Upload(16 + 256 * 4, 256, present_constants);
   if (target && !source) {
     // Nothing the size of the window to show yet.
     s.commands->barriers(plume::RenderBarrierStage::COPY,
                          plume::RenderTextureBarrier(target, plume::RenderTextureLayout::PRESENT));
+  } else if (gamma) {
+    // Draw the frontbuffer through the gamma ramp, as the display controller
+    // shows it.
+    const uint32_t header[4] = {source_index, 0, 0, 0};
+    std::memcpy(s.upload_cpu + present_constants, header, sizeof(header));
+    std::memcpy(s.upload_cpu + present_constants + 16, s.gamma_ramp.data(), 256 * 4);
+    s.commands->barriers(plume::RenderBarrierStage::GRAPHICS,
+                         plume::RenderTextureBarrier(target, plume::RenderTextureLayout::COLOR_WRITE));
+    s.commands->setFramebuffer(s.SwapFramebuffer(image));
+    s.commands->setGraphicsPipelineLayout(s.layout.get());
+    for (uint32_t i = 0; i < 6; ++i) s.commands->setGraphicsDescriptorSet(s.sets[i].get(), i);
+    s.commands->setPipeline(s.present_pipeline.get());
+    const uint64_t push[3] = {s.upload_gpu + present_constants, 0, 0};
+    s.commands->setGraphicsPushConstants(0, push, 0, sizeof(push));
+    const plume::RenderViewport viewport(0.0f, 0.0f, float(s.width), float(s.height));
+    s.commands->setViewports(&viewport, 1);
+    const plume::RenderRect scissor(0, 0, int32_t(s.width), int32_t(s.height));
+    s.commands->setScissors(&scissor, 1);
+    s.commands->drawInstanced(3, 1, 0, 0);
+    s.commands->barriers(plume::RenderBarrierStage::NONE,
+                         plume::RenderTextureBarrier(target, plume::RenderTextureLayout::PRESENT));
+    s.current = nullptr;
   } else if (target) {
     plume::RenderTextureBarrier to_copy[] = {
         plume::RenderTextureBarrier(source, plume::RenderTextureLayout::COPY_SOURCE),
@@ -2334,9 +2405,18 @@ void Renderer::Present(uint32_t frontbuffer, const uint8_t* base) {
       while (s.release.size() < s.swap_chain->getTextureCount()) {
         s.release.push_back(s.device->createCommandSemaphore());
       }
+      s.swap_framebuffers.clear();
       s.CreateTarget();
     }
   }
+}
+
+void Renderer::SetGammaRamp(const uint32_t table[256]) {
+  State& s = *state_;
+  std::lock_guard<std::mutex> lock(s.mutex);
+  std::memcpy(s.gamma_ramp.data(), table, 256 * 4);
+  s.has_gamma_ramp = false;
+  for (const uint32_t entry : s.gamma_ramp) s.has_gamma_ramp |= entry != 0;
 }
 
 std::string Renderer::TakeStats() {

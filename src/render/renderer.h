@@ -48,6 +48,10 @@ class Renderer {
   // Called from the guest thread that runs Swap.
   void Present(uint32_t frontbuffer, const uint8_t* base);
 
+  // The display gamma ramp the game wrote (256 DC_LUT_30_COLOR words: blue
+  // in bits 0-9, green 10-19, red 20-29), applied when presenting.
+  void SetGammaRamp(const uint32_t table[256]);
+
   // Counts since the last call, for the 5 s log.
   std::string TakeStats();
 
