@@ -44,6 +44,10 @@ REXCVAR_DEFINE_BOOL(native_decl_swizzle, true, "Game",
                     "With renderer=native, apply the vertex declaration swizzle (D3DCOLOR is zyxw) "
                     "while gathering streams")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(native_msaa, 4, "Game",
+                     "With renderer=native, the most samples a multisampled guest surface gets on the "
+                     "host (1 turns MSAA off)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_STRING(native_skip_shaders, "", "Game",
                       "With renderer=native, skip the draws whose vertex or pixel shader key starts with "
                       "one of these comma-separated hex prefixes (to find which pass draws something)")
@@ -785,8 +789,15 @@ struct Renderer::State {
   // EDRAM through a 1x surface). So colour images are keyed by colour base,
   // format and pitch, depth images by depth base and pitch, and a framebuffer
   // pairs them. MSAA is not emulated: everything is one sample.
+  // Surfaces the guest multisamples are drawn into a multisampled twin of
+  // the image; `msaa_newer` says the twin holds pixels the single-sample
+  // texture does not have yet, so a single-sample surface on the same EDRAM
+  // (the title composites through one) resolves it first.
   struct Image {
     std::unique_ptr<plume::RenderTexture> texture;
+    std::unique_ptr<plume::RenderTexture> msaa;
+    uint32_t msaa_samples = 0;
+    bool msaa_newer = false;
     uint32_t guest_width = 0;
     uint32_t guest_height = 0;
     uint32_t width = 0;  // host pixels
@@ -795,6 +806,7 @@ struct Renderer::State {
   struct Target {
     Image* color = nullptr;
     Image* depth = nullptr;
+    uint32_t samples = 1;
     std::unique_ptr<plume::RenderFramebuffer> framebuffer;
   };
   std::unordered_map<uint64_t, Image> color_images;
@@ -802,6 +814,7 @@ struct Renderer::State {
   std::unordered_map<uint64_t, Target> targets;
   Target* current = nullptr;
   plume::RenderTexture* color = nullptr;  // current target's
+  uint32_t current_samples = 1;
   plume::RenderTexture* depth = nullptr;
   plume::RenderFramebuffer* framebuffer = nullptr;
   uint32_t target_width = 0;  // current target, host pixels
@@ -944,8 +957,45 @@ struct Renderer::State {
 
   // Makes sure `image` holds `rows` guest rows of `pitch` pixels. Returns
   // true when it was (re)created, which drops framebuffers built on it.
-  bool EnsureImage(Image& image, uint32_t pitch, uint32_t rows, bool is_depth) {
-    if (image.texture && image.guest_width == pitch && image.guest_height >= rows) return false;
+  bool EnsureImage(Image& image, uint32_t pitch, uint32_t rows, bool is_depth, uint32_t samples = 1) {
+    bool fresh = false;
+    if (!image.texture || image.guest_width != pitch || image.guest_height < rows) {
+      CreateImage(image, pitch, rows, is_depth);
+      fresh = true;
+    }
+    if (samples > 1 && (fresh || !image.msaa || image.msaa_samples != samples)) {
+      const plume::RenderMultisampling multisampling(static_cast<plume::RenderSampleCounts>(samples));
+      image.msaa = device->createTexture(
+          is_depth ? plume::RenderTextureDesc::DepthTarget(image.width, image.height, kDepthFormat, multisampling)
+                   : plume::RenderTextureDesc::ColorTarget(image.width, image.height, kColorFormat, multisampling));
+      image.msaa_samples = samples;
+      image.msaa_newer = false;
+      commands->barriers(plume::RenderBarrierStage::GRAPHICS,
+                         plume::RenderTextureBarrier(image.msaa.get(), is_depth
+                                                                           ? plume::RenderTextureLayout::DEPTH_WRITE
+                                                                           : plume::RenderTextureLayout::COLOR_WRITE));
+      fresh = true;
+    }
+    return fresh;
+  }
+
+  // Writes the multisampled twin's pixels into the single-sample texture.
+  void ResolveMsaa(Image& image) {
+    if (!image.msaa_newer || !image.msaa) return;
+    plume::RenderTextureBarrier to_resolve[] = {
+        plume::RenderTextureBarrier(image.msaa.get(), plume::RenderTextureLayout::RESOLVE_SOURCE),
+        plume::RenderTextureBarrier(image.texture.get(), plume::RenderTextureLayout::RESOLVE_DEST)};
+    commands->barriers(plume::RenderBarrierStage::COPY, to_resolve, 2);
+    commands->resolveTexture(image.texture.get(), image.msaa.get());
+    plume::RenderTextureBarrier back[] = {
+        plume::RenderTextureBarrier(image.msaa.get(), plume::RenderTextureLayout::COLOR_WRITE),
+        plume::RenderTextureBarrier(image.texture.get(), plume::RenderTextureLayout::COLOR_WRITE)};
+    commands->barriers(plume::RenderBarrierStage::GRAPHICS, back, 2);
+    image.msaa_newer = false;
+    ++msaa_resolves;
+  }
+
+  void CreateImage(Image& image, uint32_t pitch, uint32_t rows, bool is_depth) {
     image.guest_width = pitch;
     image.guest_height = std::max(rows, image.guest_height);
     if (pitch == 1280) image.guest_height = std::max<uint32_t>(image.guest_height, 720);
@@ -958,7 +1008,6 @@ struct Renderer::State {
                        plume::RenderTextureBarrier(image.texture.get(), is_depth
                                                                             ? plume::RenderTextureLayout::DEPTH_WRITE
                                                                             : plume::RenderTextureLayout::COLOR_WRITE));
-    return true;
   }
 
   // Binds the target the device's EDRAM registers describe, creating or
@@ -968,18 +1017,22 @@ struct Renderer::State {
     const uint32_t color_info = Reg(base, guest_device, 0x2001);
     const uint32_t depth_info = Reg(base, guest_device, 0x2002);
     const uint32_t pitch = std::max<uint32_t>(surface & 0x3FFF, 1);
+    // RB_SURFACE_INFO bits 16-17: 1, 2 or 4 samples.
+    const uint32_t guest_samples = 1u << std::min<uint32_t>((surface >> 16) & 3, 2);
+    const uint32_t samples =
+        std::clamp<uint32_t>(guest_samples, 1, uint32_t(std::max<int32_t>(REXCVAR_GET(native_msaa), 1)));
     rows = std::clamp<uint32_t>(rows, 1, 2048);
     const uint64_t color_key = (uint64_t(pitch) << 32) | (color_info & 0x000F0FFF);
     const uint64_t depth_key = (uint64_t(pitch) << 32) | (depth_info & 0x00010FFF);
     Image& color_image = color_images[color_key];
     Image& depth_image = depth_images[depth_key];
-    bool fresh_color = EnsureImage(color_image, pitch, rows, false);
-    bool fresh_depth = EnsureImage(depth_image, pitch, rows, true);
+    bool fresh_color = EnsureImage(color_image, pitch, rows, false, samples);
+    bool fresh_depth = EnsureImage(depth_image, pitch, rows, true, samples);
     // Both attachments must be the same size.
     if (depth_image.guest_height < color_image.guest_height) {
-      fresh_depth |= EnsureImage(depth_image, pitch, color_image.guest_height, true);
+      fresh_depth |= EnsureImage(depth_image, pitch, color_image.guest_height, true, samples);
     } else if (color_image.guest_height < depth_image.guest_height) {
-      fresh_color |= EnsureImage(color_image, pitch, depth_image.guest_height, false);
+      fresh_color |= EnsureImage(color_image, pitch, depth_image.guest_height, false, samples);
     }
     if (fresh_color || fresh_depth) {
       for (auto it = targets.begin(); it != targets.end();) {
@@ -991,23 +1044,31 @@ struct Renderer::State {
         }
       }
     }
-    Target& target = targets[color_key * 1000003u ^ depth_key];
+    Target& target = targets[(color_key * 1000003u ^ depth_key) * 8 + samples];
     if (!target.framebuffer) {
       target.color = &color_image;
       target.depth = &depth_image;
-      const plume::RenderTexture* attachment = color_image.texture.get();
+      target.samples = samples;
+      const plume::RenderTexture* attachment =
+          samples > 1 ? color_image.msaa.get() : color_image.texture.get();
       plume::RenderFramebufferDesc desc;
       desc.colorAttachments = &attachment;
       desc.colorAttachmentsCount = 1;
-      desc.depthAttachment = depth_image.texture.get();
+      desc.depthAttachment = samples > 1 ? depth_image.msaa.get() : depth_image.texture.get();
       target.framebuffer = device->createFramebuffer(desc);
       current = nullptr;
+    }
+    if (samples > 1) {
+      color_image.msaa_newer = true;
+    } else {
+      ResolveMsaa(color_image);
     }
     if (current != &target) {
       ++target_switches;
       current = &target;
-      color = color_image.texture.get();
-      depth = depth_image.texture.get();
+      current_samples = samples;
+      color = samples > 1 ? color_image.msaa.get() : color_image.texture.get();
+      depth = samples > 1 ? depth_image.msaa.get() : depth_image.texture.get();
       framebuffer = target.framebuffer.get();
       target_width = color_image.width;
       target_height = color_image.height;
@@ -1018,6 +1079,7 @@ struct Renderer::State {
   }
 
   uint64_t presents = 0;
+  uint64_t msaa_resolves = 0;
 
   std::mutex mutex;  // Draw and Present run on the guest thread, TakeStats on the sampler
   std::map<std::string, uint64_t> skipped;
@@ -1835,6 +1897,7 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
   const uint32_t state_key[8] = {(depth_control & 1) ? depth_control : depth_control & 0x77,
                                  blend_control, color_mask, uint32_t(topology), spec, uint32_t(ps_object != 0),
                                  sc_mode, stencil_ref};
+  XXH3_64bits_update(&key_state, &s.current_samples, sizeof(s.current_samples));
   XXH3_64bits_update(&key_state, state_key, sizeof(state_key));
   XXH3_64bits_update(&key_state, &vs_key, 8);
   XXH3_64bits_update(&key_state, &ps_key, 8);
@@ -1874,6 +1937,7 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
       desc.stencilBackFace = (depth_control & 0x80) ? StencilFace(depth_control, 20) : desc.stencilFrontFace;
     }
     desc.depthTargetFormat = kDepthFormat;
+    desc.multisampling = plume::RenderMultisampling(static_cast<plume::RenderSampleCounts>(s.current_samples));
     desc.renderTargetCount = 1;
     desc.renderTargetFormat[0] = kColorFormat;
     plume::RenderBlendDesc& blend = desc.renderTargetBlend[0];
@@ -2241,7 +2305,19 @@ void Renderer::Resolve(uint32_t device, uint32_t flags, uint32_t rect, uint32_t 
     }
     src.right = std::min<int32_t>(src.right, src.left + int32_t(width) - dst_x);
     src.bottom = std::min<int32_t>(src.bottom, src.top + int32_t(height) - dst_y);
-    if (src.right > src.left && src.bottom > src.top) {
+    if (src.right > src.left && src.bottom > src.top && s.current_samples > 1) {
+      plume::RenderTextureBarrier to_resolve[] = {
+          plume::RenderTextureBarrier(s.color, plume::RenderTextureLayout::RESOLVE_SOURCE),
+          plume::RenderTextureBarrier(entry.texture.get(), plume::RenderTextureLayout::RESOLVE_DEST)};
+      s.commands->barriers(plume::RenderBarrierStage::COPY, to_resolve, 2);
+      s.commands->resolveTextureRegion(entry.texture.get(), uint32_t(dst_x), uint32_t(dst_y), s.color, &src);
+      plume::RenderTextureBarrier back[] = {
+          plume::RenderTextureBarrier(s.color, plume::RenderTextureLayout::COLOR_WRITE),
+          plume::RenderTextureBarrier(entry.texture.get(), plume::RenderTextureLayout::SHADER_READ)};
+      s.commands->barriers(plume::RenderBarrierStage::GRAPHICS, back, 2);
+      s.sets[0]->setTexture(entry.index, entry.texture.get(), plume::RenderTextureLayout::SHADER_READ,
+                            entry.view.get());
+    } else if (src.right > src.left && src.bottom > src.top) {
       plume::RenderTextureBarrier to_copy[] = {
           plume::RenderTextureBarrier(s.color, plume::RenderTextureLayout::COPY_SOURCE),
           plume::RenderTextureBarrier(entry.texture.get(), plume::RenderTextureLayout::COPY_DEST)};
@@ -2301,7 +2377,8 @@ void Renderer::Present(uint32_t frontbuffer, const uint8_t* base) {
   s.UploadDefaults();
   // Swap shows a texture: the last resolve into it when there was one, else
   // whatever the target holds.
-  plume::RenderTexture* source = s.color;
+  if (s.current) s.ResolveMsaa(*s.current->color);
+  plume::RenderTexture* source = s.current ? s.current->color->texture.get() : s.color;
   plume::RenderTextureLayout source_layout = plume::RenderTextureLayout::COLOR_WRITE;
   if (source && (s.target_width != s.width || s.target_height != s.height)) source = nullptr;
   if (frontbuffer != 0 && !REXCVAR_GET(native_debug_target)) {
@@ -2430,7 +2507,9 @@ std::string Renderer::TakeStats() {
       s.ms_present, s.last_viewport);
   s.ms_pipeline = s.ms_texture = s.ms_stream = s.ms_submit = 0;
   s.ms_draw = s.ms_clear = s.ms_resolve = s.ms_present = 0;
-  out += fmt::format(" streams hit={} miss={} cached={}", s.stream_hits, s.stream_misses, s.stream_cache.size());
+  out += fmt::format(" streams hit={} miss={} cached={} msaa_resolves={}", s.stream_hits, s.stream_misses,
+                     s.stream_cache.size(), s.msaa_resolves);
+  s.msaa_resolves = 0;
   s.stream_hits = s.stream_misses = 0;
   out += " laps";
   for (const double ms : s.ms_lap) out += fmt::format(" {:.0f}", ms);
