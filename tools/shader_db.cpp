@@ -2998,6 +2998,39 @@ int main(int argc, char** argv) {
       return DrawFrame(argv[3]);
     }
 #endif
+#if defined(SHADER_DB_TRANSLATE)
+    if (argc == 3 && std::string(argv[1]) == "disasm") {
+      // Microcode disassembly of one container extract wrote (N.vs / N.ps),
+      // to check XenosRecomp's HLSL against the instructions.
+      std::ifstream in(argv[2], std::ios::binary);
+      const std::vector<uint8_t> data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+      auto be32 = [&](size_t at) {
+        return at + 4 <= data.size()
+                   ? (uint32_t(data[at]) << 24) | (uint32_t(data[at + 1]) << 16) | (uint32_t(data[at + 2]) << 8) |
+                         data[at + 3]
+                   : 0u;
+      };
+      const uint32_t flags = be32(0);
+      const uint32_t virtual_size = be32(4);
+      const uint32_t shader_offset = be32(24);
+      const uint32_t physical_offset = be32(shader_offset);
+      const uint32_t size = be32(shader_offset + 4);
+      const size_t ucode_at = size_t(virtual_size) + physical_offset;
+      if (size == 0 || ucode_at + size > data.size()) {
+        std::cerr << "not a shader container\n";
+        return 2;
+      }
+      std::vector<uint32_t> dwords(size / 4);
+      for (size_t i = 0; i < dwords.size(); ++i) dwords[i] = be32(ucode_at + 4 * i);
+      const auto type = (flags & 1) == 0 ? rex::graphics::xenos::ShaderType::kPixel
+                                         : rex::graphics::xenos::ShaderType::kVertex;
+      rex::graphics::SpirvShader shader(type, 0, dwords.data(), dwords.size(), std::endian::native);
+      rex::string::StringBuffer disassembly;
+      shader.AnalyzeUcode(disassembly);
+      std::cout << disassembly.to_string_view();
+      return 0;
+    }
+#endif
     int tiling_failed = 0;
     int guest_draw_failed = 0;
     int semantic_failed = 0;

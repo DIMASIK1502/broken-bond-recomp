@@ -152,6 +152,13 @@ uint2 getTexture2DDimensions(Texture2D<float4> texture)
     return dimensions;
 }
 
+// getGradients: the coarse screen-space derivatives of two values,
+// (ddx(v.x), ddy(v.x), ddx(v.y), ddy(v.y)).
+float4 gradients(float2 v)
+{
+    return float4(ddx_coarse(v.x), ddy_coarse(v.x), ddx_coarse(v.y), ddy_coarse(v.y));
+}
+
 // Xenos alpha test: keep the pixel when alpha compares true against the
 // reference with RB_COLORCONTROL's function (bit 0 less, bit 1 equal, bit 2
 // greater). A macro, since the DXIL constant buffer is declared after this
