@@ -2854,9 +2854,36 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
     s.outline_dump = s.presents + 61;
   }
   const uint32_t stencil_ref = (depth_control & 1) ? Reg(base, device, kRbStencilRefMask) & 0xFFFFFF : 0;
-  const uint32_t state_key[8] = {(depth_control & 1) ? depth_control : depth_control & 0x77,
-                                 blend_control, color_mask, uint32_t(topology), spec, uint32_t(ps_object != 0),
-                                 sc_mode, stencil_ref};
+  // Polygon offset: PA_SU_SC_MODE_CNTL bits 11 and 12 enable it for front
+  // and back faces, PA_SU_POLY_OFFSET_{FRONT,BACK}_{SCALE,OFFSET} hold the
+  // slope scale and the constant. Decals and shadow overlays drawn onto
+  // geometry use it; without it they fight the surface for depth and
+  // flicker as the camera moves.
+  int32_t depth_bias = 0;
+  float slope_bias = 0.0f;
+  if (triangles) {
+    const uint32_t sc_full = Reg(base, device, kPaSuScModeCntl);
+    if (sc_full & 0x1800) {
+      const uint32_t reg = (sc_full & 0x800) ? 0x2380 : 0x2382;
+      const float scale = RegFloat(base, device, reg);
+      const float offset = RegFloat(base, device, reg + 1);
+      // The offset counts in 24-bit depth steps; the slope scale in 1/16
+      // pixel units. A D32_FLOAT step at depth 0.5-1 is 2^-24, so the
+      // constant carries over as is. Values below 1 are taken as depth.
+      const float steps = std::fabs(offset) < 1.0f ? offset * 16777216.0f : offset;
+      depth_bias = int32_t(std::lround(std::clamp(steps, -1.0e6f, 1.0e6f)));
+      slope_bias = scale / 16.0f;
+      static int logged = 0;
+      if (logged < 4) {
+        ++logged;
+        REXLOG_INFO("native: polygon offset sc_mode={:08X} scale={} offset={} -> bias {} slope {}", sc_full, scale,
+                    offset, depth_bias, slope_bias);
+      }
+    }
+  }
+  const uint32_t state_key[10] = {(depth_control & 1) ? depth_control : depth_control & 0x77,
+                                  blend_control, color_mask, uint32_t(topology), spec, uint32_t(ps_object != 0),
+                                  sc_mode, stencil_ref, uint32_t(depth_bias), std::bit_cast<uint32_t>(slope_bias)};
   const uint32_t target_samples = State::SurfaceSamples(base, device);
   XXH3_64bits_update(&key_state, &target_samples, sizeof(target_samples));
   XXH3_64bits_update(&key_state, state_key, sizeof(state_key));
@@ -2886,6 +2913,8 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
     desc.depthEnabled = (depth_control & 0x2) != 0 && !REXCVAR_GET(native_debug_target);
     desc.depthWriteEnabled = (depth_control & 0x4) != 0;
     desc.depthFunction = CompareFunction((depth_control >> 4) & 7);
+    desc.depthBias = depth_bias;
+    desc.slopeScaledDepthBias = slope_bias;
     // Stencil: characters mark their pixels so the outline shell drawn after
     // them only shows outside the body. One reference and read mask serve
     // both faces on the host; Xenos keeps a set per face.
