@@ -10,6 +10,7 @@ $sdkPath = Join-Path $projectRoot $SdkDir
 # tag and do not apply to it yet: they are reported and skipped.
 $patches = @(
     @{ File = "guest-counters-and-file-open-hook.patch"; Optional = $false },
+    @{ File = "web-platform.patch"; Optional = $false },
     @{ File = "rexglue-sdk-v0.10.0.patch"; Optional = $true },
     @{ File = "xma-past-buffer.patch"; Optional = $true }
 )

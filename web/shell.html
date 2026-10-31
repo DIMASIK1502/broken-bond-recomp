@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Naruto: The Broken Bond</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; color: #ccc; font: 14px sans-serif; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  #import-panel { position: fixed; inset: 0; z-index: 2; background: #171717; padding: 10vh 10vw; overflow: auto; }
+  #import-panel[hidden] { display: none; }
+  #import-panel label { display: block; margin: 24px 0; }
+  #import-status { white-space: pre-wrap; }
+  #log { display: none; position: fixed; left: 0; right: 0; bottom: 0; max-height: 35vh; overflow: auto;
+         margin: 0; padding: 4px 8px; background: rgba(0, 0, 0, 0.6); white-space: pre-wrap; font: 12px monospace; }
+</style>
+</head>
+<body>
+<canvas id="canvas" tabindex="0"></canvas>
+<pre id="log"></pre>
+<section id="import-panel" hidden aria-labelledby="import-title">
+  <h1 id="import-title">Naruto: The Broken Bond</h1>
+  <p>Нужна своя извлечённая папка Xbox 360 с <code>default.xex</code>. Файлы остаются в этом браузере и никуда не отправляются.</p>
+  <p id="import-status" role="status" aria-live="polite">Загрузка...</p>
+  <label>Папка игры <input id="folder-files" type="file" webkitdirectory multiple></label>
+  <p>Папку можно перетащить сюда. Клавиатура и обычный геймпад. Двойной щелчок по картинке — полный экран. Звук начинается после щелчка или клавиши.</p>
+  <button type="button" onclick="location.reload()">Обновить</button>
+</section>
+<script>
+  const runtimeArguments = [];
+  const query = new URLSearchParams(location.search);
+  for (const [name, value] of query) {
+    runtimeArguments.push(value === '' ? `--${name}` : `--${name}=${value}`);
+  }
+  if (!query.has('game_data_root')) {
+    runtimeArguments.push('--game_data_root=/opfs/broken_bond/game');
+  }
+  if (!query.has('gpu_plugin')) runtimeArguments.push('--gpu_plugin=host');
+  if (!query.has('renderer')) runtimeArguments.push('--renderer=native');
+  const logElement = document.getElementById('log');
+  if (location.hash === '#log') logElement.style.display = 'block';
+  const logLines = [];
+  function showLog(text) {
+    console.log(text);
+    logLines.push(text);
+    if (logLines.length > 200) logLines.shift();
+    logElement.textContent = logLines.join('\n');
+    logElement.scrollTop = logElement.scrollHeight;
+  }
+  const canvasElement = document.getElementById('canvas');
+  canvasElement.width = Math.round(canvasElement.clientWidth * devicePixelRatio);
+  canvasElement.height = Math.round(canvasElement.clientHeight * devicePixelRatio);
+  window.brokenBond = { started: performance.now(), exitCode: null };
+  window.brokenBond.filesStatus = (text, error = false) => {
+    if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+    document.getElementById('import-panel').hidden = false;
+    document.getElementById('import-status').textContent = text;
+    if (error) window.brokenBond.storageError = text;
+    showLog(`web storage: ${text}`);
+  };
+  var Module = {
+    arguments: runtimeArguments,
+    noInitialRun: true,
+    canvas: canvasElement,
+    print: showLog,
+    printErr: showLog,
+    onRuntimeInitialized: async () => {
+      if (window.brokenBond.startupError) return;
+      try {
+        const [{WebInput}, {startWithFiles}] = await Promise.all([
+          import('./input.js'), import('./import.js')
+        ]);
+        await startWithFiles(() => {
+          const input = new WebInput(canvasElement, Module.wasmMemory.buffer,
+                                     Number(Module._broken_bond_web_input_block()));
+          input.start();
+          window.brokenBond.input = input;
+          import('./audio.js').then(({WebAudio}) => {
+            const audio = window.brokenBond.audio = new WebAudio(Module);
+            return audio.start();
+          }).catch(error => {
+            window.brokenBond.audioError = String(error);
+            showLog(`web audio failed: ${error}`);
+          });
+          canvasElement.focus();
+          document.getElementById('import-panel').hidden = true;
+          if (Module._broken_bond_web_start_picture) {
+            const picture = Module._broken_bond_web_start_picture();
+            showLog(`web picture: ${picture === 0 ? 'presented' : 'failed ' + picture}`);
+          }
+          Module.callMain(runtimeArguments);
+        });
+      } catch (error) {
+        window.brokenBond.startupError = String(error);
+        window.brokenBond.pictureStack = error && error.stack ? String(error.stack) : '';
+        showLog(window.brokenBond.pictureStack || String(error));
+        window.brokenBond.filesStatus(String(error), true);
+      }
+    },
+    onAbort: (reason) => window.brokenBond.filesStatus(`Runtime stopped: ${reason}. Reload to retry.`, true),
+    onExit: (code) => {
+      window.brokenBond.input?.stop();
+      window.brokenBond.audio?.stop();
+      window.brokenBond.exitCode = code;
+      showLog(`broken_bond exited with code ${code}`);
+      if (!window.brokenBond.storageError) {
+        window.brokenBond.filesStatus(code === 0
+          ? 'Game closed. Reload to play again; saves stay in this browser.'
+          : `Game stopped with code ${code}. Reload to retry.`, code !== 0);
+      }
+    },
+  };
+  let browserError = '';
+  if (!crossOriginIsolated) {
+    browserError = 'Нужна изоляция страницы. Откройте сборку через tools/web/serve.py на localhost.';
+  } else if (typeof SharedArrayBuffer === 'undefined') {
+    browserError = 'Нет SharedArrayBuffer. Нужен текущий Chrome или Edge.';
+  } else if (!navigator.gpu) {
+    browserError = 'Нет WebGPU. Включите его в текущем Chrome или Edge.';
+  }
+  if (browserError) {
+    window.brokenBond.startupError = browserError;
+    window.brokenBond.filesStatus(browserError, true);
+  }
+</script>
+{{{ SCRIPT }}}
+</body>
+</html>

@@ -8,6 +8,19 @@ project(broken_bond LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Browser build. Native presets leave this off and never read cmake/web.
+# docs/superpowers/plans/2026-10-31-browser-port.md
+option(BROKEN_BOND_WEB "Build the browser host (Emscripten, WebAssembly)" OFF)
+if(BROKEN_BOND_WEB)
+    if(NOT EMSCRIPTEN)
+        message(FATAL_ERROR
+            "BROKEN_BOND_WEB needs the Emscripten toolchain. "
+            "Run emsdk_env, then: cmake --preset web-wasm64-release")
+    endif()
+    include(cmake/web/broken_bond_web.cmake)
+    return()
+endif()
+
 include(generated/rexglue.cmake)
 
 # Sources
@@ -77,6 +90,9 @@ endif()
 # Unit test for the frame interpolation helpers (no GPU, no game data).
 add_executable(interpolation_test tools/interpolation_test.cpp src/render/interpolation.cpp)
 target_include_directories(interpolation_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+
+add_executable(web_guest_fold_test tools/web_guest_fold_test.cpp)
+target_include_directories(web_guest_fold_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 
 # Reads game/xeshader.sdb. Not part of the game link and writes no cache.
 # The installed GPU plugin is D3D12-only, so SPIR-V is compiled from the SDK

@@ -42,6 +42,9 @@
 
 namespace plume {
 std::unique_ptr<RenderInterface> CreateVulkanInterface();
+#if defined(__EMSCRIPTEN__)
+std::unique_ptr<RenderInterface> CreateWebGPUInterface();
+#endif
 }
 
 REXCVAR_DEFINE_INT32(native_dump_frame, 0, "Game",
@@ -2163,11 +2166,30 @@ const std::string& Renderer::device_name() const { return state_->device_name; }
 
 bool Renderer::Open(void* native_window, std::string& reason) {
   State& s = *state_;
+#if defined(__EMSCRIPTEN__)
+  // plume-web. The PC build takes the Vulkan call below.
+  s.render_interface = plume::CreateWebGPUInterface();
+#else
   s.render_interface = plume::CreateVulkanInterface();
+#endif
   if (!s.render_interface) {
+#if defined(__EMSCRIPTEN__)
+    reason = "no WebGPU interface";
+#else
     reason = "no Vulkan interface";
+#endif
     return false;
   }
+#if defined(__EMSCRIPTEN__)
+  if (s.render_interface->getCapabilities().shaderFormat != plume::RenderShaderFormat::WGSL) {
+    reason = "WebGPU backend did not report WGSL shaders";
+    return false;
+  }
+  // This device has no buffer device addresses, and the cache is still SPIR-V.
+  // Drawing starts once the WGSL cache is bound. The PC path does not reach here.
+  reason = "WebGPU interface is linked; drawing waits on the WGSL shader cache";
+  return false;
+#endif
   s.device = s.render_interface->createDevice();
   if (!s.device) {
     reason = "no Vulkan device";
