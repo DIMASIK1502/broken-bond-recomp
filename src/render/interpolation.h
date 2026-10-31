@@ -19,6 +19,14 @@ uint64_t DrawKey(uint64_t vs_key, uint64_t ps_key, const uint32_t* stream_addres
 // draw with a key in `cur` pairs with the k-th draw with that key in `prev`.
 std::vector<int32_t> MatchDraws(const std::vector<uint64_t>& prev, const std::vector<uint64_t>& cur);
 
+// Pairs by `strict` keys first, as MatchDraws; draws left over on both
+// sides then pair by `loose` keys, in order. Same-looking draws that differ
+// in what the strict key holds (textures, index ranges) keep their own pair.
+std::vector<int32_t> MatchDrawsTwoStage(const std::vector<uint64_t>& prev_strict,
+                                        const std::vector<uint64_t>& prev_loose,
+                                        const std::vector<uint64_t>& cur_strict,
+                                        const std::vector<uint64_t>& cur_loose);
+
 // Share of draws that have a pair; 0 for no draws.
 float MatchedShare(const std::vector<int32_t>& match);
 

@@ -91,6 +91,29 @@ std::vector<int32_t> MatchDraws(const std::vector<uint64_t>& prev, const std::ve
   return match;
 }
 
+std::vector<int32_t> MatchDrawsTwoStage(const std::vector<uint64_t>& prev_strict,
+                                        const std::vector<uint64_t>& prev_loose,
+                                        const std::vector<uint64_t>& cur_strict,
+                                        const std::vector<uint64_t>& cur_loose) {
+  std::vector<int32_t> match = MatchDraws(prev_strict, cur_strict);
+  std::vector<bool> taken(prev_loose.size(), false);
+  for (int32_t m : match) {
+    if (m >= 0) taken[size_t(m)] = true;
+  }
+  std::unordered_map<uint64_t, std::vector<int32_t>> waiting;
+  for (size_t i = prev_loose.size(); i-- > 0;) {
+    if (!taken[i]) waiting[prev_loose[i]].push_back(int32_t(i));
+  }
+  for (size_t i = 0; i < cur_loose.size(); ++i) {
+    if (match[i] >= 0) continue;
+    auto found = waiting.find(cur_loose[i]);
+    if (found == waiting.end() || found->second.empty()) continue;
+    match[i] = found->second.back();
+    found->second.pop_back();
+  }
+  return match;
+}
+
 float MatchedShare(const std::vector<int32_t>& match) {
   if (match.empty()) return 0.0f;
   const size_t paired = size_t(std::count_if(match.begin(), match.end(), [](int32_t m) { return m >= 0; }));

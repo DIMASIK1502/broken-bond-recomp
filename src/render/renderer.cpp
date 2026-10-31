@@ -60,6 +60,10 @@ REXCVAR_DEFINE_BOOL(native_interpolate, false, "Game",
                     "With renderer=native, draw an in-between frame when the game steps at 30 Hz "
                     "(shows 60 FPS one step late)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_STRING(native_interpolate_blend, "vs,ps,bones", "Game",
+                      "With native_interpolate, what the in-between frame blends: comma-separated vs (vertex "
+                      "constants), ps (pixel constants), bones. Left-out parts use the real frame's")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_INT32(native_msaa, 4, "Game",
                      "With renderer=native, the most samples a multisampled guest surface gets on the "
                      "host (1 turns MSAA off)")
@@ -1275,6 +1279,7 @@ struct Renderer::State {
     texture1d_frame.clear();
     journal.clear();
     frame_vs.clear();
+    frame_ps.clear();
     frame_shared.clear();
     draw_ops.clear();
     clear_ops.clear();
@@ -1753,6 +1758,11 @@ struct Renderer::State {
   // The previous presented frame, for blending: each draw's key and its
   // vertex shader constants (kVsFloats floats per draw).
   static constexpr size_t kVsFloats = gfx::kVertexShaderConstantsBytes / 4;
+  static constexpr size_t kPsFloats = gfx::kPixelShaderConstantsBytes / 4;
+  // native_interpolate_blend, read once.
+  bool blend_vs = true, blend_ps = true, blend_bones = true;
+  bool blend_read = false;
+  uint64_t guarded = 0;  // pairs drawn unblended because their transform jumped
   struct DrawOp;  // the frame journal's, below
   struct PrevBones {
     uint32_t fetch_slot;  // which of the draw's fetch slots
@@ -1762,7 +1772,8 @@ struct Renderer::State {
     uint32_t bytes;
   };
   struct PrevFrame {
-    std::vector<uint64_t> keys, keys_no_textures, keys_shaders;
+    std::vector<uint64_t> keys, keys_strict, keys_no_textures, keys_shaders;
+    std::vector<float> ps_constants;
     std::vector<float> vs_constants;
     // Half-float 1D textures (skinning bones) per draw: bones[bones_first[i]
     // .. bones_first[i + 1]) belong to draw i.
@@ -1793,16 +1804,21 @@ struct Renderer::State {
   std::string unpaired_sample;
 
   const float* VsCpu(const DrawOp& op) const { return frame_vs.data() + size_t(op.cpu) * kVsFloats; }
+  const float* PsCpu(const DrawOp& op) const { return frame_ps.data() + size_t(op.cpu) * kPsFloats; }
 
   // Keeps what the next frame blends with. Called after the frame's fence,
   // while its upload ring still holds its data.
   void SnapshotFrame() {
     prev.keys.resize(draw_ops.size());
+    prev.keys_strict.resize(draw_ops.size());
+    prev.ps_constants.resize(draw_ops.size() * kPsFloats);
     prev.keys_no_textures.resize(draw_ops.size());
     prev.keys_shaders.resize(draw_ops.size());
     prev.vs_constants.resize(draw_ops.size() * kVsFloats);
     for (size_t i = 0; i < draw_ops.size(); ++i) {
       prev.keys[i] = draw_ops[i].key;
+      prev.keys_strict[i] = draw_ops[i].key_strict;
+      std::memcpy(prev.ps_constants.data() + i * kPsFloats, PsCpu(draw_ops[i]), kPsFloats * 4);
       prev.keys_no_textures[i] = draw_ops[i].key_no_textures;
       prev.keys_shaders[i] = draw_ops[i].key_shaders;
       std::memcpy(prev.vs_constants.data() + i * kVsFloats, VsCpu(draw_ops[i]), kVsFloats * 4);
@@ -1839,9 +1855,19 @@ struct Renderer::State {
       Skip(prev.valid ? "interp: mode change" : "interp: no previous frame");
       return false;
     }
-    std::vector<uint64_t> keys(draw_ops.size());
-    for (size_t i = 0; i < draw_ops.size(); ++i) keys[i] = draw_ops[i].key;
-    const std::vector<int32_t> match = interp::MatchDraws(prev.keys, keys);
+    if (!blend_read) {
+      const std::string parts = REXCVAR_GET(native_interpolate_blend);
+      blend_vs = parts.find("vs") != std::string::npos;
+      blend_ps = parts.find("ps") != std::string::npos;
+      blend_bones = parts.find("bones") != std::string::npos;
+      blend_read = true;
+    }
+    std::vector<uint64_t> keys(draw_ops.size()), keys_strict(draw_ops.size());
+    for (size_t i = 0; i < draw_ops.size(); ++i) {
+      keys[i] = draw_ops[i].key;
+      keys_strict[i] = draw_ops[i].key_strict;
+    }
+    const std::vector<int32_t> match = interp::MatchDrawsTwoStage(prev.keys_strict, prev.keys, keys_strict, keys);
     last_match = interp::MatchedShare(match);
     {
       std::vector<uint64_t> a(draw_ops.size()), b(draw_ops.size());
@@ -1885,8 +1911,8 @@ struct Renderer::State {
     }
     const size_t paired = size_t(std::count_if(match.begin(), match.end(), [](int32_t m) { return m >= 0; }));
     blended_slots.clear();
-    uint64_t blended = 0;
-    if (!Upload(paired * kVsFloats * 4, 256, blended)) {
+    uint64_t blended = 0, blended_ps = 0;
+    if (!Upload(paired * kVsFloats * 4, 256, blended) || !Upload(paired * kPsFloats * 4, 256, blended_ps)) {
       Skip("interp: upload ring full");
       return false;
     }
@@ -1918,19 +1944,34 @@ struct Renderer::State {
       switch (op.kind) {
         case FrameOp::kDraw: {
           const int32_t pair = match[op.index];
-          if (pair < 0 || interp::Jumped(prev.vs_constants.data() + size_t(pair) * kVsFloats,
-                                         VsCpu(draw_ops[op.index]), 16, 0.5f)) {
+          if (pair < 0) {
+            ExecuteDraw(draw_ops[op.index]);
+            break;
+          }
+          if (interp::Jumped(prev.vs_constants.data() + size_t(pair) * kVsFloats, VsCpu(draw_ops[op.index]), 16,
+                             0.5f)) {
+            ++guarded;
             ExecuteDraw(draw_ops[op.index]);
             break;
           }
           DrawOp mid = draw_ops[op.index];
-          float lerped[kVsFloats];
-          interp::LerpFloats(prev.vs_constants.data() + size_t(pair) * kVsFloats, VsCpu(mid), lerped, kVsFloats,
-                             0.5f);
-          std::memcpy(upload_cpu + blended, lerped, sizeof(lerped));
-          mid.vs_constants = blended;
-          blended += kVsFloats * 4;
-          BlendBones(mid, size_t(pair));
+          if (blend_vs) {
+            float lerped[kVsFloats];
+            interp::LerpFloats(prev.vs_constants.data() + size_t(pair) * kVsFloats, VsCpu(mid), lerped, kVsFloats,
+                               0.5f);
+            std::memcpy(upload_cpu + blended, lerped, sizeof(lerped));
+            mid.vs_constants = blended;
+            blended += kVsFloats * 4;
+          }
+          if (blend_ps) {
+            float lerped[kPsFloats];
+            interp::LerpFloats(prev.ps_constants.data() + size_t(pair) * kPsFloats, PsCpu(mid), lerped, kPsFloats,
+                               0.5f);
+            std::memcpy(upload_cpu + blended_ps, lerped, sizeof(lerped));
+            mid.ps_constants = blended_ps;
+            blended_ps += kPsFloats * 4;
+          }
+          if (blend_bones) BlendBones(mid, size_t(pair));
           ExecuteDraw(mid);
           break;
         }
@@ -2125,7 +2166,8 @@ struct Renderer::State {
     uint32_t index_count = 0;
     uint32_t vertex_count = 0;
     bool uploaded = false;  // textures were uploaded first, so rebind
-    uint64_t key = 0;       // interp::DrawKey
+    uint64_t key = 0;         // interp::DrawKey of shaders and count (second pairing stage)
+    uint64_t key_strict = 0;  // with index range and textures (first stage)
     // Looser keys, only to report how many draws they would pair.
     uint64_t key_no_textures = 0;  // shaders, index range, count
     uint64_t key_shaders = 0;      // shaders and count
@@ -2162,6 +2204,7 @@ struct Renderer::State {
   // CPU copies of each draw's vertex constants and shared constants. The
   // upload ring is write-combined on discrete GPUs and slow to read back.
   std::vector<float> frame_vs;
+  std::vector<float> frame_ps;
   std::vector<uint8_t> frame_shared;
   std::vector<DrawOp> draw_ops;
   std::vector<ClearOp> clear_ops;
@@ -2728,8 +2771,15 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
     CopySwappedDwords(s.upload_cpu + vs_constants, At(base, device + kDeviceVsConstants),
                       gfx::kVertexShaderConstantsBytes);
   }
-  CopySwappedDwords(s.upload_cpu + ps_constants, At(base, device + kDevicePsConstants),
-                    gfx::kPixelShaderConstantsBytes);
+  if (REXCVAR_GET(native_interpolate)) {
+    s.frame_ps.resize((size_t(cpu_index) + 1) * State::kPsFloats);
+    auto* ps_cpu = reinterpret_cast<uint8_t*>(s.frame_ps.data() + size_t(cpu_index) * State::kPsFloats);
+    CopySwappedDwords(ps_cpu, At(base, device + kDevicePsConstants), gfx::kPixelShaderConstantsBytes);
+    std::memcpy(s.upload_cpu + ps_constants, ps_cpu, gfx::kPixelShaderConstantsBytes);
+  } else {
+    CopySwappedDwords(s.upload_cpu + ps_constants, At(base, device + kDevicePsConstants),
+                      gfx::kPixelShaderConstantsBytes);
+  }
 
   // Shared constants are built in local memory and copied once.
   alignas(16) uint8_t shared_cpu[gfx::kSharedConstantsBytes] = {};
@@ -2858,6 +2908,8 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
     // indices and textures). Same-looking draws pair in order; a pair whose
     // transform jumps is drawn unblended.
     op.key = interp::DrawKey(vs_key, ps_key, nullptr, 0, 0, 0, draw.count, nullptr, 0);
+    op.key_strict = interp::DrawKey(vs_key, ps_key, nullptr, 0, draw.indexed ? index_address : 0, draw.start,
+                                    draw.count, texture_indices, DESCRIPTOR_SLOT_COUNT);
     op.key_no_textures = interp::DrawKey(vs_key, ps_key, nullptr, 0, draw.indexed ? index_address : 0,
                                          draw.start, draw.count, nullptr, 0);
     op.key_shaders = interp::DrawKey(vs_key, ps_key, nullptr, 0, 0, 0, draw.count, nullptr, 0);
@@ -3366,9 +3418,10 @@ std::string Renderer::TakeStats() {
   s.depth_resolves = 0;
   if (REXCVAR_GET(native_interpolate)) {
     const double frames = std::max<uint32_t>(s.match_frames, 1);
-    out += fmt::format(" journal={} interp={} match={:.2f} match_notex={:.2f} match_shaders={:.2f} bones={}",
+    out += fmt::format(" journal={} interp={} match={:.2f} match_notex={:.2f} match_shaders={:.2f} bones={} guarded={}",
                        s.journal_last, s.interp_frames, s.match_sum / frames, s.match_no_textures_sum / frames,
-                       s.match_shaders_sum / frames, s.bones_blended);
+                       s.match_shaders_sum / frames, s.bones_blended, s.guarded);
+    s.guarded = 0;
     if (!s.unpaired_sample.empty()) out += " | unpaired " + s.unpaired_sample;
     if (!s.front_resolve.empty()) out += " | front resolve " + s.front_resolve;
     s.front_resolve.clear();

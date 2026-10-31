@@ -38,6 +38,15 @@ int main() {
   CHECK(interp::MatchedShare({0, 2, -1, 1}) == 0.75f);
   CHECK(interp::MatchedShare({}) == 0.0f);
 
+  // Strict keys pair first; the rest pair by the loose key, in order.
+  // prev: strict {S1, S2, S3}, loose {L, L, M}; cur: strict {S2, S9, S8}, loose {L, L, M}.
+  // cur[0] takes prev[1] by its strict key, cur[1] the remaining L (prev[0]),
+  // cur[2] the M (prev[2]).
+  CHECK((interp::MatchDrawsTwoStage({11, 12, 13}, {1, 1, 2}, {12, 19, 18}, {1, 1, 2}) ==
+         std::vector<int32_t>{1, 0, 2}));
+  // A prev draw taken by its strict key is not paired again by the loose one.
+  CHECK((interp::MatchDrawsTwoStage({11, 12}, {1, 1}, {19, 12, 18}, {1, 1, 1}) == std::vector<int32_t>{0, 1, -1}));
+
   float out[2];
   const float lp[2] = {0, 10}, lc[2] = {2, 20};
   interp::LerpFloats(lp, lc, out, 2, 0.5f);
