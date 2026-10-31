@@ -1776,7 +1776,7 @@ struct Renderer::State {
   // native_interpolate_blend, read once.
   bool blend_vs = true, blend_ps = true, blend_bones = true;
   bool blend_read = false;
-  uint64_t guarded = 0;  // pairs drawn unblended because their transform jumped
+  uint64_t guarded = 0;  // paired draws whose transform jumped, for the cut rule
   struct DrawOp;  // the frame journal's, below
   struct PrevBones {
     uint32_t fetch_slot;  // which of the draw's fetch slots
@@ -1911,15 +1911,17 @@ struct Renderer::State {
       Skip("interp: few matches");
       return false;
     }
-    // A cut: most paired draws' first four vertex constants (their
-    // transform) moved far in one step.
+    // A cut: many paired draws' first four vertex constants (their
+    // transform) moved far in one step. Walking in the village moves about
+    // 10 % of pairs that far; a camera cut moves most of them.
     size_t pairs = 0, jumps = 0;
     for (size_t i = 0; i < match.size(); ++i) {
       if (match[i] < 0) continue;
       ++pairs;
       jumps += interp::Jumped(prev.vs_constants.data() + size_t(match[i]) * kVsFloats, VsCpu(draw_ops[i]), 16, 0.5f);
     }
-    if (jumps * 2 > pairs) {
+    guarded += jumps;
+    if (jumps * 4 > pairs) {
       Skip("interp: camera jump");
       return false;
     }
@@ -1959,12 +1961,6 @@ struct Renderer::State {
         case FrameOp::kDraw: {
           const int32_t pair = match[op.index];
           if (pair < 0) {
-            ExecuteDraw(draw_ops[op.index]);
-            break;
-          }
-          if (interp::Jumped(prev.vs_constants.data() + size_t(pair) * kVsFloats, VsCpu(draw_ops[op.index]), 16,
-                             0.5f)) {
-            ++guarded;
             ExecuteDraw(draw_ops[op.index]);
             break;
           }
@@ -2123,7 +2119,7 @@ struct Renderer::State {
     const bool show_replay = debug && (presents / 150) % 2 == 0;
     if (replayed) {
       DrawPresentPass(mid_image, debug && !show_replay ? held.index : front.index, constants_mid);
-      if (replayed && debug_dumped < REXCVAR_GET(native_interpolate_dump) && presents % 900 == 899 &&
+      if (replayed && debug_dumped < REXCVAR_GET(native_interpolate_dump) && presents % 450 == 449 &&
           front.format == kColorFormat) {
         // Both pictures of this frame: held (real) and front (replayed).
         const uint32_t row = front.width * 4;
@@ -3487,7 +3483,7 @@ std::string Renderer::TakeStats() {
   s.depth_resolves = 0;
   if (REXCVAR_GET(native_interpolate)) {
     const double frames = std::max<uint32_t>(s.match_frames, 1);
-    out += fmt::format(" journal={} interp={} match={:.2f} match_notex={:.2f} match_shaders={:.2f} bones={} guarded={}",
+    out += fmt::format(" journal={} interp={} match={:.2f} match_notex={:.2f} match_shaders={:.2f} bones={} jumped={}",
                        s.journal_last, s.interp_frames, s.match_sum / frames, s.match_no_textures_sum / frames,
                        s.match_shaders_sum / frames, s.bones_blended, s.guarded);
     s.guarded = 0;
