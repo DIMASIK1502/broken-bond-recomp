@@ -76,6 +76,10 @@ REXCVAR_DEFINE_INT32(native_interpolate_dump, 0, "Game",
                      "With native_interpolate, save this many pairs of a real frame and its in-between frame, one "
                      "pair every 900 frames, as logs/interp-N-{real,mid}.rgba (half size, BGRA)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(native_frames_in_flight, 1, "Game",
+                     "With renderer=native, frames the GPU may still be drawing while the next is recorded: 1 waits "
+                     "for each frame, 2 lets the CPU record the next one meanwhile")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_INT32(native_msaa, 4, "Game",
                      "With renderer=native, the most samples a multisampled guest surface gets on the "
                      "host (1 turns MSAA off)")
@@ -1246,24 +1250,57 @@ struct Renderer::State {
   // GPU objects replaced while a frame is being recorded. The command list
   // may still reference them (a framebuffer, a barrier, a copy), and
   // destroying them invalidates it, which NVIDIA's driver does not survive.
-  // They are destroyed once the frame's fence has passed.
-  std::vector<std::unique_ptr<plume::RenderTexture>> retired_textures;
-  std::vector<std::unique_ptr<plume::RenderTextureView>> retired_views;
-  std::vector<std::unique_ptr<plume::RenderFramebuffer>> retired_framebuffers;
+  // They are destroyed once the frame's fence has passed; with two frames
+  // in flight that also covers the frame before it, which may use them too.
+  struct Retired {
+    std::vector<std::unique_ptr<plume::RenderTexture>> textures;
+    std::vector<std::unique_ptr<plume::RenderTextureView>> views;
+    std::vector<std::unique_ptr<plume::RenderFramebuffer>> framebuffers;
+  };
+  std::array<Retired, 2> retired;
 
   void Retire(std::unique_ptr<plume::RenderTexture>& texture) {
-    if (texture) retired_textures.push_back(std::move(texture));
+    if (texture) retired[frame_slot].textures.push_back(std::move(texture));
   }
   void Retire(std::unique_ptr<plume::RenderTextureView>& view) {
-    if (view) retired_views.push_back(std::move(view));
+    if (view) retired[frame_slot].views.push_back(std::move(view));
   }
   void Retire(std::unique_ptr<plume::RenderFramebuffer>& framebuffer) {
-    if (framebuffer) retired_framebuffers.push_back(std::move(framebuffer));
+    if (framebuffer) retired[frame_slot].framebuffers.push_back(std::move(framebuffer));
   }
-  void DestroyRetired() {
-    retired_framebuffers.clear();
-    retired_views.clear();
-    retired_textures.clear();
+  void DestroyRetired(uint32_t slot) {
+    retired[slot].framebuffers.clear();
+    retired[slot].views.clear();
+    retired[slot].textures.clear();
+  }
+
+  // Frames in flight. Each slot has its own command list, fence, acquire
+  // semaphore, half of the upload ring and half of the 1D texture pool.
+  uint32_t frame_slot = 0;
+  uint32_t frames_in_flight = 1;
+  std::unique_ptr<plume::RenderCommandList> commands_other;
+  std::unique_ptr<plume::RenderCommandFence> fence_other;
+  std::unique_ptr<plume::RenderCommandSemaphore> acquire_other;
+  std::array<bool, 2> fence_pending{};
+  uint64_t upload_begin = 0, upload_end = kUploadBytes;
+  uint32_t texture1d_begin = 0, texture1d_end = kTexture1DCount;
+
+  // Descriptor writes, skipped when the slot already holds the same view:
+  // a frame still on the GPU may be reading it.
+  struct Bound {
+    const void* texture = nullptr;
+    const void* view = nullptr;
+    plume::RenderTextureLayout layout = plume::RenderTextureLayout::UNKNOWN;
+  };
+  std::array<std::vector<Bound>, 6> bound;
+  void SetTexture(uint32_t set, uint32_t index, plume::RenderTexture* texture, plume::RenderTextureLayout layout,
+                  plume::RenderTextureView* view) {
+    std::vector<Bound>& slots = bound[set];
+    if (slots.size() <= index) slots.resize(index + 1);
+    Bound& b = slots[index];
+    if (b.texture == texture && b.view == view && b.layout == layout) return;
+    b = {texture, view, layout};
+    sets[set]->setTexture(index, texture, layout, view);
   }
 
   std::mutex mutex;  // Draw and Present run on the guest thread, TakeStats on the sampler
@@ -1312,7 +1349,7 @@ struct Renderer::State {
 
   bool Upload(size_t bytes, size_t align, uint64_t& offset) {
     const uint64_t start = (upload_used + align - 1) & ~uint64_t(align - 1);
-    if (start + bytes > kUploadBytes) return false;
+    if (start + bytes > upload_end) return false;
     offset = start;
     upload_used = start + bytes;
     return true;
@@ -1341,8 +1378,14 @@ struct Renderer::State {
   void BeginFrame() {
     if (recording) return;
     recording = true;
-    upload_used = 0;
-    next_texture1d = 0;
+    const uint64_t ring_half = kUploadBytes / frames_in_flight;
+    upload_begin = ring_half * frame_slot;
+    upload_end = upload_begin + ring_half;
+    upload_used = upload_begin;
+    const uint32_t pool_half = kTexture1DCount / frames_in_flight;
+    texture1d_begin = pool_half * frame_slot;
+    texture1d_end = texture1d_begin + pool_half;
+    next_texture1d = texture1d_begin;
     texture1d_frame.clear();
     journal.clear();
     frame_vs.clear();
@@ -1502,7 +1545,7 @@ struct Renderer::State {
     const uint8_t* guest = At(base, PhysicalView(fetch.base_address << 12));
     const uint64_t frame_key = ImageKey(words) * 0x9E3779B97F4A7C15ull ^ XXH3_64bits(guest, bytes);
     if (auto found = texture1d_frame.find(frame_key); found != texture1d_frame.end()) return found->second;
-    if (next_texture1d + 1 >= kTexture1DCount) {
+    if (next_texture1d + 1 >= texture1d_end) {
       Skip("1d texture pool full");
       return 0;
     }
@@ -1581,7 +1624,7 @@ struct Renderer::State {
         plume::RenderTextureCopyLocation::PlacedFootprint(upload.get(), host, width, 1, 1, row_texels, ring));
     commands->barriers(plume::RenderBarrierStage::GRAPHICS,
                        plume::RenderTextureBarrier(slot.texture.get(), plume::RenderTextureLayout::SHADER_READ));
-    sets[5]->setTexture(index, slot.texture.get(), plume::RenderTextureLayout::SHADER_READ, slot.view.get());
+    SetTexture(5, index, slot.texture.get(), plume::RenderTextureLayout::SHADER_READ, slot.view.get());
     ++next_texture1d;
     return index;
   }
@@ -1675,7 +1718,7 @@ struct Renderer::State {
     }
     commands->barriers(plume::RenderBarrierStage::GRAPHICS,
                        plume::RenderTextureBarrier(texture.texture.get(), plume::RenderTextureLayout::SHADER_READ));
-    sets[2]->setTexture(texture.index, texture.texture.get(), plume::RenderTextureLayout::SHADER_READ,
+    SetTexture(2, texture.index, texture.texture.get(), plume::RenderTextureLayout::SHADER_READ,
                         texture.view.get());
     uploaded = true;
     return texture.index;
@@ -1787,7 +1830,7 @@ struct Renderer::State {
                                                           offset));
     commands->barriers(plume::RenderBarrierStage::GRAPHICS,
                        plume::RenderTextureBarrier(texture.texture.get(), plume::RenderTextureLayout::SHADER_READ));
-    sets[0]->setTexture(texture.index, texture.texture.get(), plume::RenderTextureLayout::SHADER_READ,
+    SetTexture(0, texture.index, texture.texture.get(), plume::RenderTextureLayout::SHADER_READ,
                         texture.view.get());
     uploaded = true;
     return texture.index;
@@ -2086,7 +2129,7 @@ struct Renderer::State {
       uint32_t index = 0;
       if (auto found = blended_slots.find(real_index); found != blended_slots.end()) index = found->second;
       uint64_t ring = 0;
-      if (index == 0 && (next_texture1d + 1 >= kTexture1DCount || !Upload(old.bytes, 512, ring))) {
+      if (index == 0 && (next_texture1d + 1 >= texture1d_end || !Upload(old.bytes, 512, ring))) {
         Skip("interp: bone pool full");
         return;
       }
@@ -2187,7 +2230,7 @@ struct Renderer::State {
         plume::RenderTextureBarrier(front.texture.get(), plume::RenderTextureLayout::SHADER_READ),
         plume::RenderTextureBarrier(held.texture.get(), plume::RenderTextureLayout::SHADER_READ)};
     commands->barriers(plume::RenderBarrierStage::GRAPHICS, after, 2);
-    sets[0]->setTexture(held.index, held.texture.get(), plume::RenderTextureLayout::SHADER_READ,
+    SetTexture(0, held.index, held.texture.get(), plume::RenderTextureLayout::SHADER_READ,
                         held.view.get());
     const bool replayed = second && ReplayFrame();
     if (!second) Skip("interp: no second swap chain image");
@@ -2385,7 +2428,7 @@ struct Renderer::State {
           plume::RenderTextureBarrier(depth, plume::RenderTextureLayout::DEPTH_READ),
           plume::RenderTextureBarrier(entry.texture.get(), plume::RenderTextureLayout::COLOR_WRITE)};
       commands->barriers(plume::RenderBarrierStage::GRAPHICS, to_pass, 2);
-      sets[0]->setTexture(depth_image.depth_index, depth, plume::RenderTextureLayout::DEPTH_READ,
+      SetTexture(0, depth_image.depth_index, depth, plume::RenderTextureLayout::DEPTH_READ,
                           depth_image.depth_view.get());
       commands->setFramebuffer(entry.framebuffer.get());
       commands->setGraphicsPipelineLayout(layout.get());
@@ -2402,7 +2445,7 @@ struct Renderer::State {
           plume::RenderTextureBarrier(depth, plume::RenderTextureLayout::DEPTH_WRITE),
           plume::RenderTextureBarrier(entry.texture.get(), plume::RenderTextureLayout::SHADER_READ)};
       commands->barriers(plume::RenderBarrierStage::GRAPHICS, back, 2);
-      sets[0]->setTexture(entry.index, entry.texture.get(), plume::RenderTextureLayout::SHADER_READ,
+      SetTexture(0, entry.index, entry.texture.get(), plume::RenderTextureLayout::SHADER_READ,
                           entry.view.get());
     } else if (op.kind == ResolveOp::kColor) {
       Texture& entry = textures[op.key];
@@ -2425,7 +2468,7 @@ struct Renderer::State {
           plume::RenderTextureBarrier(color, plume::RenderTextureLayout::COLOR_WRITE),
           plume::RenderTextureBarrier(entry.texture.get(), plume::RenderTextureLayout::SHADER_READ)};
       commands->barriers(plume::RenderBarrierStage::GRAPHICS, back, 2);
-      sets[0]->setTexture(entry.index, entry.texture.get(), plume::RenderTextureLayout::SHADER_READ,
+      SetTexture(0, entry.index, entry.texture.get(), plume::RenderTextureLayout::SHADER_READ,
                           entry.view.get());
     }
     BindTarget();
@@ -2439,7 +2482,9 @@ struct Renderer::State {
 Renderer::Renderer() : state_(std::make_unique<State>()) {}
 
 Renderer::~Renderer() {
-  if (state_->queue && state_->fence) state_->queue->waitForCommandFence(state_->fence.get());
+  State& s = *state_;
+  if (s.queue && s.fence && s.fence_pending[s.frame_slot]) s.queue->waitForCommandFence(s.fence.get());
+  if (s.queue && s.fence_other && s.fence_pending[s.frame_slot ^ 1]) s.queue->waitForCommandFence(s.fence_other.get());
 }
 
 const std::string& Renderer::device_name() const { return state_->device_name; }
@@ -2466,6 +2511,15 @@ bool Renderer::Open(void* native_window, std::string& reason) {
   s.fence = s.device->createCommandFence();
   s.commands = s.queue->createCommandList();
   s.acquire = s.device->createCommandSemaphore();
+  // Interpolation submits twice a frame and keeps one frame in flight.
+  s.frames_in_flight = REXCVAR_GET(native_interpolate)
+                           ? 1u
+                           : uint32_t(std::clamp<int32_t>(REXCVAR_GET(native_frames_in_flight), 1, 2));
+  if (s.frames_in_flight == 2) {
+    s.fence_other = s.device->createCommandFence();
+    s.commands_other = s.queue->createCommandList();
+    s.acquire_other = s.device->createCommandSemaphore();
+  }
   s.swap_chain = s.queue->createSwapChain(plume::RenderSwapChainDesc(
       static_cast<plume::RenderWindow>(native_window), kColorFormat,
       REXCVAR_GET(native_interpolate) ? kInterpolationSwapChainBuffers : kSwapChainBuffers));
@@ -3610,8 +3664,31 @@ void Renderer::Present(uint32_t frontbuffer, const uint8_t* base) {
   } else {
     s.queue->executeCommandLists(&list, 1, nullptr, 0, nullptr, 0, s.fence.get());
   }
+  s.fence_pending[s.frame_slot] = true;
   const auto t_submit = std::chrono::steady_clock::now();
-  s.queue->waitForCommandFence(s.fence.get());
+  // A frame whose results are read back here (dumps, interpolation) is
+  // waited for whatever the frames in flight.
+  const bool overlap = s.frames_in_flight == 2 && !s.Dumping() && !s.debug_pending && !shown;
+  if (overlap) {
+    // Record the next frame in the other slot once its last frame is done;
+    // this one keeps drawing meanwhile.
+    std::swap(s.commands, s.commands_other);
+    std::swap(s.fence, s.fence_other);
+    std::swap(s.acquire, s.acquire_other);
+    s.frame_slot ^= 1;
+    if (s.fence_pending[s.frame_slot]) {
+      s.queue->waitForCommandFence(s.fence.get());
+      s.fence_pending[s.frame_slot] = false;
+    }
+    s.DestroyRetired(s.frame_slot);
+  } else {
+    s.queue->waitForCommandFence(s.fence.get());
+    s.fence_pending[s.frame_slot] = false;
+    if (s.frames_in_flight == 2 && s.fence_pending[s.frame_slot ^ 1]) {
+      s.queue->waitForCommandFence(s.fence_other.get());
+      s.fence_pending[s.frame_slot ^ 1] = false;
+    }
+  }
   if (s.second_pending) {
     s.queue->waitForCommandFence(s.fence_second.get());
     s.second_pending = false;
@@ -3641,8 +3718,11 @@ void Renderer::Present(uint32_t frontbuffer, const uint8_t* base) {
       REXLOG_INFO("native: wrote logs/interp-{}-real.rgba and -mid.rgba ({}x{})", n, w / 2, h / 2);
     }
   }
-  s.DestroyRetired();
-  // The GPU is idle now, so streams unused for a while can go.
+  if (!overlap) {
+    s.DestroyRetired(0);
+    s.DestroyRetired(1);
+  }
+  // Streams unused for 120 frames are in no frame in flight and can go.
   if ((s.presents & 63) == 0) {
     std::erase_if(s.stream_cache, [&](const auto& entry) { return s.presents - entry.second.last_used > 120; });
     std::erase_if(s.index_cache, [&](const auto& entry) { return s.presents - entry.second.last_used > 120; });
@@ -3685,6 +3765,16 @@ void Renderer::Present(uint32_t frontbuffer, const uint8_t* base) {
   s.key_down = f9;
 #endif
   if (resize) {
+    // Targets and swap chain images are replaced at once: no frame may be
+    // in flight.
+    if (s.fence_pending[s.frame_slot]) {
+      s.queue->waitForCommandFence(s.fence.get());
+      s.fence_pending[s.frame_slot] = false;
+    }
+    if (s.fence_other && s.fence_pending[s.frame_slot ^ 1]) {
+      s.queue->waitForCommandFence(s.fence_other.get());
+      s.fence_pending[s.frame_slot ^ 1] = false;
+    }
     if (s.swap_chain->resize()) {
       while (s.release.size() < s.swap_chain->getTextureCount()) {
         s.release.push_back(s.device->createCommandSemaphore());
