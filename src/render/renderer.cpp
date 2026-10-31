@@ -119,9 +119,11 @@ constexpr plume::RenderFormat kColorFormat = plume::RenderFormat::B8G8R8A8_UNORM
 constexpr plume::RenderFormat kDepthFormat = plume::RenderFormat::D32_FLOAT_S8_UINT;
 // What a guest depth resolve becomes on the host: the depth value itself.
 constexpr plume::RenderFormat kDepthCopyFormat = plume::RenderFormat::R32_FLOAT;
-// Interpolation queues two presents per guest frame and needs a third.
+// Interpolation queues two presents per guest frame. With four images two
+// can wait for the display while the next frame acquires two more, so the
+// guest thread (whose logic steps once per frame) never waits for a vblank.
 constexpr uint32_t kSwapChainBuffers = 2;
-constexpr uint32_t kInterpolationSwapChainBuffers = 3;
+constexpr uint32_t kInterpolationSwapChainBuffers = 4;
 constexpr uint64_t kUploadBytes = 256ull << 20;
 constexpr uint32_t kTexture2DCount = 8192;
 constexpr uint32_t kTexture3DCount = 64;
@@ -1760,7 +1762,7 @@ struct Renderer::State {
     uint32_t bytes;
   };
   struct PrevFrame {
-    std::vector<uint64_t> keys;
+    std::vector<uint64_t> keys, keys_no_textures, keys_shaders;
     std::vector<float> vs_constants;
     // Half-float 1D textures (skinning bones) per draw: bones[bones_first[i]
     // .. bones_first[i + 1]) belong to draw i.
@@ -1771,6 +1773,9 @@ struct Renderer::State {
     bool valid = false;
   } prev;
   uint64_t bones_blended = 0;
+  // Within one replay: real 1D slot index -> its blended slot index, so the
+  // body, outline and shadow passes that share bones share the blend.
+  std::unordered_map<uint32_t, uint32_t> blended_slots;
 
   // The 1D pool slot behind fetch slot `fetch_slot` of a draw, or null.
   const Texture1DSlot* DrawTexture1D(const DrawOp& op, uint32_t fetch_slot) const {
@@ -1781,6 +1786,11 @@ struct Renderer::State {
     return &texture1d_slots[index - 1];
   }
   float last_match = 0.0f;
+  // Pairing report for the 5 s log: summed shares and frames, and a sample
+  // of one frame's unpaired draws.
+  double match_sum = 0, match_no_textures_sum = 0, match_shaders_sum = 0;
+  uint32_t match_frames = 0;
+  std::string unpaired_sample;
 
   const float* VsCpu(const DrawOp& op) const { return frame_vs.data() + size_t(op.cpu) * kVsFloats; }
 
@@ -1788,9 +1798,13 @@ struct Renderer::State {
   // while its upload ring still holds its data.
   void SnapshotFrame() {
     prev.keys.resize(draw_ops.size());
+    prev.keys_no_textures.resize(draw_ops.size());
+    prev.keys_shaders.resize(draw_ops.size());
     prev.vs_constants.resize(draw_ops.size() * kVsFloats);
     for (size_t i = 0; i < draw_ops.size(); ++i) {
       prev.keys[i] = draw_ops[i].key;
+      prev.keys_no_textures[i] = draw_ops[i].key_no_textures;
+      prev.keys_shaders[i] = draw_ops[i].key_shaders;
       std::memcpy(prev.vs_constants.data() + i * kVsFloats, VsCpu(draw_ops[i]), kVsFloats * 4);
     }
     prev.bones_first.assign(draw_ops.size() + 1, 0);
@@ -1829,6 +1843,30 @@ struct Renderer::State {
     for (size_t i = 0; i < draw_ops.size(); ++i) keys[i] = draw_ops[i].key;
     const std::vector<int32_t> match = interp::MatchDraws(prev.keys, keys);
     last_match = interp::MatchedShare(match);
+    {
+      std::vector<uint64_t> a(draw_ops.size()), b(draw_ops.size());
+      for (size_t i = 0; i < draw_ops.size(); ++i) {
+        a[i] = draw_ops[i].key_no_textures;
+        b[i] = draw_ops[i].key_shaders;
+      }
+      const std::vector<int32_t> ma = interp::MatchDraws(prev.keys_no_textures, a);
+      const std::vector<int32_t> mb = interp::MatchDraws(prev.keys_shaders, b);
+      match_sum += last_match;
+      match_no_textures_sum += interp::MatchedShare(ma);
+      match_shaders_sum += interp::MatchedShare(mb);
+      ++match_frames;
+      if (last_match < 0.9f && unpaired_sample.empty()) {
+        uint32_t listed = 0;
+        for (size_t i = 0; i < match.size() && listed < 24; ++i) {
+          if (match[i] >= 0) continue;
+          unpaired_sample += fmt::format(" [#{} n={} idx={} notex={} shaders={}]", i, draw_ops[i].count,
+                                         draw_ops[i].indexed ? 1 : 0, ma[i] >= 0 ? 1 : 0, mb[i] >= 0 ? 1 : 0);
+          ++listed;
+        }
+        unpaired_sample = fmt::format("{} of {} unpaired:", std::count(match.begin(), match.end(), -1), match.size()) +
+                          unpaired_sample;
+      }
+    }
     if (last_match < 0.9f) {
       Skip("interp: few matches");
       return false;
@@ -1846,6 +1884,7 @@ struct Renderer::State {
       return false;
     }
     const size_t paired = size_t(std::count_if(match.begin(), match.end(), [](int32_t m) { return m >= 0; }));
+    blended_slots.clear();
     uint64_t blended = 0;
     if (!Upload(paired * kVsFloats * 4, 256, blended)) {
       Skip("interp: upload ring full");
@@ -1913,8 +1952,14 @@ struct Renderer::State {
       const PrevBones& old = prev.bones[b];
       const Texture1DSlot* slot = DrawTexture1D(mid, old.fetch_slot);
       if (!slot || slot->format != old.format || slot->width != old.width || slot->cpu.size() != old.bytes) continue;
+      const uint32_t real_index = uint32_t(slot - texture1d_slots.data()) + 1;
+      uint32_t index = 0;
+      if (auto found = blended_slots.find(real_index); found != blended_slots.end()) index = found->second;
       uint64_t ring = 0;
-      if (next_texture1d + 1 >= kTexture1DCount || !Upload(old.bytes, 512, ring)) return;
+      if (index == 0 && (next_texture1d + 1 >= kTexture1DCount || !Upload(old.bytes, 512, ring))) {
+        Skip("interp: bone pool full");
+        return;
+      }
       if (!copied) {
         if (!Upload(gfx::kSharedConstantsBytes, 256, shared)) return;
         std::memcpy(upload_cpu + shared, frame_shared.data() + size_t(mid.cpu) * gfx::kSharedConstantsBytes,
@@ -1922,17 +1967,19 @@ struct Renderer::State {
         mid.shared = shared;
         copied = true;
       }
-      std::vector<uint16_t> lerped(old.bytes / 2);
-      interp::LerpHalfs(reinterpret_cast<const uint16_t*>(prev.bones_data.data() + old.offset),
-                        reinterpret_cast<const uint16_t*>(slot->cpu.data()), lerped.data(), lerped.size(), 0.5f);
-      std::memcpy(upload_cpu + ring, lerped.data(), old.bytes);
-      const uint32_t index = FillTexture1DSlot(slot->width, slot->format, slot->swizzle, ring, old.bytes,
-                                               slot->row_texels);
+      if (index == 0) {
+        std::vector<uint16_t> lerped(old.bytes / 2);
+        interp::LerpHalfs(reinterpret_cast<const uint16_t*>(prev.bones_data.data() + old.offset),
+                          reinterpret_cast<const uint16_t*>(slot->cpu.data()), lerped.data(), lerped.size(), 0.5f);
+        std::memcpy(upload_cpu + ring, lerped.data(), old.bytes);
+        index = FillTexture1DSlot(slot->width, slot->format, slot->swizzle, ring, old.bytes, slot->row_texels);
+        blended_slots[real_index] = index;
+        ++bones_blended;
+        mid.uploaded = true;
+      }
       // The shared copy was written above; patching the ring is a write.
       auto* indices = reinterpret_cast<uint32_t*>(upload_cpu + mid.shared);
       indices[DESCRIPTOR_KIND_TEXTURE1D * DESCRIPTOR_SLOT_COUNT + old.fetch_slot] = index;
-      mid.uploaded = true;
-      ++bones_blended;
     }
   }
 
@@ -2058,6 +2105,10 @@ struct Renderer::State {
     uint32_t vertex_count = 0;
     bool uploaded = false;  // textures were uploaded first, so rebind
     uint64_t key = 0;       // interp::DrawKey
+    // Looser keys, only to report how many draws they would pair.
+    uint64_t key_no_textures = 0;  // shaders, index range, count
+    uint64_t key_shaders = 0;      // shaders and count
+    uint32_t count = 0;
   };
   struct ClearOp {
     Target* target = nullptr;
@@ -2784,6 +2835,10 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
     // pair. Same-looking draws pair in order.
     op.key = interp::DrawKey(vs_key, ps_key, nullptr, 0, draw.indexed ? index_address : 0, draw.start,
                              draw.count, texture_indices, DESCRIPTOR_SLOT_COUNT);
+    op.key_no_textures = interp::DrawKey(vs_key, ps_key, nullptr, 0, draw.indexed ? index_address : 0,
+                                         draw.start, draw.count, nullptr, 0);
+    op.key_shaders = interp::DrawKey(vs_key, ps_key, nullptr, 0, 0, 0, draw.count, nullptr, 0);
+    op.count = draw.count;
   }
   s.ExecuteDraw(op);
   s.Record(op);
@@ -3286,9 +3341,15 @@ std::string Renderer::TakeStats() {
   s.msaa_resolves = 0;
   s.depth_resolves = 0;
   if (REXCVAR_GET(native_interpolate)) {
-    out += fmt::format(" journal={} interp={} match={:.2f} bones={}", s.journal_last, s.interp_frames, s.last_match,
-                       s.bones_blended);
+    const double frames = std::max<uint32_t>(s.match_frames, 1);
+    out += fmt::format(" journal={} interp={} match={:.2f} match_notex={:.2f} match_shaders={:.2f} bones={}",
+                       s.journal_last, s.interp_frames, s.match_sum / frames, s.match_no_textures_sum / frames,
+                       s.match_shaders_sum / frames, s.bones_blended);
+    if (!s.unpaired_sample.empty()) out += " | unpaired " + s.unpaired_sample;
     s.bones_blended = 0;
+    s.match_sum = s.match_no_textures_sum = s.match_shaders_sum = 0;
+    s.match_frames = 0;
+    s.unpaired_sample.clear();
     s.interp_frames = 0;
   }
   s.stream_hits = s.stream_misses = 0;
