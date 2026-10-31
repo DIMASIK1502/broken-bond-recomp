@@ -6,6 +6,8 @@
 #include <filesystem>
 #include <iostream>
 
+#include <emscripten.h>
+
 #include <rex/audio/nop/nop_audio_system.h>
 #include <rex/cvar.h>
 #include <rex/input/input_system.h>
@@ -18,6 +20,30 @@
 #include <imgui.h>
 
 using rex::X_STATUS;
+
+// The guest thread keeps running after it starts, and its program counter is
+// not stored. The link register is the last call, which is enough to see
+// whether boot is waiting on the GPU, a kernel service, or the title.
+extern "C" EMSCRIPTEN_KEEPALIVE void broken_bond_web_where() {
+  auto* runtime = rex::Runtime::instance();
+  if (!runtime || !runtime->kernel_state()) {
+    std::cout << "broken_bond web: no kernel" << std::endl;
+    return;
+  }
+  auto* kernel = runtime->kernel_state();
+  for (uint32_t id = 1; id <= 32; ++id) {
+    auto thread = kernel->GetThreadByID(id);
+    if (!thread || !thread->thread_state()) continue;
+    auto* ctx = thread->thread_state()->context();
+    const auto* params = thread->creation_params();
+    std::cout << "broken_bond web: thread " << std::dec << id
+              << (thread->main_thread() ? " main" : "")
+              << (thread->is_running() ? " running" : " idle")
+              << " start " << std::hex << (params ? params->start_address : 0)
+              << " lr " << (ctx ? ctx->lr : 0) << " ctr " << (ctx ? ctx->ctr.u32 : 0)
+              << std::endl;
+  }
+}
 
 // Boots the recompiled guest in this page and presents on #canvas.
 

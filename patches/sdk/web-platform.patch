@@ -695,6 +695,37 @@ index 76cc877..f131628 100644
    heap_type_ = heap_type;
    heap_base_ = heap_base;
    heap_size_ = heap_size;
+diff --git a/src/system/xthread.cpp b/src/system/xthread.cpp
+index 77bce25..24ed822 100644
+--- a/src/system/xthread.cpp
++++ b/src/system/xthread.cpp
+@@ -430,7 +430,14 @@ X_STATUS XThread::Create() {
+   RetainHandle();
+ 
+   rex::thread::Thread::CreationParameters params;
++#if defined(__EMSCRIPTEN__)
++  // Must match -sDEFAULT_PTHREAD_STACK_SIZE. A different size cannot come from
++  // the preallocated pool, and that spawn never reaches the thread start, so
++  // NtResumeThread waits forever.
++  params.stack_size = 2_MiB;
++#else
+   params.stack_size = 16_MiB;  // Allocate a big host stack.
++#endif
+   params.create_suspended = true;
+   thread_ = rex::thread::Thread::Create(params, [this]() {
+     rex::initialize_seh_thread();
+@@ -1391,7 +1398,11 @@ object_ref<XThread> XThread::Restore(KernelState* kernel_state, stream::ByteStre
+ 
+     rex::thread::Thread::CreationParameters params;
+     params.create_suspended = true;  // Not done restoring yet.
++#if defined(__EMSCRIPTEN__)
++    params.stack_size = 2_MiB;
++#else
+     params.stack_size = 16_MiB;
++#endif
+     thread->thread_ = rex::thread::Thread::Create(params, [thread, state]() {
+       // Set thread ID override. This is used by logging.
+       rex::thread::set_current_thread_id(thread->handle());
 diff --git a/thirdparty/renderdoc/renderdoc_app.h b/thirdparty/renderdoc/renderdoc_app.h
 index da323e9..8606d05 100644
 --- a/thirdparty/renderdoc/renderdoc_app.h
