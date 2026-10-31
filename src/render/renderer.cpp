@@ -64,6 +64,14 @@ REXCVAR_DEFINE_STRING(native_interpolate_blend, "vs,ps,bones", "Game",
                       "With native_interpolate, what the in-between frame blends: comma-separated vs (vertex "
                       "constants), ps (pixel constants), bones. Left-out parts use the real frame's")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(native_interpolate_debug, false, "Game",
+                    "With native_interpolate, show the in-between frame in place of the real one too (to compare a "
+                    "replayed frame with a real one)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(native_interpolate_dump, 0, "Game",
+                     "With native_interpolate, save this many pairs of a real frame and its in-between frame, one "
+                     "pair every 900 frames, as logs/interp-N-{real,mid}.rgba (half size, BGRA)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_INT32(native_msaa, 4, "Game",
                      "With renderer=native, the most samples a multisampled guest surface gets on the "
                      "host (1 turns MSAA off)")
@@ -1754,6 +1762,12 @@ struct Renderer::State {
   std::unique_ptr<plume::RenderCommandFence> fence_second;
   bool second_pending = false;
   uint64_t interp_frames = 0;
+  // native_interpolate_debug: one replayed frame and its real frame read
+  // back to logs/interp-{real,replay}.rgba after the frame's fence.
+  std::unique_ptr<plume::RenderBuffer> debug_readback;
+  uint32_t debug_width = 0, debug_height = 0;
+  bool debug_pending = false;
+  int32_t debug_dumped = 0;
 
   // The previous presented frame, for blending: each draw's key and its
   // vertex shader constants (kVsFloats floats per draw).
@@ -2103,10 +2117,39 @@ struct Renderer::State {
                         held.view.get());
     const bool replayed = second && ReplayFrame();
     if (!second) Skip("interp: no second swap chain image");
+    // native_interpolate_debug: replayed frames only for 150 presents, then
+    // real frames only for 150, to compare the two in one run.
+    const bool debug = REXCVAR_GET(native_interpolate_debug);
+    const bool show_replay = debug && (presents / 150) % 2 == 0;
     if (replayed) {
-      DrawPresentPass(mid_image, front.index, constants_mid);
+      DrawPresentPass(mid_image, debug && !show_replay ? held.index : front.index, constants_mid);
+      if (replayed && debug_dumped < REXCVAR_GET(native_interpolate_dump) && presents % 900 == 899 &&
+          front.format == kColorFormat) {
+        // Both pictures of this frame: held (real) and front (replayed).
+        const uint32_t row = front.width * 4;
+        debug_width = front.width;
+        debug_height = front.height;
+        debug_readback = device->createBuffer(plume::RenderBufferDesc::ReadbackBuffer(uint64_t(row) * front.height * 2));
+        plume::RenderTextureBarrier to_read[] = {
+            plume::RenderTextureBarrier(held.texture.get(), plume::RenderTextureLayout::COPY_SOURCE),
+            plume::RenderTextureBarrier(front.texture.get(), plume::RenderTextureLayout::COPY_SOURCE)};
+        commands->barriers(plume::RenderBarrierStage::COPY, to_read, 2);
+        commands->copyTextureRegion(plume::RenderTextureCopyLocation::PlacedFootprint(
+                                        debug_readback.get(), kColorFormat, front.width, front.height, 1, front.width, 0),
+                                    plume::RenderTextureCopyLocation::Subresource(held.texture.get()));
+        commands->copyTextureRegion(
+            plume::RenderTextureCopyLocation::PlacedFootprint(debug_readback.get(), kColorFormat, front.width,
+                                                              front.height, 1, front.width, uint64_t(row) * front.height),
+            plume::RenderTextureCopyLocation::Subresource(front.texture.get()));
+        plume::RenderTextureBarrier back_to_read[] = {
+            plume::RenderTextureBarrier(held.texture.get(), plume::RenderTextureLayout::SHADER_READ),
+            plume::RenderTextureBarrier(front.texture.get(), plume::RenderTextureLayout::SHADER_READ)};
+        commands->barriers(plume::RenderBarrierStage::GRAPHICS, back_to_read, 2);
+        debug_pending = true;
+      }
       // The frontbuffer holds the in-between picture now; a later present
       // that shows it without a new resolve must see the real frame.
+      if (!show_replay) {
       plume::RenderTextureBarrier to_restore[] = {
           plume::RenderTextureBarrier(held.texture.get(), plume::RenderTextureLayout::COPY_SOURCE),
           plume::RenderTextureBarrier(front.texture.get(), plume::RenderTextureLayout::COPY_DEST)};
@@ -2116,6 +2159,7 @@ struct Renderer::State {
           plume::RenderTextureBarrier(held.texture.get(), plume::RenderTextureLayout::SHADER_READ),
           plume::RenderTextureBarrier(front.texture.get(), plume::RenderTextureLayout::SHADER_READ)};
       commands->barriers(plume::RenderBarrierStage::GRAPHICS, restored, 2);
+      }
       ++interp_frames;
     } else {
       // No in-between frame: the real one goes into both images, so each
@@ -2134,7 +2178,8 @@ struct Renderer::State {
       // The held frame was written above; a later submit on the queue sees it.
       std::swap(commands, commands_second);
       commands->begin();
-      DrawPresentPass(real_image, held.index, constants_real);
+      DrawPresentPass(real_image, replayed && show_replay ? front.index : held.index,
+                      constants_real);
       commands->end();
       std::swap(commands, commands_second);
       const plume::RenderCommandList* second_list = commands_second.get();
@@ -3355,6 +3400,30 @@ void Renderer::Present(uint32_t frontbuffer, const uint8_t* base) {
     s.second_pending = false;
   }
   if (REXCVAR_GET(native_interpolate)) s.SnapshotFrame();
+  if (s.debug_pending) {
+    s.debug_pending = false;
+    const uint32_t w = s.debug_width, h = s.debug_height;
+    const size_t bytes = size_t(w) * h * 4;
+    if (const auto* data = static_cast<const uint8_t*>(s.debug_readback->map())) {
+      const int32_t n = ++s.debug_dumped;
+      std::vector<uint8_t> half(size_t(w / 2) * (h / 2) * 4);
+      for (int i = 0; i < 2; ++i) {
+        // Half size: every second pixel of every second row.
+        for (uint32_t y = 0; y < h / 2; ++y) {
+          for (uint32_t x = 0; x < w / 2; ++x) {
+            std::memcpy(&half[(size_t(y) * (w / 2) + x) * 4], data + i * bytes + (size_t(y * 2) * w + x * 2) * 4, 4);
+          }
+        }
+        const std::string path = fmt::format("logs/interp-{}-{}.rgba", n, i ? "mid" : "real");
+        if (FILE* f = std::fopen(path.c_str(), "wb")) {
+          std::fwrite(half.data(), 1, half.size(), f);
+          std::fclose(f);
+        }
+      }
+      s.debug_readback->unmap();
+      REXLOG_INFO("native: wrote logs/interp-{}-real.rgba and -mid.rgba ({}x{})", n, w / 2, h / 2);
+    }
+  }
   s.DestroyRetired();
   // The GPU is idle now, so streams unused for a while can go.
   if ((s.presents & 63) == 0) {
