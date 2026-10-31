@@ -29,6 +29,9 @@
 #include "gfx/texture.h"
 #include "gfx/xenos_shader_common.h"
 #include <bit>
+#if defined(_WIN32)
+extern "C" __declspec(dllimport) short __stdcall GetAsyncKeyState(int key);
+#endif
 #include <unordered_set>
 
 #include <rex/logging.h>
@@ -1013,8 +1016,13 @@ struct Renderer::State {
   // Vertex streams per (fetch constant endian, element endian) pair.
   std::array<uint64_t, 16> stream_endians{};
   bool Dumping() const {
-    return REXCVAR_GET(native_dump_frame) == int32_t(presents + 1) || outline_dump == presents + 1;
+    return REXCVAR_GET(native_dump_frame) == int32_t(presents + 1) || outline_dump == presents + 1 ||
+           key_dump == presents + 1;
   }
+  // F9 asks for a dump of the next frame, with its picture.
+  uint64_t key_dump = 0;
+  bool key_down = false;
+  bool frame_image_pending = false;
   bool recording = false;
   uint64_t clears = 0;
   uint64_t resolves = 0;
@@ -1275,10 +1283,25 @@ struct Renderer::State {
   // time it is seen, so data rewritten every frame stays in the ring.
   struct CachedStream {
     std::unique_ptr<plume::RenderBuffer> buffer;
+    std::vector<uint8_t> converted;  // host bytes of a stream too small for a buffer
     uint64_t last_used = 0;
     uint32_t seen = 0;
   };
   std::unordered_map<uint64_t, CachedStream> stream_cache;
+  // Indexed draws' host index lists by the guest index bytes. `host` holds
+  // indices relative to the lowest one (quad lists already as triangles),
+  // so the same bytes serve any base vertex. Lists of 4 KB and more get a
+  // GPU buffer of their own when they come back.
+  struct CachedIndices {
+    std::vector<uint32_t> host;
+    uint32_t lo = 0, hi = 0;
+    bool empty = false;  // only restart indices
+    std::unique_ptr<plume::RenderBuffer> buffer;
+    uint32_t seen = 0;
+    uint64_t last_used = 0;
+  };
+  std::unordered_map<uint64_t, CachedIndices> index_cache;
+  uint64_t index_hits = 0, index_misses = 0;
   uint64_t stream_hits = 0, stream_misses = 0;
   std::chrono::steady_clock::time_point lap_start;
   void Lap(size_t section) {
@@ -2259,6 +2282,7 @@ struct Renderer::State {
     uint32_t slot_count = 0;
     bool indexed = false;
     uint64_t index_ring = 0;
+    plume::RenderBufferReference index_ref;  // ring or cached buffer
     uint32_t index_count = 0;
     uint32_t vertex_count = 0;
     bool uploaded = false;  // textures were uploaded first, so rebind
@@ -2334,7 +2358,7 @@ struct Renderer::State {
     commands->setScissors(&scissor, 1);
     if (op.slot_count) commands->setVertexBuffers(0, op.views.data(), op.slot_count, op.slots.data());
     if (op.indexed) {
-      const plume::RenderIndexBufferView view(upload->at(op.index_ring), op.index_count * 4,
+      const plume::RenderIndexBufferView view(op.index_ref, op.index_count * 4,
                                               plume::RenderFormat::R32_UINT);
       commands->setIndexBuffer(&view);
       commands->drawIndexedInstanced(op.index_count, 1, 0, 0, 0);
@@ -2533,6 +2557,7 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
   std::vector<uint32_t>& list = s.index_scratch;
   list.clear();
   uint32_t index_address = 0;
+  State::CachedIndices* indices_entry = nullptr;
   if (draw.indexed) {
     const uint32_t ib = Be32(base, device + kDeviceIndices);
     if (ib == 0) {
@@ -2542,33 +2567,63 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
     const bool index32 = (Be32(base, ib) & 0x80000000u) != 0;
     const uint32_t address = PhysicalView(Be32(base, ib + 24));
     index_address = address;
-    list.resize(draw.count);
-    const uint8_t* src = At(base, address + (index32 ? 4u : 2u) * draw.start);
-    if (index32) {
-      for (uint32_t i = 0; i < draw.count; ++i) {
-        uint32_t v;
-        std::memcpy(&v, src + 4 * size_t(i), 4);
-        list[i] = __builtin_bswap32(v);
+    const size_t index_size = index32 ? 4 : 2;
+    const uint8_t* src = At(base, address + uint32_t(index_size) * draw.start);
+    const uint64_t index_key =
+        XXH3_64bits_withSeed(src, index_size * draw.count, (uint64_t(quads) << 1) | uint64_t(index32));
+    State::CachedIndices& entry = s.index_cache[index_key];
+    entry.last_used = s.presents;
+    if (entry.seen == 0) {
+      ++s.index_misses;
+      list.resize(draw.count);
+      if (index32) {
+        for (uint32_t i = 0; i < draw.count; ++i) {
+          uint32_t v;
+          std::memcpy(&v, src + 4 * size_t(i), 4);
+          list[i] = __builtin_bswap32(v);
+        }
+      } else {
+        for (uint32_t i = 0; i < draw.count; ++i) {
+          uint16_t v;
+          std::memcpy(&v, src + 2 * size_t(i), 2);
+          list[i] = __builtin_bswap16(v);
+        }
+      }
+      uint32_t lo = UINT32_MAX, hi = 0;
+      for (uint32_t index : list) {
+        if (index == 0xFFFFu || index == 0xFFFFFFFFu) continue;
+        lo = std::min(lo, index);
+        hi = std::max(hi, index);
+      }
+      entry.empty = lo == UINT32_MAX;
+      entry.lo = lo;
+      entry.hi = hi;
+      auto host = [&](uint32_t i) -> uint32_t {
+        const uint32_t index = list[i];
+        return (index == 0xFFFFu || index == 0xFFFFFFFFu) ? 0xFFFFFFFFu : index - lo;
+      };
+      entry.host.clear();
+      if (!entry.empty && quads) {
+        entry.host.reserve(draw.count / 4 * 6);
+        for (uint32_t q = 0; q + 3 < draw.count; q += 4) {
+          const uint32_t a = host(q), b = host(q + 1), c = host(q + 2), d = host(q + 3);
+          entry.host.insert(entry.host.end(), {a, b, c, a, c, d});
+        }
+      } else if (!entry.empty) {
+        entry.host.resize(draw.count);
+        for (uint32_t i = 0; i < draw.count; ++i) entry.host[i] = host(i);
       }
     } else {
-      for (uint32_t i = 0; i < draw.count; ++i) {
-        uint16_t v;
-        std::memcpy(&v, src + 2 * size_t(i), 2);
-        list[i] = __builtin_bswap16(v);
-      }
+      ++s.index_hits;
     }
+    ++entry.seen;
+    if (entry.empty) return;
+    indices_entry = &entry;
   }
   uint32_t first = 0, last = 0;
   if (draw.indexed) {
-    uint32_t lo = UINT32_MAX, hi = 0;
-    for (uint32_t index : list) {
-      if (index == 0xFFFFu || index == 0xFFFFFFFFu) continue;
-      lo = std::min(lo, index);
-      hi = std::max(hi, index);
-    }
-    if (lo == UINT32_MAX) return;
-    first = draw.base_vertex + lo;
-    last = draw.base_vertex + hi;
+    first = draw.base_vertex + indices_entry->lo;
+    last = draw.base_vertex + indices_entry->hi;
   } else {
     first = draw.start;
     last = draw.start + draw.count - 1;
@@ -2694,6 +2749,16 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
     if (cached.buffer) {
       ++s.stream_hits;
       stream_ref = cached.buffer->at(0);
+    } else if (cached.converted.size() == out_bytes && out_bytes != 0) {
+      // Small and seen before: the converted bytes, copied into the ring.
+      ++s.stream_hits;
+      uint64_t ring = 0;
+      if (!s.Upload(out_bytes, 16, ring)) {
+        s.Skip("upload ring full");
+        return;
+      }
+      std::memcpy(s.upload_cpu + ring, cached.converted.data(), out_bytes);
+      stream_ref = s.upload->at(ring);
     } else {
       ++s.stream_misses;
       std::vector<uint8_t>& raw = s.stream_raw;
@@ -2730,6 +2795,7 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
         }
         std::memcpy(s.upload_cpu + ring, out, out_bytes);
         stream_ref = s.upload->at(ring);
+        if (out_bytes < 4096) cached.converted.assign(out, out + out_bytes);
       }
     }
     s.Lap(9);
@@ -2938,14 +3004,37 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
   const bool use_indices = draw.indexed || quads;
   uint32_t index_count = draw.count;
   uint64_t index_ring = 0;
-  if (use_indices) {
-    // Index i of the draw as a host index, relative to the first vertex.
-    const uint32_t offset = draw.base_vertex - first;
-    auto host = [&](uint32_t i) -> uint32_t {
-      if (!draw.indexed) return i;
-      const uint32_t index = list[i];
-      return (index == 0xFFFFu || index == 0xFFFFFFFFu) ? 0xFFFFFFFFu : index + offset;
-    };
+  plume::RenderBufferReference index_ref;
+  if (use_indices && indices_entry) {
+    // Indexed: the cached list, relative to the lowest index, which `first`
+    // already is.
+    State::CachedIndices& entry = *indices_entry;
+    index_count = uint32_t(entry.host.size());
+    const size_t bytes = entry.host.size() * 4;
+    if (index_count == 0) {
+      s.Skip("index list");
+      return;
+    }
+    if (!entry.buffer && entry.seen >= 2 && bytes >= 4096) {
+      entry.buffer =
+          s.device->createBuffer(plume::RenderBufferDesc::UploadBuffer(bytes, plume::RenderBufferFlag::INDEX));
+      void* mapped = entry.buffer->map();
+      std::memcpy(mapped, entry.host.data(), bytes);
+      entry.buffer->unmap();
+    }
+    if (entry.buffer) {
+      index_ref = entry.buffer->at(0);
+    } else {
+      if (!s.Upload(bytes, 16, index_ring)) {
+        s.Skip("index list");
+        return;
+      }
+      std::memcpy(s.upload_cpu + index_ring, entry.host.data(), bytes);
+      index_ref = s.upload->at(index_ring);
+    }
+  } else if (use_indices) {
+    // Auto-indexed quad list: generated.
+    auto host = [&](uint32_t i) -> uint32_t { return i; };
     index_count = quads ? draw.count / 4 * 6 : draw.count;
     if (index_count == 0 || !s.Upload(size_t(index_count) * 4, 16, index_ring)) {
       s.Skip("index list");
@@ -2966,6 +3055,7 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
     } else {
       for (uint32_t i = 0; i < draw.count; ++i) out[i] = host(i);
     }
+    index_ref = s.upload->at(index_ring);
   }
 
   s.Lap(12);
@@ -3015,6 +3105,7 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
   op.slot_count = slot_count;
   op.indexed = use_indices;
   op.index_ring = index_ring;
+  op.index_ref = index_ref;
   op.index_count = index_count;
   op.vertex_count = draw.count;
   op.uploaded = uploaded;
@@ -3455,6 +3546,25 @@ void Renderer::Present(uint32_t frontbuffer, const uint8_t* base) {
         plume::RenderTextureBarrier(source, source_layout)};
     s.commands->barriers(plume::RenderBarrierStage::NONE, after, 2);
   }
+  if (!shown && s.Dumping() && source && source_layout == plume::RenderTextureLayout::SHADER_READ) {
+    for (const auto& [key, texture] : s.textures) {
+      if (texture.texture.get() != source || texture.format != kColorFormat) continue;
+      s.debug_width = texture.width;
+      s.debug_height = texture.height;
+      s.debug_readback = s.device->createBuffer(
+          plume::RenderBufferDesc::ReadbackBuffer(uint64_t(texture.width) * texture.height * 4));
+      s.commands->barriers(plume::RenderBarrierStage::COPY,
+                           plume::RenderTextureBarrier(source, plume::RenderTextureLayout::COPY_SOURCE));
+      s.commands->copyTextureRegion(
+          plume::RenderTextureCopyLocation::PlacedFootprint(s.debug_readback.get(), kColorFormat, texture.width,
+                                                            texture.height, 1, texture.width, 0),
+          plume::RenderTextureCopyLocation::Subresource(source));
+      s.commands->barriers(plume::RenderBarrierStage::GRAPHICS,
+                           plume::RenderTextureBarrier(source, plume::RenderTextureLayout::SHADER_READ));
+      s.frame_image_pending = true;
+      break;
+    }
+  }
   if (!shown) {
     s.journal_last = s.journal.size();
     s.commands->end();
@@ -3506,10 +3616,23 @@ void Renderer::Present(uint32_t frontbuffer, const uint8_t* base) {
   // The GPU is idle now, so streams unused for a while can go.
   if ((s.presents & 63) == 0) {
     std::erase_if(s.stream_cache, [&](const auto& entry) { return s.presents - entry.second.last_used > 120; });
+    std::erase_if(s.index_cache, [&](const auto& entry) { return s.presents - entry.second.last_used > 120; });
   }
   s.ms_submit +=std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_submit).count();
   if (s.Dumping()) {
     const std::string path = fmt::format("logs/native-frame-{}.txt", s.presents + 1);
+    if (s.frame_image_pending) {
+      s.frame_image_pending = false;
+      if (const auto* data = static_cast<const uint8_t*>(s.debug_readback->map())) {
+        const std::string image = fmt::format("logs/native-frame-{}-{}x{}.bgra", s.presents + 1, s.debug_width,
+                                              s.debug_height);
+        if (FILE* f = std::fopen(image.c_str(), "wb")) {
+          std::fwrite(data, 1, size_t(s.debug_width) * s.debug_height * 4, f);
+          std::fclose(f);
+        }
+        s.debug_readback->unmap();
+      }
+    }
     if (FILE* f = std::fopen(path.c_str(), "w")) {
       std::fputs(s.dump.c_str(), f);
       std::fprintf(f, "present frontbuffer=%08X target=%ux%u\n", frontbuffer, s.width, s.height);
@@ -3523,8 +3646,15 @@ void Renderer::Present(uint32_t frontbuffer, const uint8_t* base) {
       std::fclose(f);
     }
     s.dump.clear();
+    REXLOG_INFO("native: wrote {}", path);
   }
   ++s.presents;
+#if defined(_WIN32)
+  // F9 (on its press) dumps the next frame.
+  const bool f9 = (GetAsyncKeyState(0x78) & 0x8000) != 0;
+  if (f9 && !s.key_down) s.key_dump = s.presents + 1;
+  s.key_down = f9;
+#endif
   if (resize) {
     if (s.swap_chain->resize()) {
       while (s.release.size() < s.swap_chain->getTextureCount()) {
@@ -3580,6 +3710,8 @@ std::string Renderer::TakeStats() {
     s.interp_frames = 0;
   }
   s.stream_hits = s.stream_misses = 0;
+  out += fmt::format(" indices hit={} miss={} cached={}", s.index_hits, s.index_misses, s.index_cache.size());
+  s.index_hits = s.index_misses = 0;
   out += " laps";
   for (const double ms : s.ms_lap) out += fmt::format(" {:.0f}", ms);
   s.ms_lap = {};
