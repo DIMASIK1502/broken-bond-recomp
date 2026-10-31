@@ -1918,7 +1918,8 @@ struct Renderer::State {
       switch (op.kind) {
         case FrameOp::kDraw: {
           const int32_t pair = match[op.index];
-          if (pair < 0) {
+          if (pair < 0 || interp::Jumped(prev.vs_constants.data() + size_t(pair) * kVsFloats,
+                                         VsCpu(draw_ops[op.index]), 16, 0.5f)) {
             ExecuteDraw(draw_ops[op.index]);
             break;
           }
@@ -1988,6 +1989,26 @@ struct Renderer::State {
   // frontbuffer's entry in `textures`. Records nothing and returns false
   // when either swap chain image or the ring space is missing, or the
   // journal cannot be replayed; the caller then presents as usual.
+  // Where the frontbuffer's resolve sits in the journal: its op index and
+  // how many draws into its source target came before it. 0 draws before
+  // means the resolve copies what the previous frame drew (after Swap).
+  std::string front_resolve;
+  void NoteFrontResolve(uint64_t front_key) {
+    if (!front_resolve.empty()) return;
+    for (size_t j = journal.size(); j-- > 0;) {
+      if (journal[j].kind != FrameOp::kResolve) continue;
+      const ResolveOp& r = resolve_ops[journal[j].index];
+      if (r.key != front_key) continue;
+      size_t before = 0;
+      for (size_t k = 0; k < j; ++k) {
+        if (journal[k].kind == FrameOp::kDraw && draw_ops[journal[k].index].target == r.target) ++before;
+      }
+      front_resolve = fmt::format("{}/{} after {} draws into its target", j, journal.size(), before);
+      return;
+    }
+    front_resolve = fmt::format("none in {} ops", journal.size());
+  }
+
   bool PresentInterpolated(Texture& front) {
     if (!present_pipeline || front.index == 0 || !front.texture) {
       Skip("interp: no frontbuffer");
@@ -2830,11 +2851,13 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
     for (uint32_t slot = 0; slot < DESCRIPTOR_SLOT_COUNT; ++slot) {
       texture_indices[slot] = indices[DESCRIPTOR_KIND_TEXTURE2D * DESCRIPTOR_SLOT_COUNT + slot];
     }
-    // Streams are left out: the game writes dynamic geometry (UI quads,
-    // cables) to a different buffer each frame, and such draws must still
-    // pair. Same-looking draws pair in order.
-    op.key = interp::DrawKey(vs_key, ps_key, nullptr, 0, draw.indexed ? index_address : 0, draw.start,
-                             draw.count, texture_indices, DESCRIPTOR_SLOT_COUNT);
+    // Shaders and count only. The game writes dynamic geometry (UI quads,
+    // cables) to a new vertex and index buffer each frame, and in the
+    // village some draws' texture indices change every frame; such draws
+    // must still pair (98 % of the village's draws pair this way, 72 % with
+    // indices and textures). Same-looking draws pair in order; a pair whose
+    // transform jumps is drawn unblended.
+    op.key = interp::DrawKey(vs_key, ps_key, nullptr, 0, 0, 0, draw.count, nullptr, 0);
     op.key_no_textures = interp::DrawKey(vs_key, ps_key, nullptr, 0, draw.indexed ? index_address : 0,
                                          draw.start, draw.count, nullptr, 0);
     op.key_shaders = interp::DrawKey(vs_key, ps_key, nullptr, 0, 0, 0, draw.count, nullptr, 0);
@@ -3221,6 +3244,7 @@ void Renderer::Present(uint32_t frontbuffer, const uint8_t* base) {
       !s.swap_chain->isEmpty() && source && source_layout == plume::RenderTextureLayout::SHADER_READ) {
     for (auto& [key, texture] : s.textures) {
       if (texture.texture.get() == source) {
+        s.NoteFrontResolve(key);
         shown = s.PresentInterpolated(texture);
         break;
       }
@@ -3346,6 +3370,8 @@ std::string Renderer::TakeStats() {
                        s.journal_last, s.interp_frames, s.match_sum / frames, s.match_no_textures_sum / frames,
                        s.match_shaders_sum / frames, s.bones_blended);
     if (!s.unpaired_sample.empty()) out += " | unpaired " + s.unpaired_sample;
+    if (!s.front_resolve.empty()) out += " | front resolve " + s.front_resolve;
+    s.front_resolve.clear();
     s.bones_blended = 0;
     s.match_sum = s.match_no_textures_sum = s.match_shaders_sum = 0;
     s.match_frames = 0;
