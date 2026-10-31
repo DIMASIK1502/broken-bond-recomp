@@ -55,6 +55,20 @@ int main() {
   interp::LerpFloats(np, nc, out, 1, 0.5f);
   CHECK(out[0] == 3.0f);
 
+  // Values that jump by more than half their size (at least 1) in a step
+  // take this frame's value: a wrapping UV offset (0.98 -> 0.02), a 0/1
+  // switch. Smooth changes still blend.
+  {
+    const float sp[4] = {0.98f, 0.0f, 0.30f, 100.0f}, sc[4] = {0.02f, 1.0f, 0.40f, 110.0f};
+    float so[4];
+    const size_t snapped = interp::LerpFloatsSnap(sp, sc, so, 4, 0.5f, 0.5f);
+    CHECK(so[0] == 0.02f);
+    CHECK(so[1] == 1.0f);
+    CHECK(std::fabs(so[2] - 0.35f) < 1e-6f);
+    CHECK(so[3] == 105.0f);
+    CHECK(snapped == 2);
+  }
+
   uint16_t half_out[1];
   const uint16_t hp[1] = {0x3C00}, hc[1] = {0x4000};  // 1.0, 2.0
   interp::LerpHalfs(hp, hc, half_out, 1, 0.5f);

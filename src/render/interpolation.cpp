@@ -126,6 +126,22 @@ void LerpFloats(const float* prev, const float* cur, float* out, size_t count, f
   }
 }
 
+size_t LerpFloatsSnap(const float* prev, const float* cur, float* out, size_t count, float t, float jump) {
+  size_t snapped = 0;
+  for (size_t i = 0; i < count; ++i) {
+    const float a = prev[i], b = cur[i];
+    if (!std::isfinite(a) || !std::isfinite(b)) {
+      out[i] = b;
+    } else if (std::fabs(b - a) > jump * std::max({1.0f, std::fabs(a), std::fabs(b)})) {
+      out[i] = b;
+      ++snapped;
+    } else {
+      out[i] = a + (b - a) * t;
+    }
+  }
+  return snapped;
+}
+
 void LerpHalfs(const uint16_t* prev, const uint16_t* cur, uint16_t* out, size_t count, float t) {
   for (size_t i = 0; i < count; ++i) {
     const float a = HalfToFloat(prev[i]);

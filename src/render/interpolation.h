@@ -33,6 +33,12 @@ float MatchedShare(const std::vector<int32_t>& match);
 // out = prev + (cur - prev) * t. A non-finite value on either side gives cur.
 void LerpFloats(const float* prev, const float* cur, float* out, size_t count, float t);
 
+// As LerpFloats, except that a value which moved by more than
+// jump * max(1, |prev|, |cur|) takes cur: such a change in one step is a
+// wrap (a UV offset going 0.98 -> 0.02) or a switch, not motion, and its
+// halfway value is wrong. Returns how many values took cur that way.
+size_t LerpFloatsSnap(const float* prev, const float* cur, float* out, size_t count, float t, float jump);
+
 // The same for IEEE half floats.
 void LerpHalfs(const uint16_t* prev, const uint16_t* cur, uint16_t* out, size_t count, float t);
 

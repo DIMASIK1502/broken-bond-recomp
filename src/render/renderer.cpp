@@ -1777,6 +1777,7 @@ struct Renderer::State {
   bool blend_vs = true, blend_ps = true, blend_bones = true;
   bool blend_read = false;
   uint64_t guarded = 0;  // paired draws whose transform jumped, for the cut rule
+  uint64_t snapped = 0;  // constants that jumped and kept this frame's value
   struct DrawOp;  // the frame journal's, below
   struct PrevBones {
     uint32_t fetch_slot;  // which of the draw's fetch slots
@@ -1967,16 +1968,16 @@ struct Renderer::State {
           DrawOp mid = draw_ops[op.index];
           if (blend_vs) {
             float lerped[kVsFloats];
-            interp::LerpFloats(prev.vs_constants.data() + size_t(pair) * kVsFloats, VsCpu(mid), lerped, kVsFloats,
-                               0.5f);
+            snapped += interp::LerpFloatsSnap(prev.vs_constants.data() + size_t(pair) * kVsFloats, VsCpu(mid),
+                                              lerped, kVsFloats, 0.5f, 0.5f);
             std::memcpy(upload_cpu + blended, lerped, sizeof(lerped));
             mid.vs_constants = blended;
             blended += kVsFloats * 4;
           }
           if (blend_ps) {
             float lerped[kPsFloats];
-            interp::LerpFloats(prev.ps_constants.data() + size_t(pair) * kPsFloats, PsCpu(mid), lerped, kPsFloats,
-                               0.5f);
+            snapped += interp::LerpFloatsSnap(prev.ps_constants.data() + size_t(pair) * kPsFloats, PsCpu(mid),
+                                              lerped, kPsFloats, 0.5f, 0.5f);
             std::memcpy(upload_cpu + blended_ps, lerped, sizeof(lerped));
             mid.ps_constants = blended_ps;
             blended_ps += kPsFloats * 4;
@@ -3483,10 +3484,11 @@ std::string Renderer::TakeStats() {
   s.depth_resolves = 0;
   if (REXCVAR_GET(native_interpolate)) {
     const double frames = std::max<uint32_t>(s.match_frames, 1);
-    out += fmt::format(" journal={} interp={} match={:.2f} match_notex={:.2f} match_shaders={:.2f} bones={} jumped={}",
+    out += fmt::format(" journal={} interp={} match={:.2f} match_notex={:.2f} match_shaders={:.2f} bones={} jumped={} snapped={}",
                        s.journal_last, s.interp_frames, s.match_sum / frames, s.match_no_textures_sum / frames,
-                       s.match_shaders_sum / frames, s.bones_blended, s.guarded);
+                       s.match_shaders_sum / frames, s.bones_blended, s.guarded, s.snapped);
     s.guarded = 0;
+    s.snapped = 0;
     if (!s.unpaired_sample.empty()) out += " | unpaired " + s.unpaired_sample;
     if (!s.front_resolve.empty()) out += " | front resolve " + s.front_resolve;
     s.front_resolve.clear();
