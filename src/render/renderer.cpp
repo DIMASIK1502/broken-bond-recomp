@@ -845,6 +845,7 @@ struct Renderer::State {
     Image* color = nullptr;
     Image* depth = nullptr;
     uint32_t samples = 1;
+    uint64_t id = 0;  // creation number; a new target may reuse a freed one's address
     std::unique_ptr<plume::RenderFramebuffer> framebuffer;
   };
   std::unordered_map<uint64_t, Image> color_images;
@@ -904,6 +905,7 @@ struct Renderer::State {
     uint64_t ring = 0;
     uint32_t ring_bytes = 0;
     uint32_t row_texels = 0;
+    std::vector<uint8_t> cpu;  // the same texels, with native_interpolate
   };
   std::vector<Texture1DSlot> texture1d_slots;
   // Present pass: the frontbuffer through the game's gamma ramp.
@@ -1145,6 +1147,7 @@ struct Renderer::State {
       desc.colorAttachmentsCount = 1;
       desc.depthAttachment = samples > 1 ? depth_image.msaa.get() : depth_image.texture.get();
       target.framebuffer = device->createFramebuffer(desc);
+      target.id = ++next_target_id;
       current = nullptr;
     }
     if (UseTarget(target)) {
@@ -1176,6 +1179,7 @@ struct Renderer::State {
   }
 
   uint64_t presents = 0;
+  uint64_t next_target_id = 0;
   uint64_t msaa_resolves = 0;
   // Vblanks per flip the game last asked for (2 at 30 Hz, 1 at 60 Hz).
   std::atomic<uint32_t> flip_interval{0};
@@ -1268,6 +1272,8 @@ struct Renderer::State {
     next_texture1d = 0;
     texture1d_frame.clear();
     journal.clear();
+    frame_vs.clear();
+    frame_shared.clear();
     draw_ops.clear();
     clear_ops.clear();
     resolve_ops.clear();
@@ -1453,8 +1459,16 @@ struct Renderer::State {
     }
     if (texture1d_slots.size() <= next_texture1d) texture1d_slots.resize(next_texture1d + 1);
     const uint32_t row_texels = uint32_t(row / linear.block_bytes) * linear.block_width;
+    std::vector<uint8_t> cpu;
+    if (REXCVAR_GET(native_interpolate)) {
+      cpu.assign(row * linear.height_blocks, 0);
+      for (uint32_t y = 0; y < linear.height_blocks; ++y) {
+        std::memcpy(cpu.data() + y * row, linear.blocks.data() + y * row_bytes, row_bytes);
+      }
+    }
     const uint32_t index = FillTexture1DSlot(width, host, HostSwizzle(fetch.swizzle, fetch.format), offset,
-                                             uint32_t(row * linear.height_blocks), row_texels);
+                                             uint32_t(row * linear.height_blocks), row_texels,
+                                             cpu.empty() ? nullptr : cpu.data());
     texture1d_frame[frame_key] = index;
     uploaded = true;
     return index;
@@ -1463,7 +1477,7 @@ struct Renderer::State {
   // Takes the next 1D pool slot and copies `bytes` of texels at ring offset
   // `ring` into it. Returns its heap index; the caller checked the pool.
   uint32_t FillTexture1DSlot(uint32_t width, plume::RenderFormat host, uint32_t swizzle, uint64_t ring,
-                             uint32_t bytes, uint32_t row_texels) {
+                             uint32_t bytes, uint32_t row_texels, const uint8_t* cpu = nullptr) {
     if (texture1d_slots.size() <= next_texture1d) texture1d_slots.resize(next_texture1d + 1);
     Texture1DSlot& slot = texture1d_slots[next_texture1d];
     const uint32_t index = next_texture1d + 1;
@@ -1481,6 +1495,11 @@ struct Renderer::State {
     slot.ring = ring;
     slot.ring_bytes = bytes;
     slot.row_texels = row_texels;
+    if (cpu) {
+      slot.cpu.assign(cpu, cpu + bytes);
+    } else {
+      slot.cpu.clear();
+    }
     commands->barriers(plume::RenderBarrierStage::COPY,
                        plume::RenderTextureBarrier(slot.texture.get(), plume::RenderTextureLayout::COPY_DEST));
     commands->copyTextureRegion(
@@ -1755,12 +1774,15 @@ struct Renderer::State {
 
   // The 1D pool slot behind fetch slot `fetch_slot` of a draw, or null.
   const Texture1DSlot* DrawTexture1D(const DrawOp& op, uint32_t fetch_slot) const {
-    const auto* indices = reinterpret_cast<const uint32_t*>(upload_cpu + op.shared);
+    const auto* indices =
+        reinterpret_cast<const uint32_t*>(frame_shared.data() + size_t(op.cpu) * gfx::kSharedConstantsBytes);
     const uint32_t index = indices[DESCRIPTOR_KIND_TEXTURE1D * DESCRIPTOR_SLOT_COUNT + fetch_slot];
     if (index == 0 || index > texture1d_slots.size()) return nullptr;
     return &texture1d_slots[index - 1];
   }
   float last_match = 0.0f;
+
+  const float* VsCpu(const DrawOp& op) const { return frame_vs.data() + size_t(op.cpu) * kVsFloats; }
 
   // Keeps what the next frame blends with. Called after the frame's fence,
   // while its upload ring still holds its data.
@@ -1769,8 +1791,7 @@ struct Renderer::State {
     prev.vs_constants.resize(draw_ops.size() * kVsFloats);
     for (size_t i = 0; i < draw_ops.size(); ++i) {
       prev.keys[i] = draw_ops[i].key;
-      std::memcpy(prev.vs_constants.data() + i * kVsFloats, upload_cpu + draw_ops[i].vs_constants,
-                  kVsFloats * 4);
+      std::memcpy(prev.vs_constants.data() + i * kVsFloats, VsCpu(draw_ops[i]), kVsFloats * 4);
     }
     prev.bones_first.assign(draw_ops.size() + 1, 0);
     prev.bones.clear();
@@ -1779,10 +1800,11 @@ struct Renderer::State {
       prev.bones_first[i] = uint32_t(prev.bones.size());
       for (uint32_t fetch_slot = 0; fetch_slot < DESCRIPTOR_SLOT_COUNT; ++fetch_slot) {
         const Texture1DSlot* slot = DrawTexture1D(draw_ops[i], fetch_slot);
-        if (!slot || slot->format != plume::RenderFormat::R16G16B16A16_FLOAT) continue;
+        if (!slot || slot->format != plume::RenderFormat::R16G16B16A16_FLOAT || slot->cpu.size() != slot->ring_bytes) {
+          continue;
+        }
         prev.bones.push_back({fetch_slot, slot->width, slot->format, prev.bones_data.size(), slot->ring_bytes});
-        prev.bones_data.insert(prev.bones_data.end(), upload_cpu + slot->ring,
-                               upload_cpu + slot->ring + slot->ring_bytes);
+        prev.bones_data.insert(prev.bones_data.end(), slot->cpu.begin(), slot->cpu.end());
       }
     }
     prev.bones_first[draw_ops.size()] = uint32_t(prev.bones.size());
@@ -1817,8 +1839,7 @@ struct Renderer::State {
     for (size_t i = 0; i < match.size(); ++i) {
       if (match[i] < 0) continue;
       ++pairs;
-      jumps += interp::Jumped(prev.vs_constants.data() + size_t(match[i]) * kVsFloats,
-                              reinterpret_cast<const float*>(upload_cpu + draw_ops[i].vs_constants), 16, 0.5f);
+      jumps += interp::Jumped(prev.vs_constants.data() + size_t(match[i]) * kVsFloats, VsCpu(draw_ops[i]), 16, 0.5f);
     }
     if (jumps * 2 > pairs) {
       Skip("interp: camera jump");
@@ -1830,22 +1851,26 @@ struct Renderer::State {
       Skip("interp: upload ring full");
       return false;
     }
-    std::unordered_set<const Target*> live;
-    for (const auto& [key, target] : targets) live.insert(&target);
+    std::unordered_map<const Target*, uint64_t> live;
+    for (const auto& [key, target] : targets) live[&target] = target.id;
+    auto alive = [&](const Target* target, uint64_t id) {
+      const auto found = live.find(target);
+      return found != live.end() && found->second == id;
+    };
     for (const DrawOp& op : draw_ops) {
-      if (!live.count(op.target)) {
+      if (!alive(op.target, op.target_id)) {
         Skip("interp: target gone");
         return false;
       }
     }
     for (const ClearOp& op : clear_ops) {
-      if (!live.count(op.target)) {
+      if (!alive(op.target, op.target_id)) {
         Skip("interp: target gone");
         return false;
       }
     }
     for (const ResolveOp& op : resolve_ops) {
-      if (!live.count(op.target)) {
+      if (!alive(op.target, op.target_id)) {
         Skip("interp: target gone");
         return false;
       }
@@ -1859,9 +1884,10 @@ struct Renderer::State {
             break;
           }
           DrawOp mid = draw_ops[op.index];
-          interp::LerpFloats(prev.vs_constants.data() + size_t(pair) * kVsFloats,
-                             reinterpret_cast<const float*>(upload_cpu + mid.vs_constants),
-                             reinterpret_cast<float*>(upload_cpu + blended), kVsFloats, 0.5f);
+          float lerped[kVsFloats];
+          interp::LerpFloats(prev.vs_constants.data() + size_t(pair) * kVsFloats, VsCpu(mid), lerped, kVsFloats,
+                             0.5f);
+          std::memcpy(upload_cpu + blended, lerped, sizeof(lerped));
           mid.vs_constants = blended;
           blended += kVsFloats * 4;
           BlendBones(mid, size_t(pair));
@@ -1886,20 +1912,23 @@ struct Renderer::State {
     for (uint32_t b = prev.bones_first[pair]; b < prev.bones_first[pair + 1]; ++b) {
       const PrevBones& old = prev.bones[b];
       const Texture1DSlot* slot = DrawTexture1D(mid, old.fetch_slot);
-      if (!slot || slot->format != old.format || slot->width != old.width || slot->ring_bytes != old.bytes) continue;
+      if (!slot || slot->format != old.format || slot->width != old.width || slot->cpu.size() != old.bytes) continue;
       uint64_t ring = 0;
       if (next_texture1d + 1 >= kTexture1DCount || !Upload(old.bytes, 512, ring)) return;
       if (!copied) {
         if (!Upload(gfx::kSharedConstantsBytes, 256, shared)) return;
-        std::memcpy(upload_cpu + shared, upload_cpu + mid.shared, gfx::kSharedConstantsBytes);
+        std::memcpy(upload_cpu + shared, frame_shared.data() + size_t(mid.cpu) * gfx::kSharedConstantsBytes,
+                    gfx::kSharedConstantsBytes);
         mid.shared = shared;
         copied = true;
       }
+      std::vector<uint16_t> lerped(old.bytes / 2);
       interp::LerpHalfs(reinterpret_cast<const uint16_t*>(prev.bones_data.data() + old.offset),
-                        reinterpret_cast<const uint16_t*>(upload_cpu + slot->ring),
-                        reinterpret_cast<uint16_t*>(upload_cpu + ring), old.bytes / 2, 0.5f);
+                        reinterpret_cast<const uint16_t*>(slot->cpu.data()), lerped.data(), lerped.size(), 0.5f);
+      std::memcpy(upload_cpu + ring, lerped.data(), old.bytes);
       const uint32_t index = FillTexture1DSlot(slot->width, slot->format, slot->swizzle, ring, old.bytes,
                                                slot->row_texels);
+      // The shared copy was written above; patching the ring is a write.
       auto* indices = reinterpret_cast<uint32_t*>(upload_cpu + mid.shared);
       indices[DESCRIPTOR_KIND_TEXTURE1D * DESCRIPTOR_SLOT_COUNT + old.fetch_slot] = index;
       mid.uploaded = true;
@@ -1967,6 +1996,17 @@ struct Renderer::State {
     if (!second) Skip("interp: no second swap chain image");
     if (replayed) {
       DrawPresentPass(mid_image, front.index, constants_mid);
+      // The frontbuffer holds the in-between picture now; a later present
+      // that shows it without a new resolve must see the real frame.
+      plume::RenderTextureBarrier to_restore[] = {
+          plume::RenderTextureBarrier(held.texture.get(), plume::RenderTextureLayout::COPY_SOURCE),
+          plume::RenderTextureBarrier(front.texture.get(), plume::RenderTextureLayout::COPY_DEST)};
+      commands->barriers(plume::RenderBarrierStage::COPY, to_restore, 2);
+      commands->copyTexture(front.texture.get(), held.texture.get());
+      plume::RenderTextureBarrier restored[] = {
+          plume::RenderTextureBarrier(held.texture.get(), plume::RenderTextureLayout::SHADER_READ),
+          plume::RenderTextureBarrier(front.texture.get(), plume::RenderTextureLayout::SHADER_READ)};
+      commands->barriers(plume::RenderBarrierStage::GRAPHICS, restored, 2);
       ++interp_frames;
     } else {
       // No in-between frame: the real one goes into both images, so each
@@ -2004,6 +2044,8 @@ struct Renderer::State {
   // which holds until the next BeginFrame.
   struct DrawOp {
     Target* target = nullptr;
+    uint64_t target_id = 0;
+    uint32_t cpu = 0;  // index into frame_vs and frame_shared
     plume::RenderPipeline* pipeline = nullptr;
     uint64_t vs_constants = 0, ps_constants = 0, shared = 0;  // upload ring offsets
     plume::RenderViewport viewport;
@@ -2019,6 +2061,7 @@ struct Renderer::State {
   };
   struct ClearOp {
     Target* target = nullptr;
+    uint64_t target_id = 0;
     uint32_t flags = 0;
     plume::RenderRect rect;
     plume::RenderColor color;
@@ -2027,6 +2070,7 @@ struct Renderer::State {
   };
   struct ResolveOp {
     Target* target = nullptr;
+    uint64_t target_id = 0;
     enum Kind { kNone, kColor, kDepth } kind = kNone;
     uint64_t key = 0;  // destination in `textures`
     plume::RenderRect src;
@@ -2043,6 +2087,10 @@ struct Renderer::State {
     uint32_t index;
   };
   std::vector<FrameOp> journal;
+  // CPU copies of each draw's vertex constants and shared constants. The
+  // upload ring is write-combined on discrete GPUs and slow to read back.
+  std::vector<float> frame_vs;
+  std::vector<uint8_t> frame_shared;
   std::vector<DrawOp> draw_ops;
   std::vector<ClearOp> clear_ops;
   std::vector<ResolveOp> resolve_ops;
@@ -2597,8 +2645,17 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
     return;
   }
   s.Lap(2);
-  CopySwappedDwords(s.upload_cpu + vs_constants, At(base, device + kDeviceVsConstants),
-                    gfx::kVertexShaderConstantsBytes);
+  uint32_t cpu_index = 0;
+  if (REXCVAR_GET(native_interpolate)) {
+    cpu_index = uint32_t(s.frame_vs.size() / State::kVsFloats);
+    s.frame_vs.resize(s.frame_vs.size() + State::kVsFloats);
+    auto* vs_cpu = reinterpret_cast<uint8_t*>(s.frame_vs.data() + size_t(cpu_index) * State::kVsFloats);
+    CopySwappedDwords(vs_cpu, At(base, device + kDeviceVsConstants), gfx::kVertexShaderConstantsBytes);
+    std::memcpy(s.upload_cpu + vs_constants, vs_cpu, gfx::kVertexShaderConstantsBytes);
+  } else {
+    CopySwappedDwords(s.upload_cpu + vs_constants, At(base, device + kDeviceVsConstants),
+                      gfx::kVertexShaderConstantsBytes);
+  }
   CopySwappedDwords(s.upload_cpu + ps_constants, At(base, device + kDevicePsConstants),
                     gfx::kPixelShaderConstantsBytes);
 
@@ -2635,6 +2692,11 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
   const uint32_t alpha_func = color_control & 7;
   std::memcpy(shared_cpu + gfx::kSharedAlphaFuncOffset, &alpha_func, 4);
   std::memcpy(s.upload_cpu + shared, shared_cpu, sizeof(shared_cpu));
+  if (REXCVAR_GET(native_interpolate)) {
+    s.frame_shared.resize((size_t(cpu_index) + 1) * gfx::kSharedConstantsBytes);
+    std::memcpy(s.frame_shared.data() + size_t(cpu_index) * gfx::kSharedConstantsBytes, shared_cpu,
+                sizeof(shared_cpu));
+  }
 
   s.Lap(3);
   // Host index list, relative to the first copied vertex.
@@ -2697,6 +2759,7 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
   s.Lap(4);
   State::DrawOp op;
   op.target = s.current;
+  op.target_id = s.current->id;
   op.pipeline = pipeline;
   op.vs_constants = vs_constants;
   op.ps_constants = ps_constants;
@@ -2710,6 +2773,7 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
   op.index_count = index_count;
   op.vertex_count = draw.count;
   op.uploaded = uploaded;
+  op.cpu = cpu_index;
   if (REXCVAR_GET(native_interpolate)) {
     uint32_t texture_indices[DESCRIPTOR_SLOT_COUNT];
     for (uint32_t slot = 0; slot < DESCRIPTOR_SLOT_COUNT; ++slot) {
@@ -2868,6 +2932,7 @@ void Renderer::Clear(uint32_t device, uint32_t flags, uint32_t rect, uint32_t co
   }
   State::ClearOp op;
   op.target = s.current;
+  op.target_id = s.current->id;
   op.flags = flags;
   op.rect = host_rect;
   op.color = plume::RenderColor(0.0f, 0.0f, 0.0f, 0.0f);
@@ -2897,6 +2962,7 @@ void Renderer::Resolve(uint32_t device, uint32_t flags, uint32_t rect, uint32_t 
   const uint32_t source = flags & 7;
   State::ResolveOp op;
   op.target = s.current;
+  op.target_id = s.current->id;
   if (texture != 0 && source >= 4) {
     // The EDRAM depth into a texture the game samples later (the cutscene
     // depth of field). The host copy holds the depth value as R32_FLOAT.
