@@ -8,6 +8,7 @@
 
 #include <emscripten.h>
 
+#include <rex/audio/audio_driver.h>
 #include <rex/audio/nop/nop_audio_system.h>
 #include <rex/cvar.h>
 #include <rex/input/input_system.h>
@@ -83,6 +84,30 @@ extern "C" void sub_821CBB60(PPCContext& ctx, uint8_t* base) {
   WebLogGuest("step BB60", ctx, base, __imp__sub_821CBB60);
 }
 
+// The nop backend refuses every client, and the guest treats that status as a
+// failed device. This driver accepts the client and drops the frames.
+class SilentAudioDriver final : public rex::audio::AudioDriver {
+ public:
+  using AudioDriver::AudioDriver;
+  void SubmitFrame(uint32_t) override {}
+};
+
+class SilentAudioSystem final : public rex::audio::nop::NopAudioSystem {
+ public:
+  using NopAudioSystem::NopAudioSystem;
+
+  static std::unique_ptr<rex::audio::AudioSystem> Create(rex::runtime::FunctionDispatcher* dispatcher) {
+    return std::make_unique<SilentAudioSystem>(dispatcher);
+  }
+
+  rex::X_STATUS CreateDriver(size_t, rex::thread::Semaphore*, rex::audio::AudioDriver** out_driver) override {
+    *out_driver = new SilentAudioDriver(memory());
+    return X_STATUS_SUCCESS;
+  }
+
+  void DestroyDriver(rex::audio::AudioDriver* driver) override { delete driver; }
+};
+
 static uint32_t WebDeviceSlot() {
   auto* runtime = rex::Runtime::instance();
   if (!runtime || !runtime->memory()) return 0;
@@ -131,7 +156,7 @@ int main(int argc, char** argv) {
   rex::RuntimeConfig config;
   config.gpu_plugin = "host";
   config.graphics = rex::system::LoadGpuPlugin("host", "any");
-  config.audio_factory = REX_AUDIO_BACKEND(rex::audio::nop::NopAudioSystem);
+  config.audio_factory = REX_AUDIO_BACKEND(SilentAudioSystem);
   config.input_factory = REX_INPUT_BACKEND(rex::input::CreateDefaultInputSystem);
   config.kernel_init = rex::kernel::InitializeKernel;
 

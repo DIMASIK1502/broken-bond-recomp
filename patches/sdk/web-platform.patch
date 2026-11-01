@@ -312,7 +312,7 @@ index 378aa4b..af2c9fb 100644
  namespace rex::thread {
  
 diff --git a/src/core/clock_posix.cpp b/src/core/clock_posix.cpp
-index 00f2382..92806d3 100644
+index 00f2382..290e0ca 100644
 --- a/src/core/clock_posix.cpp
 +++ b/src/core/clock_posix.cpp
 @@ -10,7 +10,7 @@
@@ -324,6 +324,28 @@ index 00f2382..92806d3 100644
  
  #include <sys/time.h>
  
+@@ -25,6 +25,10 @@ uint64_t Clock::host_tick_frequency_platform() {
+   mach_timebase_info_data_t info;
+   mach_timebase_info(&info);
+   return (uint64_t)((1000000000ull * (uint64_t)info.denom) / (uint64_t)info.numer);
++#elif defined(__EMSCRIPTEN__)
++  // A worker's clock_getres(CLOCK_MONOTONIC_RAW) reports 0 ns. Dividing by that
++  // resolution aborts the GPU thread on the second present.
++  return 1000000000ull;
+ #else
+   timespec res;
+   int error = clock_getres(CLOCK_MONOTONIC_RAW, &res);
+@@ -43,6 +47,10 @@ uint64_t Clock::host_tick_count_platform() {
+   // clock_gettime(CLOCK_MONOTONIC_RAW) returns nanoseconds, which would be
+   // inconsistent with the 24 MHz mach frequency and cause ~41x time acceleration.
+   return mach_absolute_time();
++#elif defined(__EMSCRIPTEN__)
++  timespec tp{};
++  clock_gettime(CLOCK_MONOTONIC, &tp);
++  return tp.tv_nsec + tp.tv_sec * 1000000000ull;
+ #else
+   timespec tp;
+   int error = clock_gettime(CLOCK_MONOTONIC_RAW, &tp);
 diff --git a/src/core/dynlib_posix.cpp b/src/core/dynlib_posix.cpp
 index fcfd6c9..c7df127 100644
 --- a/src/core/dynlib_posix.cpp
