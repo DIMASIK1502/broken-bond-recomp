@@ -38,6 +38,15 @@ int main() {
   CHECK(interp::MatchedShare({0, 2, -1, 1}) == 0.75f);
   CHECK(interp::MatchedShare({}) == 0.0f);
 
+  // Strict keys pair first; the rest pair by the loose key, in order.
+  // prev: strict {S1, S2, S3}, loose {L, L, M}; cur: strict {S2, S9, S8}, loose {L, L, M}.
+  // cur[0] takes prev[1] by its strict key, cur[1] the remaining L (prev[0]),
+  // cur[2] the M (prev[2]).
+  CHECK((interp::MatchDrawsTwoStage({11, 12, 13}, {1, 1, 2}, {12, 19, 18}, {1, 1, 2}) ==
+         std::vector<int32_t>{1, 0, 2}));
+  // A prev draw taken by its strict key is not paired again by the loose one.
+  CHECK((interp::MatchDrawsTwoStage({11, 12}, {1, 1}, {19, 12, 18}, {1, 1, 1}) == std::vector<int32_t>{0, 1, -1}));
+
   float out[2];
   const float lp[2] = {0, 10}, lc[2] = {2, 20};
   interp::LerpFloats(lp, lc, out, 2, 0.5f);
@@ -45,6 +54,20 @@ int main() {
   const float np[1] = {nan}, nc[1] = {3};
   interp::LerpFloats(np, nc, out, 1, 0.5f);
   CHECK(out[0] == 3.0f);
+
+  // Values that jump by more than half their size (at least 1) in a step
+  // take this frame's value: a wrapping UV offset (0.98 -> 0.02), a 0/1
+  // switch. Smooth changes still blend.
+  {
+    const float sp[4] = {0.98f, 0.0f, 0.30f, 100.0f}, sc[4] = {0.02f, 1.0f, 0.40f, 110.0f};
+    float so[4];
+    const size_t snapped = interp::LerpFloatsSnap(sp, sc, so, 4, 0.5f, 0.5f);
+    CHECK(so[0] == 0.02f);
+    CHECK(so[1] == 1.0f);
+    CHECK(std::fabs(so[2] - 0.35f) < 1e-6f);
+    CHECK(so[3] == 105.0f);
+    CHECK(snapped == 2);
+  }
 
   uint16_t half_out[1];
   const uint16_t hp[1] = {0x3C00}, hc[1] = {0x4000};  // 1.0, 2.0

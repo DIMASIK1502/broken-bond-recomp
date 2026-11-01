@@ -19,11 +19,25 @@ uint64_t DrawKey(uint64_t vs_key, uint64_t ps_key, const uint32_t* stream_addres
 // draw with a key in `cur` pairs with the k-th draw with that key in `prev`.
 std::vector<int32_t> MatchDraws(const std::vector<uint64_t>& prev, const std::vector<uint64_t>& cur);
 
+// Pairs by `strict` keys first, as MatchDraws; draws left over on both
+// sides then pair by `loose` keys, in order. Same-looking draws that differ
+// in what the strict key holds (textures, index ranges) keep their own pair.
+std::vector<int32_t> MatchDrawsTwoStage(const std::vector<uint64_t>& prev_strict,
+                                        const std::vector<uint64_t>& prev_loose,
+                                        const std::vector<uint64_t>& cur_strict,
+                                        const std::vector<uint64_t>& cur_loose);
+
 // Share of draws that have a pair; 0 for no draws.
 float MatchedShare(const std::vector<int32_t>& match);
 
 // out = prev + (cur - prev) * t. A non-finite value on either side gives cur.
 void LerpFloats(const float* prev, const float* cur, float* out, size_t count, float t);
+
+// As LerpFloats, except that a value which moved by more than
+// jump * max(1, |prev|, |cur|) takes cur: such a change in one step is a
+// wrap (a UV offset going 0.98 -> 0.02) or a switch, not motion, and its
+// halfway value is wrong. Returns how many values took cur that way.
+size_t LerpFloatsSnap(const float* prev, const float* cur, float* out, size_t count, float t, float jump);
 
 // The same for IEEE half floats.
 void LerpHalfs(const uint16_t* prev, const uint16_t* cur, uint16_t* out, size_t count, float t);
