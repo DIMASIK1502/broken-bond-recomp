@@ -64,14 +64,15 @@
   canvasElement.width = Math.round(canvasElement.clientWidth * devicePixelRatio);
   canvasElement.height = Math.round(canvasElement.clientHeight * devicePixelRatio);
   window.brokenBond = { started: performance.now(), exitCode: null, shaderErrors: [], frames: 0, fpsTime: 0 };
-  window.brokenBond.noteFrame = () => {
+  window.brokenBond.noteFrame = (draws) => {
     const now = performance.now();
     const state = window.brokenBond;
+    state.lastDraws = draws;
     state.frames += 1;
     if (state.fpsTime === 0) state.fpsTime = now;
     const elapsed = now - state.fpsTime;
     if (elapsed < 500) return;
-    document.getElementById('fps').textContent = `${(state.frames * 1000 / elapsed).toFixed(0)} fps`;
+    document.getElementById('fps').textContent = `${(state.frames * 1000 / elapsed).toFixed(0)} fps, ${state.lastDraws || 0} draws`;
     state.frames = 0;
     state.fpsTime = now;
   };

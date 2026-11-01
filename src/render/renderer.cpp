@@ -776,6 +776,102 @@ uint32_t HostSwizzle(uint32_t swizzle, xenos::TextureFormat format) {
   return out;
 }
 
+#if defined(__EMSCRIPTEN__)
+// WebGPU samples a one-channel texture as (r, 0, 0, 1) and cannot swizzle the
+// view. A building lightmap is that one channel, and the shader reads it from
+// whichever output the fetch named, so the walls multiply by zero.
+uint32_t FormatComponents(xenos::TextureFormat format) {
+  switch (format) {
+    case xenos::TextureFormat::k_8:
+    case xenos::TextureFormat::k_8_A:
+    case xenos::TextureFormat::k_8_B:
+    case xenos::TextureFormat::k_DXT3A:
+    case xenos::TextureFormat::k_DXT5A:
+    case xenos::TextureFormat::k_16:
+    case xenos::TextureFormat::k_16_EXPAND:
+    case xenos::TextureFormat::k_16_FLOAT:
+    case xenos::TextureFormat::k_32_FLOAT:
+      return 1;
+    case xenos::TextureFormat::k_8_8:
+    case xenos::TextureFormat::k_DXN:
+    case xenos::TextureFormat::k_16_16:
+    case xenos::TextureFormat::k_16_16_EXPAND:
+    case xenos::TextureFormat::k_16_16_FLOAT:
+    case xenos::TextureFormat::k_32_32_FLOAT:
+      return 2;
+    default:
+      return 4;
+  }
+}
+
+bool WebSamplesMatch(xenos::TextureFormat format, uint32_t swizzle) {
+  const uint32_t components = FormatComponents(format);
+  const uint32_t host = HostSwizzle(swizzle, format);
+  const uint32_t native[4] = {0u, components > 1 ? 1u : 4u, components > 2 ? 2u : 4u,
+                              components > 3 ? 3u : 5u};
+  for (uint32_t c = 0; c < 4; ++c) {
+    if (((host >> (3 * c)) & 7u) != native[c]) return false;
+  }
+  return true;
+}
+
+// Rewrites the base level as RGBA8 with the fetch swizzle already applied.
+// False when WebGPU already samples it the way the shader reads it.
+bool BakeWebSwizzle(uint32_t format, uint32_t swizzle, uint32_t width, uint32_t height,
+                    gfx::LinearTexture& linear) {
+  const auto xenos_format = static_cast<xenos::TextureFormat>(format);
+  if (WebSamplesMatch(xenos_format, swizzle)) return false;
+  const uint32_t host = HostSwizzle(swizzle, xenos_format);
+  std::vector<uint8_t> raw;
+  const uint32_t components = FormatComponents(xenos_format);
+  const bool compressed = linear.block_width == 4 &&
+                          (xenos_format == xenos::TextureFormat::k_DXT1 ||
+                           xenos_format == xenos::TextureFormat::k_DXT4_5 ||
+                           xenos_format == xenos::TextureFormat::k_DXT5A);
+  const bool bytes8 = linear.block_width == 1 && linear.block_height == 1 &&
+                      ((components == 1 && linear.block_bytes == 1) ||
+                       (components == 2 && linear.block_bytes == 2) ||
+                       (components == 4 && linear.block_bytes == 4));
+  if (compressed) {
+    if (!gfx::DecodeLinearToRgba8(format, width, height, linear, raw)) return false;
+  } else if (bytes8) {
+    raw.assign(size_t(width) * height * 4u, 0);
+    for (uint32_t y = 0; y < height && y < linear.height_blocks; ++y) {
+      for (uint32_t x = 0; x < width && x < linear.width_blocks; ++x) {
+        const uint8_t* texel =
+            linear.blocks.data() + (size_t(y) * linear.width_blocks + x) * linear.block_bytes;
+        uint8_t* dst = raw.data() + (size_t(y) * width + x) * 4u;
+        dst[0] = texel[0];
+        if (linear.block_bytes >= 2) dst[1] = texel[1];
+        if (linear.block_bytes == 4) {
+          dst[2] = texel[2];
+          dst[3] = texel[3];
+        }
+      }
+    }
+  } else {
+    return false;
+  }
+  const size_t texels = size_t(width) * height;
+  std::vector<uint8_t> baked(texels * 4u, 0);
+  for (size_t i = 0; i < texels; ++i) {
+    const uint8_t* src = raw.data() + size_t(i) * 4u;
+    uint8_t* dst = baked.data() + size_t(i) * 4u;
+    for (uint32_t c = 0; c < 4; ++c) {
+      const uint32_t pick = (host >> (3 * c)) & 7u;
+      dst[c] = pick < 4 ? src[pick] : (pick == 5 ? 255 : 0);
+    }
+  }
+  linear.blocks = std::move(baked);
+  linear.block_width = 1;
+  linear.block_height = 1;
+  linear.block_bytes = 4;
+  linear.width_blocks = width;
+  linear.height_blocks = height;
+  return true;
+}
+#endif
+
 // A resolve leaves 8:8:8:8 and 2:10:10:10 pixels in guest memory in D3D's
 // ARGB order, which a fetch reads as BGRA, and the game's fetch swizzle
 // (zyxw) turns back into RGBA. The host copy of a resolve keeps the target's
@@ -877,6 +973,7 @@ struct Renderer::State {
     std::unique_ptr<plume::RenderTexture> msaa;
     uint32_t msaa_samples = 0;
     bool msaa_newer = false;
+    bool visible = false;  // color was drawn and not cleared over the whole target
     uint32_t guest_width = 0;
     uint32_t guest_height = 0;
     uint32_t width = 0;  // host pixels
@@ -944,6 +1041,16 @@ struct Renderer::State {
   };
   std::unordered_map<uint64_t, Texture> textures;
   uint32_t next_texture2d = 1;  // 0 is white in every heap
+  // A draw pins the slots it samples. The next draw may reuse one, and the bind is
+  // recorded before that draw, so the earlier draw still samples its own texture.
+  uint32_t texture_draw = 0;
+  uint64_t texture_bind = 0;
+  uint64_t texture1d_bind = 0;
+  std::array<uint32_t, kTexture2DCount> texture_pin{};
+  std::array<uint64_t, kTexture2DCount> texture_stamp{};
+  std::array<Texture*, kTexture2DCount> texture_slot{};
+  std::array<uint32_t, kTexture1DCount> texture1d_pin{};
+  std::array<uint64_t, kTexture1DCount> texture1d_stamp{};
   // 1D textures hold per-draw data the CPU rewrites every frame (skinned
   // meshes fetch their bone matrices from one), so they live in a pool that
   // is refilled each frame: slot i is heap index i + 1, and the same texels
@@ -1453,6 +1560,7 @@ fn PSMain(in: VsOut) -> @location(0) vec4f {
   std::mutex mutex;  // Draw and Present run on the guest thread, TakeStats on the sampler
   std::map<std::string, uint64_t> skipped;
   uint64_t drawn = 0;
+  uint32_t frame_draws = 0;
   double ms_pipeline = 0, ms_texture = 0, ms_stream = 0, ms_submit = 0;
   // Wall time inside each entry point, for the 5 s stats.
   double ms_draw = 0, ms_clear = 0, ms_resolve = 0, ms_present = 0;
@@ -1837,10 +1945,43 @@ fn PSMain(in: VsOut) -> @location(0) vec4f {
     }
     const uint8_t* guest = At(base, PhysicalView(fetch.base_address << 12));
     const uint64_t frame_key = ImageKey(words) * 0x9E3779B97F4A7C15ull ^ XXH3_64bits(guest, bytes);
-    if (auto found = texture1d_frame.find(frame_key); found != texture1d_frame.end()) return found->second;
+    if (auto found = texture1d_frame.find(frame_key); found != texture1d_frame.end()) {
+      const uint32_t slot = found->second - 1;
+      if (slot < kTexture1DCount) {
+        texture1d_pin[slot] = texture_draw;
+        texture1d_stamp[slot] = ++texture1d_bind;
+      }
+      return found->second;
+    }
+    bool reuse_slot = false;
     if (next_texture1d + 1 >= texture1d_end) {
-      Skip("1d texture pool full");
-      return 0;
+      uint32_t reuse = texture1d_begin;
+      bool have = false;
+      uint64_t oldest = ~uint64_t(0);
+      for (uint32_t i = texture1d_begin; i + 1 < texture1d_end; ++i) {
+        if (texture1d_pin[i] == texture_draw) continue;
+        if (texture1d_stamp[i] < oldest) {
+          oldest = texture1d_stamp[i];
+          reuse = i;
+          have = true;
+        }
+      }
+      if (!have) {
+        Skip("1d texture pool full");
+        return 0;
+      }
+      const uint32_t old_index = reuse + 1;
+      for (auto it = texture1d_frame.begin(); it != texture1d_frame.end();) {
+        if (it->second == old_index) it = texture1d_frame.erase(it);
+        else ++it;
+      }
+      next_texture1d = reuse;
+      reuse_slot = true;
+      static bool logged = false;
+      if (!logged) {
+        logged = true;
+        REXLOG_INFO("native: 1D texture pool is full, later draws reuse its slots");
+      }
     }
     gfx::LinearTexture linear;
     std::string reason;
@@ -1879,6 +2020,12 @@ fn PSMain(in: VsOut) -> @location(0) vec4f {
     const uint32_t index = FillTexture1DSlot(width, host, HostSwizzle(fetch.swizzle, fetch.format), offset,
                                              uint32_t(row * linear.height_blocks), row_texels,
                                              cpu.empty() ? nullptr : cpu.data());
+    if (index > 0 && index - 1 < kTexture1DCount) {
+      texture1d_pin[index - 1] = texture_draw;
+      texture1d_stamp[index - 1] = ++texture1d_bind;
+    }
+    // Stay full, so the next texture reuses a slot instead of overwriting the one after this.
+    if (reuse_slot) next_texture1d = texture1d_end - 1;
     texture1d_frame[frame_key] = index;
     uploaded = true;
     return index;
@@ -2017,6 +2164,73 @@ fn PSMain(in: VsOut) -> @location(0) vec4f {
     return texture.index;
   }
 
+  void AdvanceTextureDraw() {
+    ++texture_draw;
+    if (texture_draw == 0 || texture_draw == ~uint32_t(0)) texture_draw = 1;
+  }
+
+  // Puts the texture in a sampled slot. Slot 0 stays the white default. A slot
+  // pinned by this draw, or held for the whole frame, is not reused.
+  uint32_t BindTexture2D(Texture& texture) {
+    if (!texture.texture) return 0;
+    if (texture.index != 0 && texture.index < kTexture2DCount && texture_slot[texture.index] == &texture) {
+      texture_stamp[texture.index] = ++texture_bind;
+      if (texture_pin[texture.index] != ~uint32_t(0)) texture_pin[texture.index] = texture_draw;
+      return texture.index;
+    }
+    uint32_t slot = 0;
+    if (next_texture2d < kTexture2DCount) {
+      slot = next_texture2d++;
+    } else {
+      static bool logged = false;
+      if (!logged) {
+        logged = true;
+        REXLOG_INFO("native: 2D texture heap is full, later draws reuse its slots");
+      }
+      uint64_t oldest = ~uint64_t(0);
+      for (uint32_t i = 1; i < kTexture2DCount; ++i) {
+        if (texture_pin[i] == texture_draw || texture_pin[i] == ~uint32_t(0)) continue;
+        if (texture_stamp[i] < oldest) {
+          oldest = texture_stamp[i];
+          slot = i;
+        }
+      }
+    }
+    if (slot == 0) return 0;
+    if (Texture* owner = texture_slot[slot]) owner->index = 0;
+    texture.index = slot;
+    texture_slot[slot] = &texture;
+    texture_stamp[slot] = ++texture_bind;
+    texture_pin[slot] = texture_draw;
+    SetTexture(0, slot, texture.texture.get(), plume::RenderTextureLayout::SHADER_READ, texture.view.get());
+    return slot;
+  }
+
+  // A slot nothing may reuse: the depth copy reads it by the index written once.
+  uint32_t TakePinnedSlot() {
+    uint32_t slot = 0;
+    if (next_texture2d < kTexture2DCount) {
+      slot = next_texture2d++;
+    } else {
+      uint64_t oldest = ~uint64_t(0);
+      for (uint32_t i = 1; i < kTexture2DCount; ++i) {
+        if (texture_pin[i] == texture_draw || texture_pin[i] == ~uint32_t(0)) continue;
+        if (texture_stamp[i] < oldest) {
+          oldest = texture_stamp[i];
+          slot = i;
+        }
+      }
+    }
+    if (slot == 0) return 0;
+    if (Texture* owner = texture_slot[slot]) {
+      owner->index = 0;
+      texture_slot[slot] = nullptr;
+    }
+    texture_pin[slot] = ~uint32_t(0);
+    texture_stamp[slot] = ~uint64_t(0);
+    return slot;
+  }
+
   // Texture index in the 2D heap for one fetch constant, 0 (white) when the
   // format is not handled yet. Texels are uploaded untiled and endian-swapped
   // but otherwise as the guest stores them; the fetch swizzle becomes the
@@ -2032,17 +2246,17 @@ fn PSMain(in: VsOut) -> @location(0) vec4f {
       if (resolved != textures.end() &&
           (at->second.checked == presents || at->second.guest == GuestPageHash(base, physical))) {
         at->second.checked = presents;
-        return resolved->second.index;
+        return BindTexture2D(resolved->second);
       }
       resolved_at.erase(at);
     }
     const uint64_t key = ImageKey(words);
     auto found = textures.find(key);
     if (found != textures.end() && (found->second.resolved || found->second.checked == presents)) {
-      return found->second.index;
+      return BindTexture2D(found->second);
     }
     const uint32_t format = uint32_t(fetch.format);
-    const plume::RenderFormat host = HostTextureFormat(format);
+    plume::RenderFormat host = HostTextureFormat(format);
     if (host == plume::RenderFormat::UNKNOWN) {
       Skip(fmt::format("texture format {}", format));
       return 0;
@@ -2061,11 +2275,9 @@ fn PSMain(in: VsOut) -> @location(0) vec4f {
       found->second.checked = presents;
       if (Unchanged(found->second, guest, bytes, content, sample)) {
         found->second.sample = sample;
-        return found->second.index;
+        return BindTexture2D(found->second);
       }
       ++reuploads;
-    } else if (next_texture2d >= kTexture2DCount) {
-      return 0;
     } else {
       sample = SampleHash(guest, bytes);
       content = bytes <= 16384 ? sample : XXH3_64bits(guest, bytes);
@@ -2075,8 +2287,18 @@ fn PSMain(in: VsOut) -> @location(0) vec4f {
     if (!gfx::LoadGuestTextureBase(format, width, height, pitch, uint32_t(fetch.endianness), fetch.tiled,
                                    fetch.packed_mips, guest, bytes, linear, reason)) {
       Skip("texture layout");
-      return found != textures.end() ? found->second.index : 0;
+      return found != textures.end() ? BindTexture2D(found->second) : 0;
     }
+#if defined(__EMSCRIPTEN__)
+    if (BakeWebSwizzle(format, uint32_t(fetch.swizzle), width, height, linear)) {
+      host = plume::RenderFormat::R8G8B8A8_UNORM;
+      static bool logged = false;
+      if (!logged) {
+        logged = true;
+        REXLOG_INFO("native: one-channel textures are expanded so every channel samples them");
+      }
+    }
+#endif
     const size_t row_bytes = size_t(linear.width_blocks) * linear.block_bytes;
     const size_t row = (row_bytes + 255) & ~size_t(255);
     bool dump_texture = false;
@@ -2096,7 +2318,7 @@ fn PSMain(in: VsOut) -> @location(0) vec4f {
     uint64_t offset = 0;
     if (!Upload(row * linear.height_blocks, 512, offset)) {
       Skip("upload ring full");
-      return found != textures.end() ? found->second.index : 0;
+      return found != textures.end() ? BindTexture2D(found->second) : 0;
     }
     for (uint32_t y = 0; y < linear.height_blocks; ++y) {
       std::memcpy(upload_cpu + offset + y * row, linear.blocks.data() + y * row_bytes, row_bytes);
@@ -2105,9 +2327,12 @@ fn PSMain(in: VsOut) -> @location(0) vec4f {
       Texture texture;
       texture.texture = device->createTexture(plume::RenderTextureDesc::Texture2D(width, height, 1, host));
       plume::RenderTextureViewDesc view = plume::RenderTextureViewDesc::Texture2D(host);
-      view.componentMapping = ComponentMapping(HostSwizzle(fetch.swizzle, fetch.format));
+      // Baked texels already carry the fetch swizzle. WebGPU would ignore it on the view.
+      view.componentMapping = ComponentMapping(host == plume::RenderFormat::R8G8B8A8_UNORM &&
+                                                       format != uint32_t(xenos::TextureFormat::k_8_8_8_8)
+                                                   ? 0x688u
+                                                   : HostSwizzle(fetch.swizzle, fetch.format));
       texture.view = texture.texture->createTextureView(view);
-      texture.index = next_texture2d++;
       found = textures.emplace(key, std::move(texture)).first;
     }
     Texture& texture = found->second;
@@ -2123,10 +2348,8 @@ fn PSMain(in: VsOut) -> @location(0) vec4f {
                                                           offset));
     commands->barriers(plume::RenderBarrierStage::GRAPHICS,
                        plume::RenderTextureBarrier(texture.texture.get(), plume::RenderTextureLayout::SHADER_READ));
-    SetTexture(0, texture.index, texture.texture.get(), plume::RenderTextureLayout::SHADER_READ,
-                        texture.view.get());
     uploaded = true;
-    return texture.index;
+    return BindTexture2D(texture);
   }
 
   // Draws texture `source_index` of the 2D heap into swap chain image
@@ -2501,8 +2724,8 @@ fn PSMain(in: VsOut) -> @location(0) vec4f {
       held.view = held.texture->createTextureView(view);
       held.view_swizzle = front.view_swizzle;
       if (held.index == 0) {
-        if (next_texture2d >= kTexture2DCount) return false;
-        held.index = next_texture2d++;
+        if (BindTexture2D(held) == 0) return false;
+        texture_pin[held.index] = ~uint32_t(0);
       }
       held.width = front.width;
       held.height = front.height;
@@ -2703,11 +2926,19 @@ fn PSMain(in: VsOut) -> @location(0) vec4f {
     } else {
       commands->drawInstanced(op.vertex_count, 1, 0, 0);
     }
+    if (current && current->color) current->color->visible = true;
+    ++frame_draws;
   }
 
   void ExecuteClear(const ClearOp& op) {
     UseTarget(*op.target);
-    if (op.flags & 0xF) commands->clearColor(0, op.color, &op.rect, 1);
+    if (op.flags & 0xF) {
+      commands->clearColor(0, op.color, &op.rect, 1);
+      if (current && current->color && op.rect.left <= 0 && op.rect.top <= 0 &&
+          op.rect.right >= int32_t(target_width) && op.rect.bottom >= int32_t(target_height)) {
+        current->color->visible = false;
+      }
+    }
     if (op.flags & 0x30) {
       commands->clearDepthStencil((op.flags & 0x10) != 0, (op.flags & 0x20) != 0, std::clamp(op.z, 0.0f, 1.0f),
                                   op.stencil & 0xFF, &op.rect, 1);
@@ -2780,7 +3011,13 @@ fn PSMain(in: VsOut) -> @location(0) vec4f {
                           entry.view.get());
     }
     BindTarget();
-    if (!keep_picture && (op.clear_flags & 0x100)) commands->clearColor(0, op.clear_color, &op.clear_region, 1);
+    if (!keep_picture && (op.clear_flags & 0x100)) {
+      commands->clearColor(0, op.clear_color, &op.clear_region, 1);
+      if (current && current->color && op.clear_region.left <= 0 && op.clear_region.top <= 0 &&
+          op.clear_region.right >= int32_t(target_width) && op.clear_region.bottom >= int32_t(target_height)) {
+        current->color->visible = false;
+      }
+    }
     if (!keep_picture && (op.clear_flags & 0x200)) {
       commands->clearDepthStencil(true, true, std::clamp(op.z, 0.0f, 1.0f), 0, &op.clear_region, 1);
     }
@@ -3400,6 +3637,7 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
   }
 
   s.Lap(10);
+  s.AdvanceTextureDraw();
   // Shared constants are built in local memory and copied once.
   alignas(16) uint8_t shared_cpu[gfx::kSharedConstantsBytes] = {};
   auto* indices = reinterpret_cast<uint32_t*>(shared_cpu);
@@ -3574,6 +3812,7 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
     op.count = draw.count;
   }
   s.ExecuteDraw(op);
+  s.AdvanceTextureDraw();
   s.Record(op);
   s.Lap(5);
   if (s.Dumping()) {
@@ -3787,10 +4026,7 @@ void Renderer::Resolve(uint32_t device, uint32_t flags, uint32_t rect, uint32_t 
       framebuffer.colorAttachments = &attachment;
       framebuffer.colorAttachmentsCount = 1;
       entry.framebuffer = s.device->createFramebuffer(framebuffer);
-      if (entry.index == 0) {
-        if (s.next_texture2d >= kTexture2DCount) return;
-        entry.index = s.next_texture2d++;
-      }
+      if (entry.index == 0 && s.BindTexture2D(entry) == 0) return;
       entry.resolved = true;
       entry.format = kDepthCopyFormat;
       entry.width = width;
@@ -3801,8 +4037,8 @@ void Renderer::Resolve(uint32_t device, uint32_t flags, uint32_t rect, uint32_t 
       depth_image->depth_view = s.depth->createTextureView(plume::RenderTextureViewDesc::Texture2D(kDepthFormat));
       depth_image->depth_view_of = s.depth;
       if (depth_image->depth_index == 0) {
-        if (s.next_texture2d >= kTexture2DCount) return;
-        depth_image->depth_index = s.next_texture2d++;
+        depth_image->depth_index = s.TakePinnedSlot();
+        if (depth_image->depth_index == 0) return;
       }
     }
     plume::RenderRect src(0, 0, int32_t(s.target_width), int32_t(s.target_height));
@@ -3871,10 +4107,7 @@ void Renderer::Resolve(uint32_t device, uint32_t flags, uint32_t rect, uint32_t 
       entry.view_swizzle = ResolvedSwizzle(fetch.swizzle, fetch.format);
       view.componentMapping = ComponentMapping(entry.view_swizzle);
       entry.view = entry.texture->createTextureView(view);
-      if (entry.index == 0) {
-        if (s.next_texture2d >= kTexture2DCount) return;
-        entry.index = s.next_texture2d++;
-      }
+      if (entry.index == 0 && s.BindTexture2D(entry) == 0) return;
       entry.resolved = true;
       entry.format = kColorFormat;
       entry.width = width;
@@ -3953,7 +4186,10 @@ void Renderer::Present(uint32_t frontbuffer, const uint8_t* base) {
                               found->second.height == s.height;
 #if defined(__EMSCRIPTEN__)
     // An allocated frontbuffer is not a picture until a resolve has written it.
-    const bool show_front = window_sized && found->second.copied;
+    // The copy can be from before this frame's draws. While the color target
+    // still holds them, that is the menu, not the older copy.
+    const bool live = s.current && s.current->color && s.current->color->visible;
+    const bool show_front = window_sized && found->second.copied && !live;
 #else
     const bool show_front = found != s.textures.end() && found->second.resolved &&
                             (s.present_pipeline || window_sized);
@@ -4145,7 +4381,9 @@ void Renderer::Present(uint32_t frontbuffer, const uint8_t* base) {
   }
   ++s.presents;
 #if defined(__EMSCRIPTEN__)
-  MAIN_THREAD_ASYNC_EM_ASM({ if (window.brokenBond && window.brokenBond.noteFrame) window.brokenBond.noteFrame(); });
+  MAIN_THREAD_ASYNC_EM_ASM({ if (window.brokenBond && window.brokenBond.noteFrame) window.brokenBond.noteFrame($0); },
+                           s.frame_draws);
+  s.frame_draws = 0;
 #endif
 #if defined(_WIN32)
   // F9 (on its press) dumps the next frame.

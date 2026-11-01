@@ -1,5 +1,5 @@
 diff --git a/plume_device_thread.cpp b/plume_device_thread.cpp
-index 3b226b3..9ac4d9d 100644
+index 3b226b3..e92a5f0 100644
 --- a/plume_device_thread.cpp
 +++ b/plume_device_thread.cpp
 @@ -284,6 +284,8 @@ namespace plume {
@@ -45,6 +45,76 @@ index 3b226b3..9ac4d9d 100644
              RenderBuffer *buffer = inner;
              const bool ranged = (writtenRange != nullptr);
              const RenderRange range = ranged ? *writtenRange : RenderRange();
+@@ -716,6 +737,12 @@ namespace plume {
+         }
+     };
+ 
++    // The command list currently being recorded on this thread. A descriptor write made while it is open is replayed
++    // in order with the draws, so a later draw can reuse a binding slot without changing what an earlier draw sampled.
++    struct DTCommandList;
++    static thread_local DTCommandList *recordingCommandList = nullptr;
++    static bool recordBindingWrite(std::function<void()> write);
++
+     struct DTDescriptorSet : RenderDescriptorSet {
+         DeviceThread *thread = nullptr;
+         RenderDescriptorSet *inner = nullptr;
+@@ -736,9 +763,14 @@ namespace plume {
+             const DTTexture *wrapper = static_cast<const DTTexture *>(texture);
+             std::shared_ptr<DTTextureSlot> slot = ((wrapper != nullptr) && !wrapper->isMade()) ? wrapper->slot : nullptr;
+             RenderTexture *innerTexture = (slot == nullptr) ? unwrap(texture) : nullptr;
+-            thread->runAsync([set = inner, descriptorIndex, slot = std::move(slot), innerTexture, textureLayout, innerView = unwrap(textureView)]() {
++            std::function<void()> write = [set = inner, descriptorIndex, slot = std::move(slot), innerTexture, textureLayout, innerView = unwrap(textureView)]() {
+                 set->setTexture(descriptorIndex, (slot != nullptr) ? slot->texture : innerTexture, textureLayout, innerView);
+-            });
++            };
++            // Applied as the list replays, immediately before the draw that follows this write.
++            if (recordBindingWrite(std::move(write))) {
++                return;
++            }
++            thread->runAsync(std::move(write));
+         }
+ 
+         void setSampler(uint32_t descriptorIndex, const RenderSampler *sampler) override {
+@@ -773,6 +805,9 @@ namespace plume {
+ 
+         DTCommandList(DeviceThread *thread, std::unique_ptr<RenderCommandList> inner) : thread(thread), inner(inner.release()) { }
+         ~DTCommandList() override {
++            if (recordingCommandList == this) {
++                recordingCommandList = nullptr;
++            }
+             setCommandListOpen(openSerial, false);
+             destroyAsync(thread, inner);
+         }
+@@ -841,9 +876,13 @@ namespace plume {
+             readbacks.clear();
+             computeLayout = nullptr;
+             graphicsLayout = nullptr;
++            recordingCommandList = this;
+         }
+ 
+         void end() override {
++            if (recordingCommandList == this) {
++                recordingCommandList = nullptr;
++            }
+             recorded = std::move(recording);
+             recording.reset();
+             recordedReadbacks = std::move(readbacks);
+@@ -1035,6 +1074,15 @@ namespace plume {
+         }
+     };
+ 
++    static bool recordBindingWrite(std::function<void()> write) {
++        if ((recordingCommandList == nullptr) || (recordingCommandList->recording == nullptr)) {
++            return false;
++        }
++
++        recordingCommandList->record([write = std::move(write)](RenderCommandList *) { write(); });
++        return true;
++    }
++
+     // DTSwapChain
+ 
+     struct DTSwapChain : RenderSwapChain {
 diff --git a/plume_render_interface.h b/plume_render_interface.h
 index 1764dd9..40c9ea5 100644
 --- a/plume_render_interface.h
