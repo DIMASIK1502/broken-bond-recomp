@@ -3097,6 +3097,9 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
   std::memcpy(shared_cpu + gfx::kSharedAlphaThresholdOffset, &alpha_ref, 4);
   const uint32_t alpha_func = color_control & 7;
   std::memcpy(shared_cpu + gfx::kSharedAlphaFuncOffset, &alpha_func, 4);
+#if defined(__EMSCRIPTEN__)
+  std::memcpy(shared_cpu + gfx::kSharedSpecConstantsOffset, &spec, 4);
+#endif
   std::memcpy(s.upload_cpu + shared, shared_cpu, sizeof(shared_cpu));
   if (REXCVAR_GET(native_interpolate)) {
     s.frame_shared.resize((size_t(cpu_index) + 1) * gfx::kSharedConstantsBytes);

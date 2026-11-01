@@ -1,8 +1,49 @@
+diff --git a/XenosRecomp/dxc_compiler.cpp b/XenosRecomp/dxc_compiler.cpp
+index fcbc43a..1d83950 100644
+--- a/XenosRecomp/dxc_compiler.cpp
++++ b/XenosRecomp/dxc_compiler.cpp
+@@ -1,5 +1,7 @@
+ #include "dxc_compiler.h"
+ 
++#include <cstdlib>
++
+ DxcCompiler::DxcCompiler()
+ {
+     HRESULT hr = DxcCreateInstance(CLSID_DxcCompiler, IID_PPV_ARGS(&dxcCompiler));
+@@ -38,12 +40,18 @@ IDxcBlob* DxcCompiler::compile(const std::string& shaderSource, bool compilePixe
+     args[argCount++] = L"-HV 2021";
+     args[argCount++] = L"-all-resources-bound";
+ 
++    const bool wgsl = std::getenv("BROKEN_BOND_WGSL") != nullptr;
++    if (wgsl)
++        args[argCount++] = L"-DBROKEN_BOND_WGSL";
++
+     if (compileSpirv)
+     {
+         args[argCount++] = L"-spirv";
+         args[argCount++] = L"-fvk-use-dx-layout";
+ 
+-        if (!compilePixelShader)
++        // WebGPU clip space matches D3D. naga keeps it with --keep-coordinate-space,
++        // so the browser cache must not invert y here.
++        if (!compilePixelShader && !wgsl)
+             args[argCount++] = L"-fvk-invert-y";
+     }
+     else
 diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
-index 698a418..94669d6 100644
+index 698a418..1032949 100644
 --- a/XenosRecomp/shader_recompiler.cpp
 +++ b/XenosRecomp/shader_recompiler.cpp
-@@ -74,7 +74,9 @@ struct DeclUsageLocation
+@@ -1,6 +1,8 @@
+ #include "shader_recompiler.h"
+ #include "shader_common.h"
+ 
++#include <cstdlib>
++
+ static constexpr char SWIZZLES[] = 
+ { 
+     'x',
+@@ -74,7 +76,9 @@ struct DeclUsageLocation
      uint32_t location;
  };
  
@@ -13,7 +54,7 @@ index 698a418..94669d6 100644
  static constexpr DeclUsageLocation USAGE_LOCATIONS[] =
  {
      { DeclUsage::Position, 0, 0 },
-@@ -85,14 +87,13 @@ static constexpr DeclUsageLocation USAGE_LOCATIONS[] =
+@@ -85,14 +89,13 @@ static constexpr DeclUsageLocation USAGE_LOCATIONS[] =
      { DeclUsage::TexCoord, 1, 5 },
      { DeclUsage::TexCoord, 2, 6 },
      { DeclUsage::TexCoord, 3, 7 },
@@ -35,7 +76,7 @@ index 698a418..94669d6 100644
      { DeclUsage::Position, 1, 15 },
  };
  
-@@ -118,13 +119,6 @@ static constexpr std::pair<DeclUsage, size_t> INTERPOLATORS[] =
+@@ -118,13 +121,6 @@ static constexpr std::pair<DeclUsage, size_t> INTERPOLATORS[] =
      { DeclUsage::Color, 1 }
  };
  
@@ -49,7 +90,7 @@ index 698a418..94669d6 100644
  static FetchDestinationSwizzle getDestSwizzle(uint32_t dstSwizzle, uint32_t index)
  {
      return FetchDestinationSwizzle((dstSwizzle >> (index * 3)) & 0x7);
-@@ -225,7 +219,8 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+@@ -225,7 +221,8 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
  
  void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicubic)
  {
@@ -59,7 +100,7 @@ index 698a418..94669d6 100644
          return;
  
      if (instr.isPredicated)
-@@ -246,6 +241,31 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
+@@ -246,6 +243,31 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
                  out += SWIZZLES[((instr.srcSwizzle >> (i * 2))) & 0x3];
          };
  
@@ -91,7 +132,7 @@ index 698a418..94669d6 100644
      std::string constName;
      const char* constNamePtr = nullptr;
  #ifdef UNLEASHED_RECOMP
-@@ -331,11 +351,19 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
+@@ -331,11 +353,19 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
          out += "Bicubic";
  #endif
  
@@ -112,7 +153,43 @@ index 698a418..94669d6 100644
      case TextureDimension::Texture2D:
          print(", float2({}, {})", instr.offsetX * 0.5f, instr.offsetY * 0.5f);
          break;
-@@ -1171,15 +1199,6 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1154,13 +1184,31 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+             {
+                 uint32_t tailCount = (isPixelShader ? 224 : 256) - constantInfo->registerIndex;
+ 
+-                println("#define {}(INDEX) select((INDEX) < {}, vk::RawBufferLoad<float4>(g_PushConstants.{}ShaderConstants + ({} + min(INDEX, {})) * 16, 0x10), 0.0)",
+-                    constantName, tailCount, shaderName, constantInfo->registerIndex.get(), tailCount - 1);
++                // BROKEN_BOND_WGSL: the push-constant word is a byte offset into
++                // the upload ring. The PC path keeps the GPU virtual address.
++                if (std::getenv("BROKEN_BOND_WGSL") != nullptr)
++                {
++                    println("#define {}(INDEX) select((INDEX) < {}, asfloat(g_Upload.Load4(uint(g_PushConstants.{}ShaderConstants) + ({} + min(INDEX, {})) * 16)), 0.0)",
++                        constantName, tailCount, shaderName, constantInfo->registerIndex.get(), tailCount - 1);
++                }
++                else
++                {
++                    println("#define {}(INDEX) select((INDEX) < {}, vk::RawBufferLoad<float4>(g_PushConstants.{}ShaderConstants + ({} + min(INDEX, {})) * 16, 0x10), 0.0)",
++                        constantName, tailCount, shaderName, constantInfo->registerIndex.get(), tailCount - 1);
++                }
+             }
+             else
+             {
+-                println("#define {} vk::RawBufferLoad<float4>(g_PushConstants.{}ShaderConstants + {}, 0x10)",
+-                    constantName, shaderName, constantInfo->registerIndex * 16);
++                if (std::getenv("BROKEN_BOND_WGSL") != nullptr)
++                {
++                    println("#define {} asfloat(g_Upload.Load4(uint(g_PushConstants.{}ShaderConstants) + {}))",
++                        constantName, shaderName, constantInfo->registerIndex * 16);
++                }
++                else
++                {
++                    println("#define {} vk::RawBufferLoad<float4>(g_PushConstants.{}ShaderConstants + {}, 0x10)",
++                        constantName, shaderName, constantInfo->registerIndex * 16);
++                }
+             }
+             
+             for (uint16_t j = 0; j < constantInfo->registerCount; j++)
+@@ -1171,15 +1219,6 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
  
          case RegisterSet::Sampler:
          {
@@ -128,7 +205,7 @@ index 698a418..94669d6 100644
              samplers.emplace(constantInfo->registerIndex, constantName);
              break;
          }
-@@ -1220,27 +1239,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1220,27 +1259,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
  
      out += "cbuffer SharedConstants : register(b2, space4)\n";
      out += "{\n";
@@ -157,7 +234,7 @@ index 698a418..94669d6 100644
      out += "\tDEFINE_SHARED_CONSTANTS();\n";
      out += "};\n\n";
  
-@@ -1804,7 +1803,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1804,7 +1823,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                      out += '{';
  
                      indent();
