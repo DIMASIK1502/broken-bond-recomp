@@ -57,7 +57,7 @@ add_custom_command(TARGET broken_bond POST_BUILD
 
 target_link_options(broken_bond PRIVATE
     -sPROXY_TO_PTHREAD
-    -sPTHREAD_POOL_SIZE=16
+    -sPTHREAD_POOL_SIZE=48
     -sINITIAL_MEMORY=3328MB
     -sMAXIMUM_MEMORY=8GB
     -sALLOW_MEMORY_GROWTH=1
@@ -71,6 +71,11 @@ target_link_options(broken_bond PRIVATE
     -Wl,--error-limit=0
     --shell-file "${_root}/web/shell.html"
     --pre-js "${_root}/web/plume_webgpu_device.js"
+    --emit-symbol-map
+    # wasm-opt -O2 and above overflows its own stack on the recompiled
+    # functions. Last -O wins, so this stays after the build type's -O3 and
+    # skips that pass. The objects are already LLVM-optimized.
+    -O1
 )
 set_target_properties(broken_bond PROPERTIES
     SUFFIX ".html"

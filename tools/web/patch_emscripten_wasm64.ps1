@@ -9,12 +9,17 @@ if (-not $emsdk) {
     exit 1
 }
 
+function Normalize-Newlines([string]$Value) {
+    if ($null -eq $Value) { return $null }
+    return ($Value -replace "`r`n", "`n" -replace "`r", "`n")
+}
+
 function Update-TextFile([string]$Path, [scriptblock]$Edit) {
     if (-not (Test-Path $Path)) {
         Write-Error "Missing $Path. Link once so Emscripten fetches emdawnwebgpu, then build again."
         exit 1
     }
-    $text = [System.IO.File]::ReadAllText($Path)
+    $text = Normalize-Newlines ([System.IO.File]::ReadAllText($Path))
     $next = & $Edit $text
     if ($null -eq $next) {
         Write-Host "already patched $Path"
@@ -26,6 +31,35 @@ function Update-TextFile([string]$Path, [scriptblock]$Edit) {
 }
 
 $emscripten = Join-Path $emsdk "upstream\emscripten"
+
+Update-TextFile (Join-Path $emscripten "src\runtime_pthread.js") {
+    param($text)
+    $old = @'
+    } catch(ex) {
+#if ASSERTIONS
+      err(`worker: onmessage() captured an uncaught exception: ${ex}`);
+      if (ex?.stack) err(ex.stack);
+#endif
+      if (runtimeInitialized) __emscripten_thread_crashed();
+      throw ex;
+    }
+'@
+    $new = @'
+    } catch(ex) {
+      err(`worker: onmessage() captured an uncaught exception: ${ex}`);
+      if (ex && ex.stack) err(ex.stack);
+      if (runtimeInitialized) __emscripten_thread_crashed();
+      throw ex;
+    }
+'@
+    $old = Normalize-Newlines $old
+    $new = Normalize-Newlines $new
+    if ($text.Contains($new.TrimEnd())) { return $null }
+    if (-not $text.Contains($old.TrimEnd())) {
+        throw "runtime_pthread.js worker catch is neither stock nor wasm64"
+    }
+    return $text.Replace($old.TrimEnd(), $new.TrimEnd())
+}
 
 Update-TextFile (Join-Path $emscripten "src\lib\libint53.js") {
     param($text)
@@ -44,6 +78,8 @@ Update-TextFile (Join-Path $emscripten "src\lib\libint53.js") {
     return (num < INT53_MIN || num > INT53_MAX) ? NaN : Number(num);
   },
 '@
+    $old = Normalize-Newlines $old
+    $new = Normalize-Newlines $new
     if ($text.Contains($new.TrimEnd())) { return $null }
     if (-not $text.Contains($old.TrimEnd())) {
         throw "libint53.js has neither the stock bigintToI53Checked nor the wasm64 one"
@@ -71,6 +107,10 @@ Update-TextFile (Join-Path $emscripten "src\lib\libstrings.js") {
     if (typeof ptr == 'bigint') ptr = Number(ptr);
 #if ASSERTIONS
 '@
+    $oldFind = Normalize-Newlines $oldFind
+    $newFind = Normalize-Newlines $newFind
+    $oldUtf = Normalize-Newlines $oldUtf
+    $newUtf = Normalize-Newlines $newUtf
     $changed = $false
     if ($text.Contains($oldFind.TrimEnd())) {
         $text = $text.Replace($oldFind.TrimEnd(), $newFind.TrimEnd())
@@ -158,8 +198,8 @@ Update-TextFile $webgpu {
     )
     $changed = $false
     foreach ($pair in $pairs) {
-        $old = $pair.Old.TrimEnd()
-        $new = $pair.New.TrimEnd()
+        $old = (Normalize-Newlines $pair.Old).TrimEnd()
+        $new = (Normalize-Newlines $pair.New).TrimEnd()
         if ($text.Contains($old)) {
             $text = $text.Replace($old, $new)
             $changed = $true
