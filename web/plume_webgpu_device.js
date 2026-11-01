@@ -32,7 +32,7 @@
     const requiredFeatures = optionalFeatures.filter((feature) => adapter.features.has(feature));
     const raisedLimits = ['maxSampledTexturesPerShaderStage', 'maxSamplersPerShaderStage', 'maxStorageBuffersPerShaderStage',
       'maxStorageTexturesPerShaderStage', 'maxBindingsPerBindGroup', 'maxStorageBufferBindingSize', 'maxBufferSize',
-      'maxTextureDimension2D'];
+      'maxTextureDimension2D', 'maxInterStageShaderVariables'];
     const requiredLimits = {};
     for (const limit of raisedLimits) {
       if (adapter.limits[limit] !== undefined) {

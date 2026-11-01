@@ -1,0 +1,172 @@
+diff --git a/plume_device_thread.cpp b/plume_device_thread.cpp
+index 3b226b3..9ac4d9d 100644
+--- a/plume_device_thread.cpp
++++ b/plume_device_thread.cpp
+@@ -284,6 +284,8 @@ namespace plume {
+         // for one smaller than CopiedUploadMaxSize.
+         static constexpr uint64_t CopiedUploadMaxSize = 16 * 1024 * 1024;
+         std::shared_ptr<uint8_t[]> uploadCopy;
++        // The backend shadow, when this buffer is too big for a private copy. The caller writes it.
++        uint8_t *directMapped = nullptr;
+ 
+         DTBuffer(DeviceThread *thread, std::unique_ptr<RenderBuffer> inner, const RenderBufferDesc &desc) : thread(thread), inner(inner.release()), size(desc.size) {
+             uploadHeap = (desc.heapType == RenderHeapType::UPLOAD) || (desc.heapType == RenderHeapType::GPU_UPLOAD);
+@@ -375,6 +377,7 @@ namespace plume {
+                 });
+ 
+                 if (ready) {
++                    directMapped = static_cast<uint8_t *>(data);
+                     return data;
+                 }
+ 
+@@ -395,7 +398,25 @@ namespace plume {
+             return runSync(thread, [&]() { return inner->isMapReady(); });
+         }
+ 
++        // The caller writes a large upload buffer's backend memory directly, and the next frame
++        // overwrites it before the device thread reaches this submit. Keep a copy of the written
++        // range and upload that copy, not whatever the mapping holds later.
++        void noteMappedWrite(uint64_t begin, uint64_t end) override {
++            if ((directMapped == nullptr) || (end <= begin)) {
++                thread->runAsync([buffer = inner, begin, end]() { buffer->noteMappedWrite(begin, end); });
++                return;
++            }
++            begin &= ~uint64_t(3);
++            end = std::min((end + 3) & ~uint64_t(3), size & ~uint64_t(3));
++            if (end <= begin) return;
++            auto copy = std::make_shared<std::vector<uint8_t>>(directMapped + begin, directMapped + end);
++            thread->runAsync([buffer = inner, begin, copy]() {
++                buffer->replaceMappedRange(begin, copy->data(), copy->size());
++            });
++        }
++
+         void unmap(uint32_t subresource, const RenderRange *writtenRange) override {
++            directMapped = nullptr;
+             RenderBuffer *buffer = inner;
+             const bool ranged = (writtenRange != nullptr);
+             const RenderRange range = ranged ? *writtenRange : RenderRange();
+diff --git a/plume_render_interface.h b/plume_render_interface.h
+index 1764dd9..40c9ea5 100644
+--- a/plume_render_interface.h
++++ b/plume_render_interface.h
+@@ -32,6 +32,14 @@ namespace plume {
+         // (WebGPU's READBACK buffers). A thread other than the device's can wait for it to turn true.
+         virtual bool isMapReady() { return true; }
+ 
++        // Bytes of a buffer that stays mapped, written since the last submit. A backend that
++        // uploads the whole mapping at each submit (WebGPU) sends just this range.
++        virtual void noteMappedWrite(uint64_t begin, uint64_t end) { (void)begin; (void)end; }
++
++        // Replaces [begin, begin + bytes) with these bytes. `begin` and `bytes` are multiples of 4.
++        // Used when the caller's mapping will be overwritten before the next submit reads it.
++        virtual void replaceMappedRange(uint64_t begin, const void *data, uint64_t bytes) { (void)begin; (void)data; (void)bytes; }
++
+         // Concrete implementation shortcuts.
+         inline RenderBufferReference at(uint64_t offset) const {
+             return RenderBufferReference(this, offset);
+diff --git a/plume_webgpu.cpp b/plume_webgpu.cpp
+index 1268982..fa90845 100644
+--- a/plume_webgpu.cpp
++++ b/plume_webgpu.cpp
+@@ -87,7 +87,7 @@ EM_JS(void, plume_webgpu_hold_canvas_size, (const char *selector), {
+ EM_JS(void, plume_webgpu_watch_device, (int32_t *flag), {
+     const device = Module['preinitializedWebGPUDevice'];
+     if (device && device.plumeReplaced) {
+-        device.plumeReplaced.then(() => Atomics.store(HEAP32, flag >> 2, 1));
++        device.plumeReplaced.then(() => Atomics.store(HEAP32, Number(flag) >> 2, 1));
+     }
+ });
+ 
+@@ -510,6 +510,11 @@ namespace plume {
+         shadow.reset();
+     }
+ 
++    void WebGPUBuffer::replaceMappedRange(uint64_t begin, const void *data, uint64_t bytes) {
++        if ((data == nullptr) || (bytes == 0) || (buffer == nullptr)) return;
++        wgpuQueueWriteBuffer(device->queue, buffer, begin, data, bytes);
++    }
++
+     void WebGPUBuffer::flush(uint64_t begin, uint64_t end) {
+         // writeBuffer wants a multiple of 4 bytes at a multiple of 4.
+         begin = begin & ~uint64_t(3);
+@@ -1111,6 +1116,13 @@ namespace plume {
+                 continue;
+             }
+ 
++            // A binding no shader has named yet has no stage. WebGPU rejects a
++            // layout entry with empty visibility, and the next shader that
++            // names it rebuilds this set.
++            if (layoutEntry.visibility == WGPUShaderStage_None) {
++                continue;
++            }
++
+             appendKey(key, 'v', uint64_t(layoutEntry.visibility));
+ 
+             // What the entry binds, for the device's bind group cache: a texture without a view binds its default one, or
+@@ -3052,12 +3064,20 @@ namespace plume {
+     }
+ 
+     void WebGPUCommandList::resolveTextureRegion(const RenderTexture *dstTexture, uint32_t dstX, uint32_t dstY, const RenderTexture *srcTexture, const RenderRect *srcRect, RenderResolveMode resolveMode) {
+-        if ((dstX == 0) && (dstY == 0) && (srcRect == nullptr) && (resolveMode == RenderResolveMode::AVERAGE)) {
++        const RenderTextureDesc &srcDesc = static_cast<const WebGPUTexture *>(srcTexture)->desc;
++        const RenderTextureDesc &dstDesc = static_cast<const WebGPUTexture *>(dstTexture)->desc;
++        // The source has to be the multisampled target and the destination a color target of
++        // the same size. A sampled texture cannot be a resolve target: beginning that pass
++        // invalidates the command buffer and the frame is dropped.
++        const bool sameSize = (srcDesc.width == dstDesc.width) && (srcDesc.height == dstDesc.height);
++        const bool canResolve = (srcDesc.multisampling.sampleCount > 1) &&
++                                ((dstDesc.flags & RenderTextureFlag::RENDER_TARGET) != 0);
++        if ((dstX == 0) && (dstY == 0) && sameSize && canResolve && (resolveMode == RenderResolveMode::AVERAGE)) {
+             resolveTexture(dstTexture, srcTexture);
++            return;
+         }
+-        else {
+-            PLUME_WEBGPU_UNSUPPORTED("resolving part of a texture, or not by averaging, is ignored");
+-        }
++        (void)srcRect;
++        PLUME_WEBGPU_UNSUPPORTED("resolving part of a texture, or not by averaging, is ignored");
+     }
+ 
+     void WebGPUCommandList::buildBottomLevelAS(const RenderAccelerationStructure *dstAccelerationStructure, RenderBufferReference scratchBuffer, const RenderBottomLevelASBuildInfo &buildInfo) {
+@@ -3318,7 +3338,9 @@ namespace plume {
+ 
+     void WebGPUDevice::flushMappedBuffers() {
+         for (WebGPUBuffer *buffer : mappedBuffers) {
+-            buffer->flush(0, buffer->size);
++            if (!buffer->dirty) continue;
++            buffer->flush(buffer->dirtyBegin, buffer->dirtyEnd);
++            buffer->dirty = false;
+         }
+     }
+ 
+diff --git a/plume_webgpu.h b/plume_webgpu.h
+index bf3ffa9..03df41f 100644
+--- a/plume_webgpu.h
++++ b/plume_webgpu.h
+@@ -183,6 +183,26 @@ namespace plume {
+         std::unique_ptr<uint8_t[]> shadow;
+         std::shared_ptr<WebGPUReadback> readback;
+         bool mapped = false;
++        // Bytes written since the last submit. A buffer that stays mapped is flushed on
++        // submit; flushing all of a 256 MiB upload ring every frame stalls the page.
++        bool dirty = false;
++        uint64_t dirtyBegin = 0;
++        uint64_t dirtyEnd = 0;
++
++        void noteWritten(uint64_t begin, uint64_t end) {
++            if (end <= begin) return;
++            if (!dirty) {
++                dirtyBegin = begin;
++                dirtyEnd = end;
++                dirty = true;
++                return;
++            }
++            if (begin < dirtyBegin) dirtyBegin = begin;
++            if (end > dirtyEnd) dirtyEnd = end;
++        }
++
++        void noteMappedWrite(uint64_t begin, uint64_t end) override { noteWritten(begin, end); }
++        void replaceMappedRange(uint64_t begin, const void *data, uint64_t bytes) override;
+ 
+         WebGPUBuffer(WebGPUDevice *device, WebGPUPool *pool, const RenderBufferDesc &desc);
+         ~WebGPUBuffer() override;

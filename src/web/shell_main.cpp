@@ -1,7 +1,9 @@
 #include "broken_bond_init.h"
 #include "web/web_audio.h"
+#include "web/web_draw.h"
 #include "web/web_files.h"
 #include "web/web_input.h"
+#include "web/web_picture.h"
 
 #include <filesystem>
 #include <iostream>
@@ -178,6 +180,10 @@ int main(int argc, char** argv) {
   if (auto* dispatcher = runtime.function_dispatcher()) {
     dispatcher->SetFunction(0x821C1190, WebDeviceSetup);
     dispatcher->SetFunction(0x821C2260, WebDeviceShutdown);
+  }
+
+  if (!broken_bond::web::OpenRenderer()) {
+    broken_bond::web::StartPicture();
   }
 
   auto main_thread = runtime.PrepareModuleLaunch();

@@ -6,4 +6,7 @@ namespace broken_bond::web {
 // frontbuffer onto it when that texture has texels.
 bool StartPicture();
 
+// Drops that swapchain so the native renderer can take #canvas.
+void ReleasePicture();
+
 }  // namespace broken_bond::web

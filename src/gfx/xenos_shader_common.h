@@ -129,24 +129,36 @@ inline constexpr VertexLocation kVertexLocations[] = {
 
 struct PushConstants
 {
-    uint64_t VertexShaderConstants;
-    uint64_t PixelShaderConstants;
-    uint64_t SharedConstants;
+    // Three little-endian uint64 offsets. WGSL has no u64, so each offset is
+    // the low word and the high word is padding. The renderer still writes
+    // three uint64s.
+    uint VertexShaderConstants;
+    uint VertexShaderConstantsHigh;
+    uint PixelShaderConstants;
+    uint PixelShaderConstantsHigh;
+    uint SharedConstants;
+    uint SharedConstantsHigh;
 };
 
 [[vk::push_constant]] ConstantBuffer<PushConstants> g_PushConstants;
 
 ByteAddressBuffer g_Upload : register(t0, space2);
 
-#define UPLOAD_U32(BYTE) g_Upload.Load(uint(BYTE))
-#define DESCRIPTOR_INDEX(KIND, SLOT) UPLOAD_U32(g_PushConstants.SharedConstants + ((KIND) * DESCRIPTOR_SLOT_COUNT + (SLOT)) * 4)
+// Copied from the push constants at the start of main. Using the pointer in a
+// later block makes naga spill it into a local, which WGSL cannot store.
+static uint g_WebVertexBase;
+static uint g_WebPixelBase;
+static uint g_WebSharedBase;
 
-#define g_Booleans                 UPLOAD_U32(g_PushConstants.SharedConstants + 640)
-#define g_SwappedTexcoords         UPLOAD_U32(g_PushConstants.SharedConstants + 644)
-#define g_HalfPixelOffset          asfloat(g_Upload.Load2(uint(g_PushConstants.SharedConstants + 648)))
-#define g_AlphaThreshold           asfloat(UPLOAD_U32(g_PushConstants.SharedConstants + 656))
-#define g_AlphaFunc                UPLOAD_U32(g_PushConstants.SharedConstants + 660)
-#define g_SpecConstants()          UPLOAD_U32(g_PushConstants.SharedConstants + 664)
+#define UPLOAD_U32(BYTE) g_Upload.Load(uint(BYTE))
+#define DESCRIPTOR_INDEX(KIND, SLOT) UPLOAD_U32(g_WebSharedBase + ((KIND) * DESCRIPTOR_SLOT_COUNT + (SLOT)) * 4)
+
+#define g_Booleans                 UPLOAD_U32(g_WebSharedBase + 640)
+#define g_SwappedTexcoords         UPLOAD_U32(g_WebSharedBase + 644)
+#define g_HalfPixelOffset          asfloat(g_Upload.Load2(g_WebSharedBase + 648))
+#define g_AlphaThreshold           asfloat(UPLOAD_U32(g_WebSharedBase + 656))
+#define g_AlphaFunc                UPLOAD_U32(g_WebSharedBase + 660)
+#define g_SpecConstants()          UPLOAD_U32(g_WebSharedBase + 664)
 
 #elif defined(__spirv__)
 
@@ -273,1466 +285,1336 @@ SamplerState g_WebS_13 : register(s13, space1);
 SamplerState g_WebS_14 : register(s14, space1);
 SamplerState g_WebS_15 : register(s15, space1);
 float4 webSample2D(uint textureIndex, uint samplerIndex, float2 texCoord, float2 offset) {
-    switch (textureIndex) {
-        case 0: {
-            uint2 dimensions;
-            g_WebT2D_0.GetDimensions(dimensions.x, dimensions.y);
-            float2 uv = texCoord + offset / dimensions;
-            switch (samplerIndex) {
-                case 0: return g_WebT2D_0.Sample(g_WebS_0, uv);
-                case 1: return g_WebT2D_0.Sample(g_WebS_1, uv);
-                case 2: return g_WebT2D_0.Sample(g_WebS_2, uv);
-                case 3: return g_WebT2D_0.Sample(g_WebS_3, uv);
-                case 4: return g_WebT2D_0.Sample(g_WebS_4, uv);
-                case 5: return g_WebT2D_0.Sample(g_WebS_5, uv);
-                case 6: return g_WebT2D_0.Sample(g_WebS_6, uv);
-                case 7: return g_WebT2D_0.Sample(g_WebS_7, uv);
-                case 8: return g_WebT2D_0.Sample(g_WebS_8, uv);
-                case 9: return g_WebT2D_0.Sample(g_WebS_9, uv);
-                case 10: return g_WebT2D_0.Sample(g_WebS_10, uv);
-                case 11: return g_WebT2D_0.Sample(g_WebS_11, uv);
-                case 12: return g_WebT2D_0.Sample(g_WebS_12, uv);
-                case 13: return g_WebT2D_0.Sample(g_WebS_13, uv);
-                case 14: return g_WebT2D_0.Sample(g_WebS_14, uv);
-                case 15: return g_WebT2D_0.Sample(g_WebS_15, uv);
-                default: return g_WebT2D_0.Sample(g_WebS_0, uv);
-            }
-        }
-        case 1: {
-            uint2 dimensions;
-            g_WebT2D_1.GetDimensions(dimensions.x, dimensions.y);
-            float2 uv = texCoord + offset / dimensions;
-            switch (samplerIndex) {
-                case 0: return g_WebT2D_1.Sample(g_WebS_0, uv);
-                case 1: return g_WebT2D_1.Sample(g_WebS_1, uv);
-                case 2: return g_WebT2D_1.Sample(g_WebS_2, uv);
-                case 3: return g_WebT2D_1.Sample(g_WebS_3, uv);
-                case 4: return g_WebT2D_1.Sample(g_WebS_4, uv);
-                case 5: return g_WebT2D_1.Sample(g_WebS_5, uv);
-                case 6: return g_WebT2D_1.Sample(g_WebS_6, uv);
-                case 7: return g_WebT2D_1.Sample(g_WebS_7, uv);
-                case 8: return g_WebT2D_1.Sample(g_WebS_8, uv);
-                case 9: return g_WebT2D_1.Sample(g_WebS_9, uv);
-                case 10: return g_WebT2D_1.Sample(g_WebS_10, uv);
-                case 11: return g_WebT2D_1.Sample(g_WebS_11, uv);
-                case 12: return g_WebT2D_1.Sample(g_WebS_12, uv);
-                case 13: return g_WebT2D_1.Sample(g_WebS_13, uv);
-                case 14: return g_WebT2D_1.Sample(g_WebS_14, uv);
-                case 15: return g_WebT2D_1.Sample(g_WebS_15, uv);
-                default: return g_WebT2D_1.Sample(g_WebS_0, uv);
-            }
-        }
-        case 2: {
-            uint2 dimensions;
-            g_WebT2D_2.GetDimensions(dimensions.x, dimensions.y);
-            float2 uv = texCoord + offset / dimensions;
-            switch (samplerIndex) {
-                case 0: return g_WebT2D_2.Sample(g_WebS_0, uv);
-                case 1: return g_WebT2D_2.Sample(g_WebS_1, uv);
-                case 2: return g_WebT2D_2.Sample(g_WebS_2, uv);
-                case 3: return g_WebT2D_2.Sample(g_WebS_3, uv);
-                case 4: return g_WebT2D_2.Sample(g_WebS_4, uv);
-                case 5: return g_WebT2D_2.Sample(g_WebS_5, uv);
-                case 6: return g_WebT2D_2.Sample(g_WebS_6, uv);
-                case 7: return g_WebT2D_2.Sample(g_WebS_7, uv);
-                case 8: return g_WebT2D_2.Sample(g_WebS_8, uv);
-                case 9: return g_WebT2D_2.Sample(g_WebS_9, uv);
-                case 10: return g_WebT2D_2.Sample(g_WebS_10, uv);
-                case 11: return g_WebT2D_2.Sample(g_WebS_11, uv);
-                case 12: return g_WebT2D_2.Sample(g_WebS_12, uv);
-                case 13: return g_WebT2D_2.Sample(g_WebS_13, uv);
-                case 14: return g_WebT2D_2.Sample(g_WebS_14, uv);
-                case 15: return g_WebT2D_2.Sample(g_WebS_15, uv);
-                default: return g_WebT2D_2.Sample(g_WebS_0, uv);
-            }
-        }
-        case 3: {
-            uint2 dimensions;
-            g_WebT2D_3.GetDimensions(dimensions.x, dimensions.y);
-            float2 uv = texCoord + offset / dimensions;
-            switch (samplerIndex) {
-                case 0: return g_WebT2D_3.Sample(g_WebS_0, uv);
-                case 1: return g_WebT2D_3.Sample(g_WebS_1, uv);
-                case 2: return g_WebT2D_3.Sample(g_WebS_2, uv);
-                case 3: return g_WebT2D_3.Sample(g_WebS_3, uv);
-                case 4: return g_WebT2D_3.Sample(g_WebS_4, uv);
-                case 5: return g_WebT2D_3.Sample(g_WebS_5, uv);
-                case 6: return g_WebT2D_3.Sample(g_WebS_6, uv);
-                case 7: return g_WebT2D_3.Sample(g_WebS_7, uv);
-                case 8: return g_WebT2D_3.Sample(g_WebS_8, uv);
-                case 9: return g_WebT2D_3.Sample(g_WebS_9, uv);
-                case 10: return g_WebT2D_3.Sample(g_WebS_10, uv);
-                case 11: return g_WebT2D_3.Sample(g_WebS_11, uv);
-                case 12: return g_WebT2D_3.Sample(g_WebS_12, uv);
-                case 13: return g_WebT2D_3.Sample(g_WebS_13, uv);
-                case 14: return g_WebT2D_3.Sample(g_WebS_14, uv);
-                case 15: return g_WebT2D_3.Sample(g_WebS_15, uv);
-                default: return g_WebT2D_3.Sample(g_WebS_0, uv);
-            }
-        }
-        case 4: {
-            uint2 dimensions;
-            g_WebT2D_4.GetDimensions(dimensions.x, dimensions.y);
-            float2 uv = texCoord + offset / dimensions;
-            switch (samplerIndex) {
-                case 0: return g_WebT2D_4.Sample(g_WebS_0, uv);
-                case 1: return g_WebT2D_4.Sample(g_WebS_1, uv);
-                case 2: return g_WebT2D_4.Sample(g_WebS_2, uv);
-                case 3: return g_WebT2D_4.Sample(g_WebS_3, uv);
-                case 4: return g_WebT2D_4.Sample(g_WebS_4, uv);
-                case 5: return g_WebT2D_4.Sample(g_WebS_5, uv);
-                case 6: return g_WebT2D_4.Sample(g_WebS_6, uv);
-                case 7: return g_WebT2D_4.Sample(g_WebS_7, uv);
-                case 8: return g_WebT2D_4.Sample(g_WebS_8, uv);
-                case 9: return g_WebT2D_4.Sample(g_WebS_9, uv);
-                case 10: return g_WebT2D_4.Sample(g_WebS_10, uv);
-                case 11: return g_WebT2D_4.Sample(g_WebS_11, uv);
-                case 12: return g_WebT2D_4.Sample(g_WebS_12, uv);
-                case 13: return g_WebT2D_4.Sample(g_WebS_13, uv);
-                case 14: return g_WebT2D_4.Sample(g_WebS_14, uv);
-                case 15: return g_WebT2D_4.Sample(g_WebS_15, uv);
-                default: return g_WebT2D_4.Sample(g_WebS_0, uv);
-            }
-        }
-        case 5: {
-            uint2 dimensions;
-            g_WebT2D_5.GetDimensions(dimensions.x, dimensions.y);
-            float2 uv = texCoord + offset / dimensions;
-            switch (samplerIndex) {
-                case 0: return g_WebT2D_5.Sample(g_WebS_0, uv);
-                case 1: return g_WebT2D_5.Sample(g_WebS_1, uv);
-                case 2: return g_WebT2D_5.Sample(g_WebS_2, uv);
-                case 3: return g_WebT2D_5.Sample(g_WebS_3, uv);
-                case 4: return g_WebT2D_5.Sample(g_WebS_4, uv);
-                case 5: return g_WebT2D_5.Sample(g_WebS_5, uv);
-                case 6: return g_WebT2D_5.Sample(g_WebS_6, uv);
-                case 7: return g_WebT2D_5.Sample(g_WebS_7, uv);
-                case 8: return g_WebT2D_5.Sample(g_WebS_8, uv);
-                case 9: return g_WebT2D_5.Sample(g_WebS_9, uv);
-                case 10: return g_WebT2D_5.Sample(g_WebS_10, uv);
-                case 11: return g_WebT2D_5.Sample(g_WebS_11, uv);
-                case 12: return g_WebT2D_5.Sample(g_WebS_12, uv);
-                case 13: return g_WebT2D_5.Sample(g_WebS_13, uv);
-                case 14: return g_WebT2D_5.Sample(g_WebS_14, uv);
-                case 15: return g_WebT2D_5.Sample(g_WebS_15, uv);
-                default: return g_WebT2D_5.Sample(g_WebS_0, uv);
-            }
-        }
-        case 6: {
-            uint2 dimensions;
-            g_WebT2D_6.GetDimensions(dimensions.x, dimensions.y);
-            float2 uv = texCoord + offset / dimensions;
-            switch (samplerIndex) {
-                case 0: return g_WebT2D_6.Sample(g_WebS_0, uv);
-                case 1: return g_WebT2D_6.Sample(g_WebS_1, uv);
-                case 2: return g_WebT2D_6.Sample(g_WebS_2, uv);
-                case 3: return g_WebT2D_6.Sample(g_WebS_3, uv);
-                case 4: return g_WebT2D_6.Sample(g_WebS_4, uv);
-                case 5: return g_WebT2D_6.Sample(g_WebS_5, uv);
-                case 6: return g_WebT2D_6.Sample(g_WebS_6, uv);
-                case 7: return g_WebT2D_6.Sample(g_WebS_7, uv);
-                case 8: return g_WebT2D_6.Sample(g_WebS_8, uv);
-                case 9: return g_WebT2D_6.Sample(g_WebS_9, uv);
-                case 10: return g_WebT2D_6.Sample(g_WebS_10, uv);
-                case 11: return g_WebT2D_6.Sample(g_WebS_11, uv);
-                case 12: return g_WebT2D_6.Sample(g_WebS_12, uv);
-                case 13: return g_WebT2D_6.Sample(g_WebS_13, uv);
-                case 14: return g_WebT2D_6.Sample(g_WebS_14, uv);
-                case 15: return g_WebT2D_6.Sample(g_WebS_15, uv);
-                default: return g_WebT2D_6.Sample(g_WebS_0, uv);
-            }
-        }
-        case 7: {
-            uint2 dimensions;
-            g_WebT2D_7.GetDimensions(dimensions.x, dimensions.y);
-            float2 uv = texCoord + offset / dimensions;
-            switch (samplerIndex) {
-                case 0: return g_WebT2D_7.Sample(g_WebS_0, uv);
-                case 1: return g_WebT2D_7.Sample(g_WebS_1, uv);
-                case 2: return g_WebT2D_7.Sample(g_WebS_2, uv);
-                case 3: return g_WebT2D_7.Sample(g_WebS_3, uv);
-                case 4: return g_WebT2D_7.Sample(g_WebS_4, uv);
-                case 5: return g_WebT2D_7.Sample(g_WebS_5, uv);
-                case 6: return g_WebT2D_7.Sample(g_WebS_6, uv);
-                case 7: return g_WebT2D_7.Sample(g_WebS_7, uv);
-                case 8: return g_WebT2D_7.Sample(g_WebS_8, uv);
-                case 9: return g_WebT2D_7.Sample(g_WebS_9, uv);
-                case 10: return g_WebT2D_7.Sample(g_WebS_10, uv);
-                case 11: return g_WebT2D_7.Sample(g_WebS_11, uv);
-                case 12: return g_WebT2D_7.Sample(g_WebS_12, uv);
-                case 13: return g_WebT2D_7.Sample(g_WebS_13, uv);
-                case 14: return g_WebT2D_7.Sample(g_WebS_14, uv);
-                case 15: return g_WebT2D_7.Sample(g_WebS_15, uv);
-                default: return g_WebT2D_7.Sample(g_WebS_0, uv);
-            }
-        }
-        case 8: {
-            uint2 dimensions;
-            g_WebT2D_8.GetDimensions(dimensions.x, dimensions.y);
-            float2 uv = texCoord + offset / dimensions;
-            switch (samplerIndex) {
-                case 0: return g_WebT2D_8.Sample(g_WebS_0, uv);
-                case 1: return g_WebT2D_8.Sample(g_WebS_1, uv);
-                case 2: return g_WebT2D_8.Sample(g_WebS_2, uv);
-                case 3: return g_WebT2D_8.Sample(g_WebS_3, uv);
-                case 4: return g_WebT2D_8.Sample(g_WebS_4, uv);
-                case 5: return g_WebT2D_8.Sample(g_WebS_5, uv);
-                case 6: return g_WebT2D_8.Sample(g_WebS_6, uv);
-                case 7: return g_WebT2D_8.Sample(g_WebS_7, uv);
-                case 8: return g_WebT2D_8.Sample(g_WebS_8, uv);
-                case 9: return g_WebT2D_8.Sample(g_WebS_9, uv);
-                case 10: return g_WebT2D_8.Sample(g_WebS_10, uv);
-                case 11: return g_WebT2D_8.Sample(g_WebS_11, uv);
-                case 12: return g_WebT2D_8.Sample(g_WebS_12, uv);
-                case 13: return g_WebT2D_8.Sample(g_WebS_13, uv);
-                case 14: return g_WebT2D_8.Sample(g_WebS_14, uv);
-                case 15: return g_WebT2D_8.Sample(g_WebS_15, uv);
-                default: return g_WebT2D_8.Sample(g_WebS_0, uv);
-            }
-        }
-        case 9: {
-            uint2 dimensions;
-            g_WebT2D_9.GetDimensions(dimensions.x, dimensions.y);
-            float2 uv = texCoord + offset / dimensions;
-            switch (samplerIndex) {
-                case 0: return g_WebT2D_9.Sample(g_WebS_0, uv);
-                case 1: return g_WebT2D_9.Sample(g_WebS_1, uv);
-                case 2: return g_WebT2D_9.Sample(g_WebS_2, uv);
-                case 3: return g_WebT2D_9.Sample(g_WebS_3, uv);
-                case 4: return g_WebT2D_9.Sample(g_WebS_4, uv);
-                case 5: return g_WebT2D_9.Sample(g_WebS_5, uv);
-                case 6: return g_WebT2D_9.Sample(g_WebS_6, uv);
-                case 7: return g_WebT2D_9.Sample(g_WebS_7, uv);
-                case 8: return g_WebT2D_9.Sample(g_WebS_8, uv);
-                case 9: return g_WebT2D_9.Sample(g_WebS_9, uv);
-                case 10: return g_WebT2D_9.Sample(g_WebS_10, uv);
-                case 11: return g_WebT2D_9.Sample(g_WebS_11, uv);
-                case 12: return g_WebT2D_9.Sample(g_WebS_12, uv);
-                case 13: return g_WebT2D_9.Sample(g_WebS_13, uv);
-                case 14: return g_WebT2D_9.Sample(g_WebS_14, uv);
-                case 15: return g_WebT2D_9.Sample(g_WebS_15, uv);
-                default: return g_WebT2D_9.Sample(g_WebS_0, uv);
-            }
-        }
-        case 10: {
-            uint2 dimensions;
-            g_WebT2D_10.GetDimensions(dimensions.x, dimensions.y);
-            float2 uv = texCoord + offset / dimensions;
-            switch (samplerIndex) {
-                case 0: return g_WebT2D_10.Sample(g_WebS_0, uv);
-                case 1: return g_WebT2D_10.Sample(g_WebS_1, uv);
-                case 2: return g_WebT2D_10.Sample(g_WebS_2, uv);
-                case 3: return g_WebT2D_10.Sample(g_WebS_3, uv);
-                case 4: return g_WebT2D_10.Sample(g_WebS_4, uv);
-                case 5: return g_WebT2D_10.Sample(g_WebS_5, uv);
-                case 6: return g_WebT2D_10.Sample(g_WebS_6, uv);
-                case 7: return g_WebT2D_10.Sample(g_WebS_7, uv);
-                case 8: return g_WebT2D_10.Sample(g_WebS_8, uv);
-                case 9: return g_WebT2D_10.Sample(g_WebS_9, uv);
-                case 10: return g_WebT2D_10.Sample(g_WebS_10, uv);
-                case 11: return g_WebT2D_10.Sample(g_WebS_11, uv);
-                case 12: return g_WebT2D_10.Sample(g_WebS_12, uv);
-                case 13: return g_WebT2D_10.Sample(g_WebS_13, uv);
-                case 14: return g_WebT2D_10.Sample(g_WebS_14, uv);
-                case 15: return g_WebT2D_10.Sample(g_WebS_15, uv);
-                default: return g_WebT2D_10.Sample(g_WebS_0, uv);
-            }
-        }
-        case 11: {
-            uint2 dimensions;
-            g_WebT2D_11.GetDimensions(dimensions.x, dimensions.y);
-            float2 uv = texCoord + offset / dimensions;
-            switch (samplerIndex) {
-                case 0: return g_WebT2D_11.Sample(g_WebS_0, uv);
-                case 1: return g_WebT2D_11.Sample(g_WebS_1, uv);
-                case 2: return g_WebT2D_11.Sample(g_WebS_2, uv);
-                case 3: return g_WebT2D_11.Sample(g_WebS_3, uv);
-                case 4: return g_WebT2D_11.Sample(g_WebS_4, uv);
-                case 5: return g_WebT2D_11.Sample(g_WebS_5, uv);
-                case 6: return g_WebT2D_11.Sample(g_WebS_6, uv);
-                case 7: return g_WebT2D_11.Sample(g_WebS_7, uv);
-                case 8: return g_WebT2D_11.Sample(g_WebS_8, uv);
-                case 9: return g_WebT2D_11.Sample(g_WebS_9, uv);
-                case 10: return g_WebT2D_11.Sample(g_WebS_10, uv);
-                case 11: return g_WebT2D_11.Sample(g_WebS_11, uv);
-                case 12: return g_WebT2D_11.Sample(g_WebS_12, uv);
-                case 13: return g_WebT2D_11.Sample(g_WebS_13, uv);
-                case 14: return g_WebT2D_11.Sample(g_WebS_14, uv);
-                case 15: return g_WebT2D_11.Sample(g_WebS_15, uv);
-                default: return g_WebT2D_11.Sample(g_WebS_0, uv);
-            }
-        }
-        case 12: {
-            uint2 dimensions;
-            g_WebT2D_12.GetDimensions(dimensions.x, dimensions.y);
-            float2 uv = texCoord + offset / dimensions;
-            switch (samplerIndex) {
-                case 0: return g_WebT2D_12.Sample(g_WebS_0, uv);
-                case 1: return g_WebT2D_12.Sample(g_WebS_1, uv);
-                case 2: return g_WebT2D_12.Sample(g_WebS_2, uv);
-                case 3: return g_WebT2D_12.Sample(g_WebS_3, uv);
-                case 4: return g_WebT2D_12.Sample(g_WebS_4, uv);
-                case 5: return g_WebT2D_12.Sample(g_WebS_5, uv);
-                case 6: return g_WebT2D_12.Sample(g_WebS_6, uv);
-                case 7: return g_WebT2D_12.Sample(g_WebS_7, uv);
-                case 8: return g_WebT2D_12.Sample(g_WebS_8, uv);
-                case 9: return g_WebT2D_12.Sample(g_WebS_9, uv);
-                case 10: return g_WebT2D_12.Sample(g_WebS_10, uv);
-                case 11: return g_WebT2D_12.Sample(g_WebS_11, uv);
-                case 12: return g_WebT2D_12.Sample(g_WebS_12, uv);
-                case 13: return g_WebT2D_12.Sample(g_WebS_13, uv);
-                case 14: return g_WebT2D_12.Sample(g_WebS_14, uv);
-                case 15: return g_WebT2D_12.Sample(g_WebS_15, uv);
-                default: return g_WebT2D_12.Sample(g_WebS_0, uv);
-            }
-        }
-        case 13: {
-            uint2 dimensions;
-            g_WebT2D_13.GetDimensions(dimensions.x, dimensions.y);
-            float2 uv = texCoord + offset / dimensions;
-            switch (samplerIndex) {
-                case 0: return g_WebT2D_13.Sample(g_WebS_0, uv);
-                case 1: return g_WebT2D_13.Sample(g_WebS_1, uv);
-                case 2: return g_WebT2D_13.Sample(g_WebS_2, uv);
-                case 3: return g_WebT2D_13.Sample(g_WebS_3, uv);
-                case 4: return g_WebT2D_13.Sample(g_WebS_4, uv);
-                case 5: return g_WebT2D_13.Sample(g_WebS_5, uv);
-                case 6: return g_WebT2D_13.Sample(g_WebS_6, uv);
-                case 7: return g_WebT2D_13.Sample(g_WebS_7, uv);
-                case 8: return g_WebT2D_13.Sample(g_WebS_8, uv);
-                case 9: return g_WebT2D_13.Sample(g_WebS_9, uv);
-                case 10: return g_WebT2D_13.Sample(g_WebS_10, uv);
-                case 11: return g_WebT2D_13.Sample(g_WebS_11, uv);
-                case 12: return g_WebT2D_13.Sample(g_WebS_12, uv);
-                case 13: return g_WebT2D_13.Sample(g_WebS_13, uv);
-                case 14: return g_WebT2D_13.Sample(g_WebS_14, uv);
-                case 15: return g_WebT2D_13.Sample(g_WebS_15, uv);
-                default: return g_WebT2D_13.Sample(g_WebS_0, uv);
-            }
-        }
-        case 14: {
-            uint2 dimensions;
-            g_WebT2D_14.GetDimensions(dimensions.x, dimensions.y);
-            float2 uv = texCoord + offset / dimensions;
-            switch (samplerIndex) {
-                case 0: return g_WebT2D_14.Sample(g_WebS_0, uv);
-                case 1: return g_WebT2D_14.Sample(g_WebS_1, uv);
-                case 2: return g_WebT2D_14.Sample(g_WebS_2, uv);
-                case 3: return g_WebT2D_14.Sample(g_WebS_3, uv);
-                case 4: return g_WebT2D_14.Sample(g_WebS_4, uv);
-                case 5: return g_WebT2D_14.Sample(g_WebS_5, uv);
-                case 6: return g_WebT2D_14.Sample(g_WebS_6, uv);
-                case 7: return g_WebT2D_14.Sample(g_WebS_7, uv);
-                case 8: return g_WebT2D_14.Sample(g_WebS_8, uv);
-                case 9: return g_WebT2D_14.Sample(g_WebS_9, uv);
-                case 10: return g_WebT2D_14.Sample(g_WebS_10, uv);
-                case 11: return g_WebT2D_14.Sample(g_WebS_11, uv);
-                case 12: return g_WebT2D_14.Sample(g_WebS_12, uv);
-                case 13: return g_WebT2D_14.Sample(g_WebS_13, uv);
-                case 14: return g_WebT2D_14.Sample(g_WebS_14, uv);
-                case 15: return g_WebT2D_14.Sample(g_WebS_15, uv);
-                default: return g_WebT2D_14.Sample(g_WebS_0, uv);
-            }
-        }
-        case 15: {
-            uint2 dimensions;
-            g_WebT2D_15.GetDimensions(dimensions.x, dimensions.y);
-            float2 uv = texCoord + offset / dimensions;
-            switch (samplerIndex) {
-                case 0: return g_WebT2D_15.Sample(g_WebS_0, uv);
-                case 1: return g_WebT2D_15.Sample(g_WebS_1, uv);
-                case 2: return g_WebT2D_15.Sample(g_WebS_2, uv);
-                case 3: return g_WebT2D_15.Sample(g_WebS_3, uv);
-                case 4: return g_WebT2D_15.Sample(g_WebS_4, uv);
-                case 5: return g_WebT2D_15.Sample(g_WebS_5, uv);
-                case 6: return g_WebT2D_15.Sample(g_WebS_6, uv);
-                case 7: return g_WebT2D_15.Sample(g_WebS_7, uv);
-                case 8: return g_WebT2D_15.Sample(g_WebS_8, uv);
-                case 9: return g_WebT2D_15.Sample(g_WebS_9, uv);
-                case 10: return g_WebT2D_15.Sample(g_WebS_10, uv);
-                case 11: return g_WebT2D_15.Sample(g_WebS_11, uv);
-                case 12: return g_WebT2D_15.Sample(g_WebS_12, uv);
-                case 13: return g_WebT2D_15.Sample(g_WebS_13, uv);
-                case 14: return g_WebT2D_15.Sample(g_WebS_14, uv);
-                case 15: return g_WebT2D_15.Sample(g_WebS_15, uv);
-                default: return g_WebT2D_15.Sample(g_WebS_0, uv);
-            }
-        }
-        case 16: {
-            uint2 dimensions;
-            g_WebT2D_16.GetDimensions(dimensions.x, dimensions.y);
-            float2 uv = texCoord + offset / dimensions;
-            switch (samplerIndex) {
-                case 0: return g_WebT2D_16.Sample(g_WebS_0, uv);
-                case 1: return g_WebT2D_16.Sample(g_WebS_1, uv);
-                case 2: return g_WebT2D_16.Sample(g_WebS_2, uv);
-                case 3: return g_WebT2D_16.Sample(g_WebS_3, uv);
-                case 4: return g_WebT2D_16.Sample(g_WebS_4, uv);
-                case 5: return g_WebT2D_16.Sample(g_WebS_5, uv);
-                case 6: return g_WebT2D_16.Sample(g_WebS_6, uv);
-                case 7: return g_WebT2D_16.Sample(g_WebS_7, uv);
-                case 8: return g_WebT2D_16.Sample(g_WebS_8, uv);
-                case 9: return g_WebT2D_16.Sample(g_WebS_9, uv);
-                case 10: return g_WebT2D_16.Sample(g_WebS_10, uv);
-                case 11: return g_WebT2D_16.Sample(g_WebS_11, uv);
-                case 12: return g_WebT2D_16.Sample(g_WebS_12, uv);
-                case 13: return g_WebT2D_16.Sample(g_WebS_13, uv);
-                case 14: return g_WebT2D_16.Sample(g_WebS_14, uv);
-                case 15: return g_WebT2D_16.Sample(g_WebS_15, uv);
-                default: return g_WebT2D_16.Sample(g_WebS_0, uv);
-            }
-        }
-        case 17: {
-            uint2 dimensions;
-            g_WebT2D_17.GetDimensions(dimensions.x, dimensions.y);
-            float2 uv = texCoord + offset / dimensions;
-            switch (samplerIndex) {
-                case 0: return g_WebT2D_17.Sample(g_WebS_0, uv);
-                case 1: return g_WebT2D_17.Sample(g_WebS_1, uv);
-                case 2: return g_WebT2D_17.Sample(g_WebS_2, uv);
-                case 3: return g_WebT2D_17.Sample(g_WebS_3, uv);
-                case 4: return g_WebT2D_17.Sample(g_WebS_4, uv);
-                case 5: return g_WebT2D_17.Sample(g_WebS_5, uv);
-                case 6: return g_WebT2D_17.Sample(g_WebS_6, uv);
-                case 7: return g_WebT2D_17.Sample(g_WebS_7, uv);
-                case 8: return g_WebT2D_17.Sample(g_WebS_8, uv);
-                case 9: return g_WebT2D_17.Sample(g_WebS_9, uv);
-                case 10: return g_WebT2D_17.Sample(g_WebS_10, uv);
-                case 11: return g_WebT2D_17.Sample(g_WebS_11, uv);
-                case 12: return g_WebT2D_17.Sample(g_WebS_12, uv);
-                case 13: return g_WebT2D_17.Sample(g_WebS_13, uv);
-                case 14: return g_WebT2D_17.Sample(g_WebS_14, uv);
-                case 15: return g_WebT2D_17.Sample(g_WebS_15, uv);
-                default: return g_WebT2D_17.Sample(g_WebS_0, uv);
-            }
-        }
-        case 18: {
-            uint2 dimensions;
-            g_WebT2D_18.GetDimensions(dimensions.x, dimensions.y);
-            float2 uv = texCoord + offset / dimensions;
-            switch (samplerIndex) {
-                case 0: return g_WebT2D_18.Sample(g_WebS_0, uv);
-                case 1: return g_WebT2D_18.Sample(g_WebS_1, uv);
-                case 2: return g_WebT2D_18.Sample(g_WebS_2, uv);
-                case 3: return g_WebT2D_18.Sample(g_WebS_3, uv);
-                case 4: return g_WebT2D_18.Sample(g_WebS_4, uv);
-                case 5: return g_WebT2D_18.Sample(g_WebS_5, uv);
-                case 6: return g_WebT2D_18.Sample(g_WebS_6, uv);
-                case 7: return g_WebT2D_18.Sample(g_WebS_7, uv);
-                case 8: return g_WebT2D_18.Sample(g_WebS_8, uv);
-                case 9: return g_WebT2D_18.Sample(g_WebS_9, uv);
-                case 10: return g_WebT2D_18.Sample(g_WebS_10, uv);
-                case 11: return g_WebT2D_18.Sample(g_WebS_11, uv);
-                case 12: return g_WebT2D_18.Sample(g_WebS_12, uv);
-                case 13: return g_WebT2D_18.Sample(g_WebS_13, uv);
-                case 14: return g_WebT2D_18.Sample(g_WebS_14, uv);
-                case 15: return g_WebT2D_18.Sample(g_WebS_15, uv);
-                default: return g_WebT2D_18.Sample(g_WebS_0, uv);
-            }
-        }
-        case 19: {
-            uint2 dimensions;
-            g_WebT2D_19.GetDimensions(dimensions.x, dimensions.y);
-            float2 uv = texCoord + offset / dimensions;
-            switch (samplerIndex) {
-                case 0: return g_WebT2D_19.Sample(g_WebS_0, uv);
-                case 1: return g_WebT2D_19.Sample(g_WebS_1, uv);
-                case 2: return g_WebT2D_19.Sample(g_WebS_2, uv);
-                case 3: return g_WebT2D_19.Sample(g_WebS_3, uv);
-                case 4: return g_WebT2D_19.Sample(g_WebS_4, uv);
-                case 5: return g_WebT2D_19.Sample(g_WebS_5, uv);
-                case 6: return g_WebT2D_19.Sample(g_WebS_6, uv);
-                case 7: return g_WebT2D_19.Sample(g_WebS_7, uv);
-                case 8: return g_WebT2D_19.Sample(g_WebS_8, uv);
-                case 9: return g_WebT2D_19.Sample(g_WebS_9, uv);
-                case 10: return g_WebT2D_19.Sample(g_WebS_10, uv);
-                case 11: return g_WebT2D_19.Sample(g_WebS_11, uv);
-                case 12: return g_WebT2D_19.Sample(g_WebS_12, uv);
-                case 13: return g_WebT2D_19.Sample(g_WebS_13, uv);
-                case 14: return g_WebT2D_19.Sample(g_WebS_14, uv);
-                case 15: return g_WebT2D_19.Sample(g_WebS_15, uv);
-                default: return g_WebT2D_19.Sample(g_WebS_0, uv);
-            }
-        }
-        case 20: {
-            uint2 dimensions;
-            g_WebT2D_20.GetDimensions(dimensions.x, dimensions.y);
-            float2 uv = texCoord + offset / dimensions;
-            switch (samplerIndex) {
-                case 0: return g_WebT2D_20.Sample(g_WebS_0, uv);
-                case 1: return g_WebT2D_20.Sample(g_WebS_1, uv);
-                case 2: return g_WebT2D_20.Sample(g_WebS_2, uv);
-                case 3: return g_WebT2D_20.Sample(g_WebS_3, uv);
-                case 4: return g_WebT2D_20.Sample(g_WebS_4, uv);
-                case 5: return g_WebT2D_20.Sample(g_WebS_5, uv);
-                case 6: return g_WebT2D_20.Sample(g_WebS_6, uv);
-                case 7: return g_WebT2D_20.Sample(g_WebS_7, uv);
-                case 8: return g_WebT2D_20.Sample(g_WebS_8, uv);
-                case 9: return g_WebT2D_20.Sample(g_WebS_9, uv);
-                case 10: return g_WebT2D_20.Sample(g_WebS_10, uv);
-                case 11: return g_WebT2D_20.Sample(g_WebS_11, uv);
-                case 12: return g_WebT2D_20.Sample(g_WebS_12, uv);
-                case 13: return g_WebT2D_20.Sample(g_WebS_13, uv);
-                case 14: return g_WebT2D_20.Sample(g_WebS_14, uv);
-                case 15: return g_WebT2D_20.Sample(g_WebS_15, uv);
-                default: return g_WebT2D_20.Sample(g_WebS_0, uv);
-            }
-        }
-        case 21: {
-            uint2 dimensions;
-            g_WebT2D_21.GetDimensions(dimensions.x, dimensions.y);
-            float2 uv = texCoord + offset / dimensions;
-            switch (samplerIndex) {
-                case 0: return g_WebT2D_21.Sample(g_WebS_0, uv);
-                case 1: return g_WebT2D_21.Sample(g_WebS_1, uv);
-                case 2: return g_WebT2D_21.Sample(g_WebS_2, uv);
-                case 3: return g_WebT2D_21.Sample(g_WebS_3, uv);
-                case 4: return g_WebT2D_21.Sample(g_WebS_4, uv);
-                case 5: return g_WebT2D_21.Sample(g_WebS_5, uv);
-                case 6: return g_WebT2D_21.Sample(g_WebS_6, uv);
-                case 7: return g_WebT2D_21.Sample(g_WebS_7, uv);
-                case 8: return g_WebT2D_21.Sample(g_WebS_8, uv);
-                case 9: return g_WebT2D_21.Sample(g_WebS_9, uv);
-                case 10: return g_WebT2D_21.Sample(g_WebS_10, uv);
-                case 11: return g_WebT2D_21.Sample(g_WebS_11, uv);
-                case 12: return g_WebT2D_21.Sample(g_WebS_12, uv);
-                case 13: return g_WebT2D_21.Sample(g_WebS_13, uv);
-                case 14: return g_WebT2D_21.Sample(g_WebS_14, uv);
-                case 15: return g_WebT2D_21.Sample(g_WebS_15, uv);
-                default: return g_WebT2D_21.Sample(g_WebS_0, uv);
-            }
-        }
-        case 22: {
-            uint2 dimensions;
-            g_WebT2D_22.GetDimensions(dimensions.x, dimensions.y);
-            float2 uv = texCoord + offset / dimensions;
-            switch (samplerIndex) {
-                case 0: return g_WebT2D_22.Sample(g_WebS_0, uv);
-                case 1: return g_WebT2D_22.Sample(g_WebS_1, uv);
-                case 2: return g_WebT2D_22.Sample(g_WebS_2, uv);
-                case 3: return g_WebT2D_22.Sample(g_WebS_3, uv);
-                case 4: return g_WebT2D_22.Sample(g_WebS_4, uv);
-                case 5: return g_WebT2D_22.Sample(g_WebS_5, uv);
-                case 6: return g_WebT2D_22.Sample(g_WebS_6, uv);
-                case 7: return g_WebT2D_22.Sample(g_WebS_7, uv);
-                case 8: return g_WebT2D_22.Sample(g_WebS_8, uv);
-                case 9: return g_WebT2D_22.Sample(g_WebS_9, uv);
-                case 10: return g_WebT2D_22.Sample(g_WebS_10, uv);
-                case 11: return g_WebT2D_22.Sample(g_WebS_11, uv);
-                case 12: return g_WebT2D_22.Sample(g_WebS_12, uv);
-                case 13: return g_WebT2D_22.Sample(g_WebS_13, uv);
-                case 14: return g_WebT2D_22.Sample(g_WebS_14, uv);
-                case 15: return g_WebT2D_22.Sample(g_WebS_15, uv);
-                default: return g_WebT2D_22.Sample(g_WebS_0, uv);
-            }
-        }
-        case 23: {
-            uint2 dimensions;
-            g_WebT2D_23.GetDimensions(dimensions.x, dimensions.y);
-            float2 uv = texCoord + offset / dimensions;
-            switch (samplerIndex) {
-                case 0: return g_WebT2D_23.Sample(g_WebS_0, uv);
-                case 1: return g_WebT2D_23.Sample(g_WebS_1, uv);
-                case 2: return g_WebT2D_23.Sample(g_WebS_2, uv);
-                case 3: return g_WebT2D_23.Sample(g_WebS_3, uv);
-                case 4: return g_WebT2D_23.Sample(g_WebS_4, uv);
-                case 5: return g_WebT2D_23.Sample(g_WebS_5, uv);
-                case 6: return g_WebT2D_23.Sample(g_WebS_6, uv);
-                case 7: return g_WebT2D_23.Sample(g_WebS_7, uv);
-                case 8: return g_WebT2D_23.Sample(g_WebS_8, uv);
-                case 9: return g_WebT2D_23.Sample(g_WebS_9, uv);
-                case 10: return g_WebT2D_23.Sample(g_WebS_10, uv);
-                case 11: return g_WebT2D_23.Sample(g_WebS_11, uv);
-                case 12: return g_WebT2D_23.Sample(g_WebS_12, uv);
-                case 13: return g_WebT2D_23.Sample(g_WebS_13, uv);
-                case 14: return g_WebT2D_23.Sample(g_WebS_14, uv);
-                case 15: return g_WebT2D_23.Sample(g_WebS_15, uv);
-                default: return g_WebT2D_23.Sample(g_WebS_0, uv);
-            }
-        }
-        case 24: {
-            uint2 dimensions;
-            g_WebT2D_24.GetDimensions(dimensions.x, dimensions.y);
-            float2 uv = texCoord + offset / dimensions;
-            switch (samplerIndex) {
-                case 0: return g_WebT2D_24.Sample(g_WebS_0, uv);
-                case 1: return g_WebT2D_24.Sample(g_WebS_1, uv);
-                case 2: return g_WebT2D_24.Sample(g_WebS_2, uv);
-                case 3: return g_WebT2D_24.Sample(g_WebS_3, uv);
-                case 4: return g_WebT2D_24.Sample(g_WebS_4, uv);
-                case 5: return g_WebT2D_24.Sample(g_WebS_5, uv);
-                case 6: return g_WebT2D_24.Sample(g_WebS_6, uv);
-                case 7: return g_WebT2D_24.Sample(g_WebS_7, uv);
-                case 8: return g_WebT2D_24.Sample(g_WebS_8, uv);
-                case 9: return g_WebT2D_24.Sample(g_WebS_9, uv);
-                case 10: return g_WebT2D_24.Sample(g_WebS_10, uv);
-                case 11: return g_WebT2D_24.Sample(g_WebS_11, uv);
-                case 12: return g_WebT2D_24.Sample(g_WebS_12, uv);
-                case 13: return g_WebT2D_24.Sample(g_WebS_13, uv);
-                case 14: return g_WebT2D_24.Sample(g_WebS_14, uv);
-                case 15: return g_WebT2D_24.Sample(g_WebS_15, uv);
-                default: return g_WebT2D_24.Sample(g_WebS_0, uv);
-            }
-        }
-        case 25: {
-            uint2 dimensions;
-            g_WebT2D_25.GetDimensions(dimensions.x, dimensions.y);
-            float2 uv = texCoord + offset / dimensions;
-            switch (samplerIndex) {
-                case 0: return g_WebT2D_25.Sample(g_WebS_0, uv);
-                case 1: return g_WebT2D_25.Sample(g_WebS_1, uv);
-                case 2: return g_WebT2D_25.Sample(g_WebS_2, uv);
-                case 3: return g_WebT2D_25.Sample(g_WebS_3, uv);
-                case 4: return g_WebT2D_25.Sample(g_WebS_4, uv);
-                case 5: return g_WebT2D_25.Sample(g_WebS_5, uv);
-                case 6: return g_WebT2D_25.Sample(g_WebS_6, uv);
-                case 7: return g_WebT2D_25.Sample(g_WebS_7, uv);
-                case 8: return g_WebT2D_25.Sample(g_WebS_8, uv);
-                case 9: return g_WebT2D_25.Sample(g_WebS_9, uv);
-                case 10: return g_WebT2D_25.Sample(g_WebS_10, uv);
-                case 11: return g_WebT2D_25.Sample(g_WebS_11, uv);
-                case 12: return g_WebT2D_25.Sample(g_WebS_12, uv);
-                case 13: return g_WebT2D_25.Sample(g_WebS_13, uv);
-                case 14: return g_WebT2D_25.Sample(g_WebS_14, uv);
-                case 15: return g_WebT2D_25.Sample(g_WebS_15, uv);
-                default: return g_WebT2D_25.Sample(g_WebS_0, uv);
-            }
-        }
-        case 26: {
-            uint2 dimensions;
-            g_WebT2D_26.GetDimensions(dimensions.x, dimensions.y);
-            float2 uv = texCoord + offset / dimensions;
-            switch (samplerIndex) {
-                case 0: return g_WebT2D_26.Sample(g_WebS_0, uv);
-                case 1: return g_WebT2D_26.Sample(g_WebS_1, uv);
-                case 2: return g_WebT2D_26.Sample(g_WebS_2, uv);
-                case 3: return g_WebT2D_26.Sample(g_WebS_3, uv);
-                case 4: return g_WebT2D_26.Sample(g_WebS_4, uv);
-                case 5: return g_WebT2D_26.Sample(g_WebS_5, uv);
-                case 6: return g_WebT2D_26.Sample(g_WebS_6, uv);
-                case 7: return g_WebT2D_26.Sample(g_WebS_7, uv);
-                case 8: return g_WebT2D_26.Sample(g_WebS_8, uv);
-                case 9: return g_WebT2D_26.Sample(g_WebS_9, uv);
-                case 10: return g_WebT2D_26.Sample(g_WebS_10, uv);
-                case 11: return g_WebT2D_26.Sample(g_WebS_11, uv);
-                case 12: return g_WebT2D_26.Sample(g_WebS_12, uv);
-                case 13: return g_WebT2D_26.Sample(g_WebS_13, uv);
-                case 14: return g_WebT2D_26.Sample(g_WebS_14, uv);
-                case 15: return g_WebT2D_26.Sample(g_WebS_15, uv);
-                default: return g_WebT2D_26.Sample(g_WebS_0, uv);
-            }
-        }
-        case 27: {
-            uint2 dimensions;
-            g_WebT2D_27.GetDimensions(dimensions.x, dimensions.y);
-            float2 uv = texCoord + offset / dimensions;
-            switch (samplerIndex) {
-                case 0: return g_WebT2D_27.Sample(g_WebS_0, uv);
-                case 1: return g_WebT2D_27.Sample(g_WebS_1, uv);
-                case 2: return g_WebT2D_27.Sample(g_WebS_2, uv);
-                case 3: return g_WebT2D_27.Sample(g_WebS_3, uv);
-                case 4: return g_WebT2D_27.Sample(g_WebS_4, uv);
-                case 5: return g_WebT2D_27.Sample(g_WebS_5, uv);
-                case 6: return g_WebT2D_27.Sample(g_WebS_6, uv);
-                case 7: return g_WebT2D_27.Sample(g_WebS_7, uv);
-                case 8: return g_WebT2D_27.Sample(g_WebS_8, uv);
-                case 9: return g_WebT2D_27.Sample(g_WebS_9, uv);
-                case 10: return g_WebT2D_27.Sample(g_WebS_10, uv);
-                case 11: return g_WebT2D_27.Sample(g_WebS_11, uv);
-                case 12: return g_WebT2D_27.Sample(g_WebS_12, uv);
-                case 13: return g_WebT2D_27.Sample(g_WebS_13, uv);
-                case 14: return g_WebT2D_27.Sample(g_WebS_14, uv);
-                case 15: return g_WebT2D_27.Sample(g_WebS_15, uv);
-                default: return g_WebT2D_27.Sample(g_WebS_0, uv);
-            }
-        }
-        case 28: {
-            uint2 dimensions;
-            g_WebT2D_28.GetDimensions(dimensions.x, dimensions.y);
-            float2 uv = texCoord + offset / dimensions;
-            switch (samplerIndex) {
-                case 0: return g_WebT2D_28.Sample(g_WebS_0, uv);
-                case 1: return g_WebT2D_28.Sample(g_WebS_1, uv);
-                case 2: return g_WebT2D_28.Sample(g_WebS_2, uv);
-                case 3: return g_WebT2D_28.Sample(g_WebS_3, uv);
-                case 4: return g_WebT2D_28.Sample(g_WebS_4, uv);
-                case 5: return g_WebT2D_28.Sample(g_WebS_5, uv);
-                case 6: return g_WebT2D_28.Sample(g_WebS_6, uv);
-                case 7: return g_WebT2D_28.Sample(g_WebS_7, uv);
-                case 8: return g_WebT2D_28.Sample(g_WebS_8, uv);
-                case 9: return g_WebT2D_28.Sample(g_WebS_9, uv);
-                case 10: return g_WebT2D_28.Sample(g_WebS_10, uv);
-                case 11: return g_WebT2D_28.Sample(g_WebS_11, uv);
-                case 12: return g_WebT2D_28.Sample(g_WebS_12, uv);
-                case 13: return g_WebT2D_28.Sample(g_WebS_13, uv);
-                case 14: return g_WebT2D_28.Sample(g_WebS_14, uv);
-                case 15: return g_WebT2D_28.Sample(g_WebS_15, uv);
-                default: return g_WebT2D_28.Sample(g_WebS_0, uv);
-            }
-        }
-        case 29: {
-            uint2 dimensions;
-            g_WebT2D_29.GetDimensions(dimensions.x, dimensions.y);
-            float2 uv = texCoord + offset / dimensions;
-            switch (samplerIndex) {
-                case 0: return g_WebT2D_29.Sample(g_WebS_0, uv);
-                case 1: return g_WebT2D_29.Sample(g_WebS_1, uv);
-                case 2: return g_WebT2D_29.Sample(g_WebS_2, uv);
-                case 3: return g_WebT2D_29.Sample(g_WebS_3, uv);
-                case 4: return g_WebT2D_29.Sample(g_WebS_4, uv);
-                case 5: return g_WebT2D_29.Sample(g_WebS_5, uv);
-                case 6: return g_WebT2D_29.Sample(g_WebS_6, uv);
-                case 7: return g_WebT2D_29.Sample(g_WebS_7, uv);
-                case 8: return g_WebT2D_29.Sample(g_WebS_8, uv);
-                case 9: return g_WebT2D_29.Sample(g_WebS_9, uv);
-                case 10: return g_WebT2D_29.Sample(g_WebS_10, uv);
-                case 11: return g_WebT2D_29.Sample(g_WebS_11, uv);
-                case 12: return g_WebT2D_29.Sample(g_WebS_12, uv);
-                case 13: return g_WebT2D_29.Sample(g_WebS_13, uv);
-                case 14: return g_WebT2D_29.Sample(g_WebS_14, uv);
-                case 15: return g_WebT2D_29.Sample(g_WebS_15, uv);
-                default: return g_WebT2D_29.Sample(g_WebS_0, uv);
-            }
-        }
-        case 30: {
-            uint2 dimensions;
-            g_WebT2D_30.GetDimensions(dimensions.x, dimensions.y);
-            float2 uv = texCoord + offset / dimensions;
-            switch (samplerIndex) {
-                case 0: return g_WebT2D_30.Sample(g_WebS_0, uv);
-                case 1: return g_WebT2D_30.Sample(g_WebS_1, uv);
-                case 2: return g_WebT2D_30.Sample(g_WebS_2, uv);
-                case 3: return g_WebT2D_30.Sample(g_WebS_3, uv);
-                case 4: return g_WebT2D_30.Sample(g_WebS_4, uv);
-                case 5: return g_WebT2D_30.Sample(g_WebS_5, uv);
-                case 6: return g_WebT2D_30.Sample(g_WebS_6, uv);
-                case 7: return g_WebT2D_30.Sample(g_WebS_7, uv);
-                case 8: return g_WebT2D_30.Sample(g_WebS_8, uv);
-                case 9: return g_WebT2D_30.Sample(g_WebS_9, uv);
-                case 10: return g_WebT2D_30.Sample(g_WebS_10, uv);
-                case 11: return g_WebT2D_30.Sample(g_WebS_11, uv);
-                case 12: return g_WebT2D_30.Sample(g_WebS_12, uv);
-                case 13: return g_WebT2D_30.Sample(g_WebS_13, uv);
-                case 14: return g_WebT2D_30.Sample(g_WebS_14, uv);
-                case 15: return g_WebT2D_30.Sample(g_WebS_15, uv);
-                default: return g_WebT2D_30.Sample(g_WebS_0, uv);
-            }
-        }
-        case 31: {
-            uint2 dimensions;
-            g_WebT2D_31.GetDimensions(dimensions.x, dimensions.y);
-            float2 uv = texCoord + offset / dimensions;
-            switch (samplerIndex) {
-                case 0: return g_WebT2D_31.Sample(g_WebS_0, uv);
-                case 1: return g_WebT2D_31.Sample(g_WebS_1, uv);
-                case 2: return g_WebT2D_31.Sample(g_WebS_2, uv);
-                case 3: return g_WebT2D_31.Sample(g_WebS_3, uv);
-                case 4: return g_WebT2D_31.Sample(g_WebS_4, uv);
-                case 5: return g_WebT2D_31.Sample(g_WebS_5, uv);
-                case 6: return g_WebT2D_31.Sample(g_WebS_6, uv);
-                case 7: return g_WebT2D_31.Sample(g_WebS_7, uv);
-                case 8: return g_WebT2D_31.Sample(g_WebS_8, uv);
-                case 9: return g_WebT2D_31.Sample(g_WebS_9, uv);
-                case 10: return g_WebT2D_31.Sample(g_WebS_10, uv);
-                case 11: return g_WebT2D_31.Sample(g_WebS_11, uv);
-                case 12: return g_WebT2D_31.Sample(g_WebS_12, uv);
-                case 13: return g_WebT2D_31.Sample(g_WebS_13, uv);
-                case 14: return g_WebT2D_31.Sample(g_WebS_14, uv);
-                case 15: return g_WebT2D_31.Sample(g_WebS_15, uv);
-                default: return g_WebT2D_31.Sample(g_WebS_0, uv);
-            }
-        }
-        default: return 0;
+    if (textureIndex == 0) {
+        uint2 dimensions;
+        g_WebT2D_0.GetDimensions(dimensions.x, dimensions.y);
+        float2 uv = texCoord + offset / dimensions;
+        if (samplerIndex == 0) return g_WebT2D_0.Sample(g_WebS_0, uv);
+        else if (samplerIndex == 1) return g_WebT2D_0.Sample(g_WebS_1, uv);
+        else if (samplerIndex == 2) return g_WebT2D_0.Sample(g_WebS_2, uv);
+        else if (samplerIndex == 3) return g_WebT2D_0.Sample(g_WebS_3, uv);
+        else if (samplerIndex == 4) return g_WebT2D_0.Sample(g_WebS_4, uv);
+        else if (samplerIndex == 5) return g_WebT2D_0.Sample(g_WebS_5, uv);
+        else if (samplerIndex == 6) return g_WebT2D_0.Sample(g_WebS_6, uv);
+        else if (samplerIndex == 7) return g_WebT2D_0.Sample(g_WebS_7, uv);
+        else if (samplerIndex == 8) return g_WebT2D_0.Sample(g_WebS_8, uv);
+        else if (samplerIndex == 9) return g_WebT2D_0.Sample(g_WebS_9, uv);
+        else if (samplerIndex == 10) return g_WebT2D_0.Sample(g_WebS_10, uv);
+        else if (samplerIndex == 11) return g_WebT2D_0.Sample(g_WebS_11, uv);
+        else if (samplerIndex == 12) return g_WebT2D_0.Sample(g_WebS_12, uv);
+        else if (samplerIndex == 13) return g_WebT2D_0.Sample(g_WebS_13, uv);
+        else if (samplerIndex == 14) return g_WebT2D_0.Sample(g_WebS_14, uv);
+        else if (samplerIndex == 15) return g_WebT2D_0.Sample(g_WebS_15, uv);
+        else return g_WebT2D_0.Sample(g_WebS_0, uv);
     }
+    else if (textureIndex == 1) {
+        uint2 dimensions;
+        g_WebT2D_1.GetDimensions(dimensions.x, dimensions.y);
+        float2 uv = texCoord + offset / dimensions;
+        if (samplerIndex == 0) return g_WebT2D_1.Sample(g_WebS_0, uv);
+        else if (samplerIndex == 1) return g_WebT2D_1.Sample(g_WebS_1, uv);
+        else if (samplerIndex == 2) return g_WebT2D_1.Sample(g_WebS_2, uv);
+        else if (samplerIndex == 3) return g_WebT2D_1.Sample(g_WebS_3, uv);
+        else if (samplerIndex == 4) return g_WebT2D_1.Sample(g_WebS_4, uv);
+        else if (samplerIndex == 5) return g_WebT2D_1.Sample(g_WebS_5, uv);
+        else if (samplerIndex == 6) return g_WebT2D_1.Sample(g_WebS_6, uv);
+        else if (samplerIndex == 7) return g_WebT2D_1.Sample(g_WebS_7, uv);
+        else if (samplerIndex == 8) return g_WebT2D_1.Sample(g_WebS_8, uv);
+        else if (samplerIndex == 9) return g_WebT2D_1.Sample(g_WebS_9, uv);
+        else if (samplerIndex == 10) return g_WebT2D_1.Sample(g_WebS_10, uv);
+        else if (samplerIndex == 11) return g_WebT2D_1.Sample(g_WebS_11, uv);
+        else if (samplerIndex == 12) return g_WebT2D_1.Sample(g_WebS_12, uv);
+        else if (samplerIndex == 13) return g_WebT2D_1.Sample(g_WebS_13, uv);
+        else if (samplerIndex == 14) return g_WebT2D_1.Sample(g_WebS_14, uv);
+        else if (samplerIndex == 15) return g_WebT2D_1.Sample(g_WebS_15, uv);
+        else return g_WebT2D_1.Sample(g_WebS_0, uv);
+    }
+    else if (textureIndex == 2) {
+        uint2 dimensions;
+        g_WebT2D_2.GetDimensions(dimensions.x, dimensions.y);
+        float2 uv = texCoord + offset / dimensions;
+        if (samplerIndex == 0) return g_WebT2D_2.Sample(g_WebS_0, uv);
+        else if (samplerIndex == 1) return g_WebT2D_2.Sample(g_WebS_1, uv);
+        else if (samplerIndex == 2) return g_WebT2D_2.Sample(g_WebS_2, uv);
+        else if (samplerIndex == 3) return g_WebT2D_2.Sample(g_WebS_3, uv);
+        else if (samplerIndex == 4) return g_WebT2D_2.Sample(g_WebS_4, uv);
+        else if (samplerIndex == 5) return g_WebT2D_2.Sample(g_WebS_5, uv);
+        else if (samplerIndex == 6) return g_WebT2D_2.Sample(g_WebS_6, uv);
+        else if (samplerIndex == 7) return g_WebT2D_2.Sample(g_WebS_7, uv);
+        else if (samplerIndex == 8) return g_WebT2D_2.Sample(g_WebS_8, uv);
+        else if (samplerIndex == 9) return g_WebT2D_2.Sample(g_WebS_9, uv);
+        else if (samplerIndex == 10) return g_WebT2D_2.Sample(g_WebS_10, uv);
+        else if (samplerIndex == 11) return g_WebT2D_2.Sample(g_WebS_11, uv);
+        else if (samplerIndex == 12) return g_WebT2D_2.Sample(g_WebS_12, uv);
+        else if (samplerIndex == 13) return g_WebT2D_2.Sample(g_WebS_13, uv);
+        else if (samplerIndex == 14) return g_WebT2D_2.Sample(g_WebS_14, uv);
+        else if (samplerIndex == 15) return g_WebT2D_2.Sample(g_WebS_15, uv);
+        else return g_WebT2D_2.Sample(g_WebS_0, uv);
+    }
+    else if (textureIndex == 3) {
+        uint2 dimensions;
+        g_WebT2D_3.GetDimensions(dimensions.x, dimensions.y);
+        float2 uv = texCoord + offset / dimensions;
+        if (samplerIndex == 0) return g_WebT2D_3.Sample(g_WebS_0, uv);
+        else if (samplerIndex == 1) return g_WebT2D_3.Sample(g_WebS_1, uv);
+        else if (samplerIndex == 2) return g_WebT2D_3.Sample(g_WebS_2, uv);
+        else if (samplerIndex == 3) return g_WebT2D_3.Sample(g_WebS_3, uv);
+        else if (samplerIndex == 4) return g_WebT2D_3.Sample(g_WebS_4, uv);
+        else if (samplerIndex == 5) return g_WebT2D_3.Sample(g_WebS_5, uv);
+        else if (samplerIndex == 6) return g_WebT2D_3.Sample(g_WebS_6, uv);
+        else if (samplerIndex == 7) return g_WebT2D_3.Sample(g_WebS_7, uv);
+        else if (samplerIndex == 8) return g_WebT2D_3.Sample(g_WebS_8, uv);
+        else if (samplerIndex == 9) return g_WebT2D_3.Sample(g_WebS_9, uv);
+        else if (samplerIndex == 10) return g_WebT2D_3.Sample(g_WebS_10, uv);
+        else if (samplerIndex == 11) return g_WebT2D_3.Sample(g_WebS_11, uv);
+        else if (samplerIndex == 12) return g_WebT2D_3.Sample(g_WebS_12, uv);
+        else if (samplerIndex == 13) return g_WebT2D_3.Sample(g_WebS_13, uv);
+        else if (samplerIndex == 14) return g_WebT2D_3.Sample(g_WebS_14, uv);
+        else if (samplerIndex == 15) return g_WebT2D_3.Sample(g_WebS_15, uv);
+        else return g_WebT2D_3.Sample(g_WebS_0, uv);
+    }
+    else if (textureIndex == 4) {
+        uint2 dimensions;
+        g_WebT2D_4.GetDimensions(dimensions.x, dimensions.y);
+        float2 uv = texCoord + offset / dimensions;
+        if (samplerIndex == 0) return g_WebT2D_4.Sample(g_WebS_0, uv);
+        else if (samplerIndex == 1) return g_WebT2D_4.Sample(g_WebS_1, uv);
+        else if (samplerIndex == 2) return g_WebT2D_4.Sample(g_WebS_2, uv);
+        else if (samplerIndex == 3) return g_WebT2D_4.Sample(g_WebS_3, uv);
+        else if (samplerIndex == 4) return g_WebT2D_4.Sample(g_WebS_4, uv);
+        else if (samplerIndex == 5) return g_WebT2D_4.Sample(g_WebS_5, uv);
+        else if (samplerIndex == 6) return g_WebT2D_4.Sample(g_WebS_6, uv);
+        else if (samplerIndex == 7) return g_WebT2D_4.Sample(g_WebS_7, uv);
+        else if (samplerIndex == 8) return g_WebT2D_4.Sample(g_WebS_8, uv);
+        else if (samplerIndex == 9) return g_WebT2D_4.Sample(g_WebS_9, uv);
+        else if (samplerIndex == 10) return g_WebT2D_4.Sample(g_WebS_10, uv);
+        else if (samplerIndex == 11) return g_WebT2D_4.Sample(g_WebS_11, uv);
+        else if (samplerIndex == 12) return g_WebT2D_4.Sample(g_WebS_12, uv);
+        else if (samplerIndex == 13) return g_WebT2D_4.Sample(g_WebS_13, uv);
+        else if (samplerIndex == 14) return g_WebT2D_4.Sample(g_WebS_14, uv);
+        else if (samplerIndex == 15) return g_WebT2D_4.Sample(g_WebS_15, uv);
+        else return g_WebT2D_4.Sample(g_WebS_0, uv);
+    }
+    else if (textureIndex == 5) {
+        uint2 dimensions;
+        g_WebT2D_5.GetDimensions(dimensions.x, dimensions.y);
+        float2 uv = texCoord + offset / dimensions;
+        if (samplerIndex == 0) return g_WebT2D_5.Sample(g_WebS_0, uv);
+        else if (samplerIndex == 1) return g_WebT2D_5.Sample(g_WebS_1, uv);
+        else if (samplerIndex == 2) return g_WebT2D_5.Sample(g_WebS_2, uv);
+        else if (samplerIndex == 3) return g_WebT2D_5.Sample(g_WebS_3, uv);
+        else if (samplerIndex == 4) return g_WebT2D_5.Sample(g_WebS_4, uv);
+        else if (samplerIndex == 5) return g_WebT2D_5.Sample(g_WebS_5, uv);
+        else if (samplerIndex == 6) return g_WebT2D_5.Sample(g_WebS_6, uv);
+        else if (samplerIndex == 7) return g_WebT2D_5.Sample(g_WebS_7, uv);
+        else if (samplerIndex == 8) return g_WebT2D_5.Sample(g_WebS_8, uv);
+        else if (samplerIndex == 9) return g_WebT2D_5.Sample(g_WebS_9, uv);
+        else if (samplerIndex == 10) return g_WebT2D_5.Sample(g_WebS_10, uv);
+        else if (samplerIndex == 11) return g_WebT2D_5.Sample(g_WebS_11, uv);
+        else if (samplerIndex == 12) return g_WebT2D_5.Sample(g_WebS_12, uv);
+        else if (samplerIndex == 13) return g_WebT2D_5.Sample(g_WebS_13, uv);
+        else if (samplerIndex == 14) return g_WebT2D_5.Sample(g_WebS_14, uv);
+        else if (samplerIndex == 15) return g_WebT2D_5.Sample(g_WebS_15, uv);
+        else return g_WebT2D_5.Sample(g_WebS_0, uv);
+    }
+    else if (textureIndex == 6) {
+        uint2 dimensions;
+        g_WebT2D_6.GetDimensions(dimensions.x, dimensions.y);
+        float2 uv = texCoord + offset / dimensions;
+        if (samplerIndex == 0) return g_WebT2D_6.Sample(g_WebS_0, uv);
+        else if (samplerIndex == 1) return g_WebT2D_6.Sample(g_WebS_1, uv);
+        else if (samplerIndex == 2) return g_WebT2D_6.Sample(g_WebS_2, uv);
+        else if (samplerIndex == 3) return g_WebT2D_6.Sample(g_WebS_3, uv);
+        else if (samplerIndex == 4) return g_WebT2D_6.Sample(g_WebS_4, uv);
+        else if (samplerIndex == 5) return g_WebT2D_6.Sample(g_WebS_5, uv);
+        else if (samplerIndex == 6) return g_WebT2D_6.Sample(g_WebS_6, uv);
+        else if (samplerIndex == 7) return g_WebT2D_6.Sample(g_WebS_7, uv);
+        else if (samplerIndex == 8) return g_WebT2D_6.Sample(g_WebS_8, uv);
+        else if (samplerIndex == 9) return g_WebT2D_6.Sample(g_WebS_9, uv);
+        else if (samplerIndex == 10) return g_WebT2D_6.Sample(g_WebS_10, uv);
+        else if (samplerIndex == 11) return g_WebT2D_6.Sample(g_WebS_11, uv);
+        else if (samplerIndex == 12) return g_WebT2D_6.Sample(g_WebS_12, uv);
+        else if (samplerIndex == 13) return g_WebT2D_6.Sample(g_WebS_13, uv);
+        else if (samplerIndex == 14) return g_WebT2D_6.Sample(g_WebS_14, uv);
+        else if (samplerIndex == 15) return g_WebT2D_6.Sample(g_WebS_15, uv);
+        else return g_WebT2D_6.Sample(g_WebS_0, uv);
+    }
+    else if (textureIndex == 7) {
+        uint2 dimensions;
+        g_WebT2D_7.GetDimensions(dimensions.x, dimensions.y);
+        float2 uv = texCoord + offset / dimensions;
+        if (samplerIndex == 0) return g_WebT2D_7.Sample(g_WebS_0, uv);
+        else if (samplerIndex == 1) return g_WebT2D_7.Sample(g_WebS_1, uv);
+        else if (samplerIndex == 2) return g_WebT2D_7.Sample(g_WebS_2, uv);
+        else if (samplerIndex == 3) return g_WebT2D_7.Sample(g_WebS_3, uv);
+        else if (samplerIndex == 4) return g_WebT2D_7.Sample(g_WebS_4, uv);
+        else if (samplerIndex == 5) return g_WebT2D_7.Sample(g_WebS_5, uv);
+        else if (samplerIndex == 6) return g_WebT2D_7.Sample(g_WebS_6, uv);
+        else if (samplerIndex == 7) return g_WebT2D_7.Sample(g_WebS_7, uv);
+        else if (samplerIndex == 8) return g_WebT2D_7.Sample(g_WebS_8, uv);
+        else if (samplerIndex == 9) return g_WebT2D_7.Sample(g_WebS_9, uv);
+        else if (samplerIndex == 10) return g_WebT2D_7.Sample(g_WebS_10, uv);
+        else if (samplerIndex == 11) return g_WebT2D_7.Sample(g_WebS_11, uv);
+        else if (samplerIndex == 12) return g_WebT2D_7.Sample(g_WebS_12, uv);
+        else if (samplerIndex == 13) return g_WebT2D_7.Sample(g_WebS_13, uv);
+        else if (samplerIndex == 14) return g_WebT2D_7.Sample(g_WebS_14, uv);
+        else if (samplerIndex == 15) return g_WebT2D_7.Sample(g_WebS_15, uv);
+        else return g_WebT2D_7.Sample(g_WebS_0, uv);
+    }
+    else if (textureIndex == 8) {
+        uint2 dimensions;
+        g_WebT2D_8.GetDimensions(dimensions.x, dimensions.y);
+        float2 uv = texCoord + offset / dimensions;
+        if (samplerIndex == 0) return g_WebT2D_8.Sample(g_WebS_0, uv);
+        else if (samplerIndex == 1) return g_WebT2D_8.Sample(g_WebS_1, uv);
+        else if (samplerIndex == 2) return g_WebT2D_8.Sample(g_WebS_2, uv);
+        else if (samplerIndex == 3) return g_WebT2D_8.Sample(g_WebS_3, uv);
+        else if (samplerIndex == 4) return g_WebT2D_8.Sample(g_WebS_4, uv);
+        else if (samplerIndex == 5) return g_WebT2D_8.Sample(g_WebS_5, uv);
+        else if (samplerIndex == 6) return g_WebT2D_8.Sample(g_WebS_6, uv);
+        else if (samplerIndex == 7) return g_WebT2D_8.Sample(g_WebS_7, uv);
+        else if (samplerIndex == 8) return g_WebT2D_8.Sample(g_WebS_8, uv);
+        else if (samplerIndex == 9) return g_WebT2D_8.Sample(g_WebS_9, uv);
+        else if (samplerIndex == 10) return g_WebT2D_8.Sample(g_WebS_10, uv);
+        else if (samplerIndex == 11) return g_WebT2D_8.Sample(g_WebS_11, uv);
+        else if (samplerIndex == 12) return g_WebT2D_8.Sample(g_WebS_12, uv);
+        else if (samplerIndex == 13) return g_WebT2D_8.Sample(g_WebS_13, uv);
+        else if (samplerIndex == 14) return g_WebT2D_8.Sample(g_WebS_14, uv);
+        else if (samplerIndex == 15) return g_WebT2D_8.Sample(g_WebS_15, uv);
+        else return g_WebT2D_8.Sample(g_WebS_0, uv);
+    }
+    else if (textureIndex == 9) {
+        uint2 dimensions;
+        g_WebT2D_9.GetDimensions(dimensions.x, dimensions.y);
+        float2 uv = texCoord + offset / dimensions;
+        if (samplerIndex == 0) return g_WebT2D_9.Sample(g_WebS_0, uv);
+        else if (samplerIndex == 1) return g_WebT2D_9.Sample(g_WebS_1, uv);
+        else if (samplerIndex == 2) return g_WebT2D_9.Sample(g_WebS_2, uv);
+        else if (samplerIndex == 3) return g_WebT2D_9.Sample(g_WebS_3, uv);
+        else if (samplerIndex == 4) return g_WebT2D_9.Sample(g_WebS_4, uv);
+        else if (samplerIndex == 5) return g_WebT2D_9.Sample(g_WebS_5, uv);
+        else if (samplerIndex == 6) return g_WebT2D_9.Sample(g_WebS_6, uv);
+        else if (samplerIndex == 7) return g_WebT2D_9.Sample(g_WebS_7, uv);
+        else if (samplerIndex == 8) return g_WebT2D_9.Sample(g_WebS_8, uv);
+        else if (samplerIndex == 9) return g_WebT2D_9.Sample(g_WebS_9, uv);
+        else if (samplerIndex == 10) return g_WebT2D_9.Sample(g_WebS_10, uv);
+        else if (samplerIndex == 11) return g_WebT2D_9.Sample(g_WebS_11, uv);
+        else if (samplerIndex == 12) return g_WebT2D_9.Sample(g_WebS_12, uv);
+        else if (samplerIndex == 13) return g_WebT2D_9.Sample(g_WebS_13, uv);
+        else if (samplerIndex == 14) return g_WebT2D_9.Sample(g_WebS_14, uv);
+        else if (samplerIndex == 15) return g_WebT2D_9.Sample(g_WebS_15, uv);
+        else return g_WebT2D_9.Sample(g_WebS_0, uv);
+    }
+    else if (textureIndex == 10) {
+        uint2 dimensions;
+        g_WebT2D_10.GetDimensions(dimensions.x, dimensions.y);
+        float2 uv = texCoord + offset / dimensions;
+        if (samplerIndex == 0) return g_WebT2D_10.Sample(g_WebS_0, uv);
+        else if (samplerIndex == 1) return g_WebT2D_10.Sample(g_WebS_1, uv);
+        else if (samplerIndex == 2) return g_WebT2D_10.Sample(g_WebS_2, uv);
+        else if (samplerIndex == 3) return g_WebT2D_10.Sample(g_WebS_3, uv);
+        else if (samplerIndex == 4) return g_WebT2D_10.Sample(g_WebS_4, uv);
+        else if (samplerIndex == 5) return g_WebT2D_10.Sample(g_WebS_5, uv);
+        else if (samplerIndex == 6) return g_WebT2D_10.Sample(g_WebS_6, uv);
+        else if (samplerIndex == 7) return g_WebT2D_10.Sample(g_WebS_7, uv);
+        else if (samplerIndex == 8) return g_WebT2D_10.Sample(g_WebS_8, uv);
+        else if (samplerIndex == 9) return g_WebT2D_10.Sample(g_WebS_9, uv);
+        else if (samplerIndex == 10) return g_WebT2D_10.Sample(g_WebS_10, uv);
+        else if (samplerIndex == 11) return g_WebT2D_10.Sample(g_WebS_11, uv);
+        else if (samplerIndex == 12) return g_WebT2D_10.Sample(g_WebS_12, uv);
+        else if (samplerIndex == 13) return g_WebT2D_10.Sample(g_WebS_13, uv);
+        else if (samplerIndex == 14) return g_WebT2D_10.Sample(g_WebS_14, uv);
+        else if (samplerIndex == 15) return g_WebT2D_10.Sample(g_WebS_15, uv);
+        else return g_WebT2D_10.Sample(g_WebS_0, uv);
+    }
+    else if (textureIndex == 11) {
+        uint2 dimensions;
+        g_WebT2D_11.GetDimensions(dimensions.x, dimensions.y);
+        float2 uv = texCoord + offset / dimensions;
+        if (samplerIndex == 0) return g_WebT2D_11.Sample(g_WebS_0, uv);
+        else if (samplerIndex == 1) return g_WebT2D_11.Sample(g_WebS_1, uv);
+        else if (samplerIndex == 2) return g_WebT2D_11.Sample(g_WebS_2, uv);
+        else if (samplerIndex == 3) return g_WebT2D_11.Sample(g_WebS_3, uv);
+        else if (samplerIndex == 4) return g_WebT2D_11.Sample(g_WebS_4, uv);
+        else if (samplerIndex == 5) return g_WebT2D_11.Sample(g_WebS_5, uv);
+        else if (samplerIndex == 6) return g_WebT2D_11.Sample(g_WebS_6, uv);
+        else if (samplerIndex == 7) return g_WebT2D_11.Sample(g_WebS_7, uv);
+        else if (samplerIndex == 8) return g_WebT2D_11.Sample(g_WebS_8, uv);
+        else if (samplerIndex == 9) return g_WebT2D_11.Sample(g_WebS_9, uv);
+        else if (samplerIndex == 10) return g_WebT2D_11.Sample(g_WebS_10, uv);
+        else if (samplerIndex == 11) return g_WebT2D_11.Sample(g_WebS_11, uv);
+        else if (samplerIndex == 12) return g_WebT2D_11.Sample(g_WebS_12, uv);
+        else if (samplerIndex == 13) return g_WebT2D_11.Sample(g_WebS_13, uv);
+        else if (samplerIndex == 14) return g_WebT2D_11.Sample(g_WebS_14, uv);
+        else if (samplerIndex == 15) return g_WebT2D_11.Sample(g_WebS_15, uv);
+        else return g_WebT2D_11.Sample(g_WebS_0, uv);
+    }
+    else if (textureIndex == 12) {
+        uint2 dimensions;
+        g_WebT2D_12.GetDimensions(dimensions.x, dimensions.y);
+        float2 uv = texCoord + offset / dimensions;
+        if (samplerIndex == 0) return g_WebT2D_12.Sample(g_WebS_0, uv);
+        else if (samplerIndex == 1) return g_WebT2D_12.Sample(g_WebS_1, uv);
+        else if (samplerIndex == 2) return g_WebT2D_12.Sample(g_WebS_2, uv);
+        else if (samplerIndex == 3) return g_WebT2D_12.Sample(g_WebS_3, uv);
+        else if (samplerIndex == 4) return g_WebT2D_12.Sample(g_WebS_4, uv);
+        else if (samplerIndex == 5) return g_WebT2D_12.Sample(g_WebS_5, uv);
+        else if (samplerIndex == 6) return g_WebT2D_12.Sample(g_WebS_6, uv);
+        else if (samplerIndex == 7) return g_WebT2D_12.Sample(g_WebS_7, uv);
+        else if (samplerIndex == 8) return g_WebT2D_12.Sample(g_WebS_8, uv);
+        else if (samplerIndex == 9) return g_WebT2D_12.Sample(g_WebS_9, uv);
+        else if (samplerIndex == 10) return g_WebT2D_12.Sample(g_WebS_10, uv);
+        else if (samplerIndex == 11) return g_WebT2D_12.Sample(g_WebS_11, uv);
+        else if (samplerIndex == 12) return g_WebT2D_12.Sample(g_WebS_12, uv);
+        else if (samplerIndex == 13) return g_WebT2D_12.Sample(g_WebS_13, uv);
+        else if (samplerIndex == 14) return g_WebT2D_12.Sample(g_WebS_14, uv);
+        else if (samplerIndex == 15) return g_WebT2D_12.Sample(g_WebS_15, uv);
+        else return g_WebT2D_12.Sample(g_WebS_0, uv);
+    }
+    else if (textureIndex == 13) {
+        uint2 dimensions;
+        g_WebT2D_13.GetDimensions(dimensions.x, dimensions.y);
+        float2 uv = texCoord + offset / dimensions;
+        if (samplerIndex == 0) return g_WebT2D_13.Sample(g_WebS_0, uv);
+        else if (samplerIndex == 1) return g_WebT2D_13.Sample(g_WebS_1, uv);
+        else if (samplerIndex == 2) return g_WebT2D_13.Sample(g_WebS_2, uv);
+        else if (samplerIndex == 3) return g_WebT2D_13.Sample(g_WebS_3, uv);
+        else if (samplerIndex == 4) return g_WebT2D_13.Sample(g_WebS_4, uv);
+        else if (samplerIndex == 5) return g_WebT2D_13.Sample(g_WebS_5, uv);
+        else if (samplerIndex == 6) return g_WebT2D_13.Sample(g_WebS_6, uv);
+        else if (samplerIndex == 7) return g_WebT2D_13.Sample(g_WebS_7, uv);
+        else if (samplerIndex == 8) return g_WebT2D_13.Sample(g_WebS_8, uv);
+        else if (samplerIndex == 9) return g_WebT2D_13.Sample(g_WebS_9, uv);
+        else if (samplerIndex == 10) return g_WebT2D_13.Sample(g_WebS_10, uv);
+        else if (samplerIndex == 11) return g_WebT2D_13.Sample(g_WebS_11, uv);
+        else if (samplerIndex == 12) return g_WebT2D_13.Sample(g_WebS_12, uv);
+        else if (samplerIndex == 13) return g_WebT2D_13.Sample(g_WebS_13, uv);
+        else if (samplerIndex == 14) return g_WebT2D_13.Sample(g_WebS_14, uv);
+        else if (samplerIndex == 15) return g_WebT2D_13.Sample(g_WebS_15, uv);
+        else return g_WebT2D_13.Sample(g_WebS_0, uv);
+    }
+    else if (textureIndex == 14) {
+        uint2 dimensions;
+        g_WebT2D_14.GetDimensions(dimensions.x, dimensions.y);
+        float2 uv = texCoord + offset / dimensions;
+        if (samplerIndex == 0) return g_WebT2D_14.Sample(g_WebS_0, uv);
+        else if (samplerIndex == 1) return g_WebT2D_14.Sample(g_WebS_1, uv);
+        else if (samplerIndex == 2) return g_WebT2D_14.Sample(g_WebS_2, uv);
+        else if (samplerIndex == 3) return g_WebT2D_14.Sample(g_WebS_3, uv);
+        else if (samplerIndex == 4) return g_WebT2D_14.Sample(g_WebS_4, uv);
+        else if (samplerIndex == 5) return g_WebT2D_14.Sample(g_WebS_5, uv);
+        else if (samplerIndex == 6) return g_WebT2D_14.Sample(g_WebS_6, uv);
+        else if (samplerIndex == 7) return g_WebT2D_14.Sample(g_WebS_7, uv);
+        else if (samplerIndex == 8) return g_WebT2D_14.Sample(g_WebS_8, uv);
+        else if (samplerIndex == 9) return g_WebT2D_14.Sample(g_WebS_9, uv);
+        else if (samplerIndex == 10) return g_WebT2D_14.Sample(g_WebS_10, uv);
+        else if (samplerIndex == 11) return g_WebT2D_14.Sample(g_WebS_11, uv);
+        else if (samplerIndex == 12) return g_WebT2D_14.Sample(g_WebS_12, uv);
+        else if (samplerIndex == 13) return g_WebT2D_14.Sample(g_WebS_13, uv);
+        else if (samplerIndex == 14) return g_WebT2D_14.Sample(g_WebS_14, uv);
+        else if (samplerIndex == 15) return g_WebT2D_14.Sample(g_WebS_15, uv);
+        else return g_WebT2D_14.Sample(g_WebS_0, uv);
+    }
+    else if (textureIndex == 15) {
+        uint2 dimensions;
+        g_WebT2D_15.GetDimensions(dimensions.x, dimensions.y);
+        float2 uv = texCoord + offset / dimensions;
+        if (samplerIndex == 0) return g_WebT2D_15.Sample(g_WebS_0, uv);
+        else if (samplerIndex == 1) return g_WebT2D_15.Sample(g_WebS_1, uv);
+        else if (samplerIndex == 2) return g_WebT2D_15.Sample(g_WebS_2, uv);
+        else if (samplerIndex == 3) return g_WebT2D_15.Sample(g_WebS_3, uv);
+        else if (samplerIndex == 4) return g_WebT2D_15.Sample(g_WebS_4, uv);
+        else if (samplerIndex == 5) return g_WebT2D_15.Sample(g_WebS_5, uv);
+        else if (samplerIndex == 6) return g_WebT2D_15.Sample(g_WebS_6, uv);
+        else if (samplerIndex == 7) return g_WebT2D_15.Sample(g_WebS_7, uv);
+        else if (samplerIndex == 8) return g_WebT2D_15.Sample(g_WebS_8, uv);
+        else if (samplerIndex == 9) return g_WebT2D_15.Sample(g_WebS_9, uv);
+        else if (samplerIndex == 10) return g_WebT2D_15.Sample(g_WebS_10, uv);
+        else if (samplerIndex == 11) return g_WebT2D_15.Sample(g_WebS_11, uv);
+        else if (samplerIndex == 12) return g_WebT2D_15.Sample(g_WebS_12, uv);
+        else if (samplerIndex == 13) return g_WebT2D_15.Sample(g_WebS_13, uv);
+        else if (samplerIndex == 14) return g_WebT2D_15.Sample(g_WebS_14, uv);
+        else if (samplerIndex == 15) return g_WebT2D_15.Sample(g_WebS_15, uv);
+        else return g_WebT2D_15.Sample(g_WebS_0, uv);
+    }
+    else if (textureIndex == 16) {
+        uint2 dimensions;
+        g_WebT2D_16.GetDimensions(dimensions.x, dimensions.y);
+        float2 uv = texCoord + offset / dimensions;
+        if (samplerIndex == 0) return g_WebT2D_16.Sample(g_WebS_0, uv);
+        else if (samplerIndex == 1) return g_WebT2D_16.Sample(g_WebS_1, uv);
+        else if (samplerIndex == 2) return g_WebT2D_16.Sample(g_WebS_2, uv);
+        else if (samplerIndex == 3) return g_WebT2D_16.Sample(g_WebS_3, uv);
+        else if (samplerIndex == 4) return g_WebT2D_16.Sample(g_WebS_4, uv);
+        else if (samplerIndex == 5) return g_WebT2D_16.Sample(g_WebS_5, uv);
+        else if (samplerIndex == 6) return g_WebT2D_16.Sample(g_WebS_6, uv);
+        else if (samplerIndex == 7) return g_WebT2D_16.Sample(g_WebS_7, uv);
+        else if (samplerIndex == 8) return g_WebT2D_16.Sample(g_WebS_8, uv);
+        else if (samplerIndex == 9) return g_WebT2D_16.Sample(g_WebS_9, uv);
+        else if (samplerIndex == 10) return g_WebT2D_16.Sample(g_WebS_10, uv);
+        else if (samplerIndex == 11) return g_WebT2D_16.Sample(g_WebS_11, uv);
+        else if (samplerIndex == 12) return g_WebT2D_16.Sample(g_WebS_12, uv);
+        else if (samplerIndex == 13) return g_WebT2D_16.Sample(g_WebS_13, uv);
+        else if (samplerIndex == 14) return g_WebT2D_16.Sample(g_WebS_14, uv);
+        else if (samplerIndex == 15) return g_WebT2D_16.Sample(g_WebS_15, uv);
+        else return g_WebT2D_16.Sample(g_WebS_0, uv);
+    }
+    else if (textureIndex == 17) {
+        uint2 dimensions;
+        g_WebT2D_17.GetDimensions(dimensions.x, dimensions.y);
+        float2 uv = texCoord + offset / dimensions;
+        if (samplerIndex == 0) return g_WebT2D_17.Sample(g_WebS_0, uv);
+        else if (samplerIndex == 1) return g_WebT2D_17.Sample(g_WebS_1, uv);
+        else if (samplerIndex == 2) return g_WebT2D_17.Sample(g_WebS_2, uv);
+        else if (samplerIndex == 3) return g_WebT2D_17.Sample(g_WebS_3, uv);
+        else if (samplerIndex == 4) return g_WebT2D_17.Sample(g_WebS_4, uv);
+        else if (samplerIndex == 5) return g_WebT2D_17.Sample(g_WebS_5, uv);
+        else if (samplerIndex == 6) return g_WebT2D_17.Sample(g_WebS_6, uv);
+        else if (samplerIndex == 7) return g_WebT2D_17.Sample(g_WebS_7, uv);
+        else if (samplerIndex == 8) return g_WebT2D_17.Sample(g_WebS_8, uv);
+        else if (samplerIndex == 9) return g_WebT2D_17.Sample(g_WebS_9, uv);
+        else if (samplerIndex == 10) return g_WebT2D_17.Sample(g_WebS_10, uv);
+        else if (samplerIndex == 11) return g_WebT2D_17.Sample(g_WebS_11, uv);
+        else if (samplerIndex == 12) return g_WebT2D_17.Sample(g_WebS_12, uv);
+        else if (samplerIndex == 13) return g_WebT2D_17.Sample(g_WebS_13, uv);
+        else if (samplerIndex == 14) return g_WebT2D_17.Sample(g_WebS_14, uv);
+        else if (samplerIndex == 15) return g_WebT2D_17.Sample(g_WebS_15, uv);
+        else return g_WebT2D_17.Sample(g_WebS_0, uv);
+    }
+    else if (textureIndex == 18) {
+        uint2 dimensions;
+        g_WebT2D_18.GetDimensions(dimensions.x, dimensions.y);
+        float2 uv = texCoord + offset / dimensions;
+        if (samplerIndex == 0) return g_WebT2D_18.Sample(g_WebS_0, uv);
+        else if (samplerIndex == 1) return g_WebT2D_18.Sample(g_WebS_1, uv);
+        else if (samplerIndex == 2) return g_WebT2D_18.Sample(g_WebS_2, uv);
+        else if (samplerIndex == 3) return g_WebT2D_18.Sample(g_WebS_3, uv);
+        else if (samplerIndex == 4) return g_WebT2D_18.Sample(g_WebS_4, uv);
+        else if (samplerIndex == 5) return g_WebT2D_18.Sample(g_WebS_5, uv);
+        else if (samplerIndex == 6) return g_WebT2D_18.Sample(g_WebS_6, uv);
+        else if (samplerIndex == 7) return g_WebT2D_18.Sample(g_WebS_7, uv);
+        else if (samplerIndex == 8) return g_WebT2D_18.Sample(g_WebS_8, uv);
+        else if (samplerIndex == 9) return g_WebT2D_18.Sample(g_WebS_9, uv);
+        else if (samplerIndex == 10) return g_WebT2D_18.Sample(g_WebS_10, uv);
+        else if (samplerIndex == 11) return g_WebT2D_18.Sample(g_WebS_11, uv);
+        else if (samplerIndex == 12) return g_WebT2D_18.Sample(g_WebS_12, uv);
+        else if (samplerIndex == 13) return g_WebT2D_18.Sample(g_WebS_13, uv);
+        else if (samplerIndex == 14) return g_WebT2D_18.Sample(g_WebS_14, uv);
+        else if (samplerIndex == 15) return g_WebT2D_18.Sample(g_WebS_15, uv);
+        else return g_WebT2D_18.Sample(g_WebS_0, uv);
+    }
+    else if (textureIndex == 19) {
+        uint2 dimensions;
+        g_WebT2D_19.GetDimensions(dimensions.x, dimensions.y);
+        float2 uv = texCoord + offset / dimensions;
+        if (samplerIndex == 0) return g_WebT2D_19.Sample(g_WebS_0, uv);
+        else if (samplerIndex == 1) return g_WebT2D_19.Sample(g_WebS_1, uv);
+        else if (samplerIndex == 2) return g_WebT2D_19.Sample(g_WebS_2, uv);
+        else if (samplerIndex == 3) return g_WebT2D_19.Sample(g_WebS_3, uv);
+        else if (samplerIndex == 4) return g_WebT2D_19.Sample(g_WebS_4, uv);
+        else if (samplerIndex == 5) return g_WebT2D_19.Sample(g_WebS_5, uv);
+        else if (samplerIndex == 6) return g_WebT2D_19.Sample(g_WebS_6, uv);
+        else if (samplerIndex == 7) return g_WebT2D_19.Sample(g_WebS_7, uv);
+        else if (samplerIndex == 8) return g_WebT2D_19.Sample(g_WebS_8, uv);
+        else if (samplerIndex == 9) return g_WebT2D_19.Sample(g_WebS_9, uv);
+        else if (samplerIndex == 10) return g_WebT2D_19.Sample(g_WebS_10, uv);
+        else if (samplerIndex == 11) return g_WebT2D_19.Sample(g_WebS_11, uv);
+        else if (samplerIndex == 12) return g_WebT2D_19.Sample(g_WebS_12, uv);
+        else if (samplerIndex == 13) return g_WebT2D_19.Sample(g_WebS_13, uv);
+        else if (samplerIndex == 14) return g_WebT2D_19.Sample(g_WebS_14, uv);
+        else if (samplerIndex == 15) return g_WebT2D_19.Sample(g_WebS_15, uv);
+        else return g_WebT2D_19.Sample(g_WebS_0, uv);
+    }
+    else if (textureIndex == 20) {
+        uint2 dimensions;
+        g_WebT2D_20.GetDimensions(dimensions.x, dimensions.y);
+        float2 uv = texCoord + offset / dimensions;
+        if (samplerIndex == 0) return g_WebT2D_20.Sample(g_WebS_0, uv);
+        else if (samplerIndex == 1) return g_WebT2D_20.Sample(g_WebS_1, uv);
+        else if (samplerIndex == 2) return g_WebT2D_20.Sample(g_WebS_2, uv);
+        else if (samplerIndex == 3) return g_WebT2D_20.Sample(g_WebS_3, uv);
+        else if (samplerIndex == 4) return g_WebT2D_20.Sample(g_WebS_4, uv);
+        else if (samplerIndex == 5) return g_WebT2D_20.Sample(g_WebS_5, uv);
+        else if (samplerIndex == 6) return g_WebT2D_20.Sample(g_WebS_6, uv);
+        else if (samplerIndex == 7) return g_WebT2D_20.Sample(g_WebS_7, uv);
+        else if (samplerIndex == 8) return g_WebT2D_20.Sample(g_WebS_8, uv);
+        else if (samplerIndex == 9) return g_WebT2D_20.Sample(g_WebS_9, uv);
+        else if (samplerIndex == 10) return g_WebT2D_20.Sample(g_WebS_10, uv);
+        else if (samplerIndex == 11) return g_WebT2D_20.Sample(g_WebS_11, uv);
+        else if (samplerIndex == 12) return g_WebT2D_20.Sample(g_WebS_12, uv);
+        else if (samplerIndex == 13) return g_WebT2D_20.Sample(g_WebS_13, uv);
+        else if (samplerIndex == 14) return g_WebT2D_20.Sample(g_WebS_14, uv);
+        else if (samplerIndex == 15) return g_WebT2D_20.Sample(g_WebS_15, uv);
+        else return g_WebT2D_20.Sample(g_WebS_0, uv);
+    }
+    else if (textureIndex == 21) {
+        uint2 dimensions;
+        g_WebT2D_21.GetDimensions(dimensions.x, dimensions.y);
+        float2 uv = texCoord + offset / dimensions;
+        if (samplerIndex == 0) return g_WebT2D_21.Sample(g_WebS_0, uv);
+        else if (samplerIndex == 1) return g_WebT2D_21.Sample(g_WebS_1, uv);
+        else if (samplerIndex == 2) return g_WebT2D_21.Sample(g_WebS_2, uv);
+        else if (samplerIndex == 3) return g_WebT2D_21.Sample(g_WebS_3, uv);
+        else if (samplerIndex == 4) return g_WebT2D_21.Sample(g_WebS_4, uv);
+        else if (samplerIndex == 5) return g_WebT2D_21.Sample(g_WebS_5, uv);
+        else if (samplerIndex == 6) return g_WebT2D_21.Sample(g_WebS_6, uv);
+        else if (samplerIndex == 7) return g_WebT2D_21.Sample(g_WebS_7, uv);
+        else if (samplerIndex == 8) return g_WebT2D_21.Sample(g_WebS_8, uv);
+        else if (samplerIndex == 9) return g_WebT2D_21.Sample(g_WebS_9, uv);
+        else if (samplerIndex == 10) return g_WebT2D_21.Sample(g_WebS_10, uv);
+        else if (samplerIndex == 11) return g_WebT2D_21.Sample(g_WebS_11, uv);
+        else if (samplerIndex == 12) return g_WebT2D_21.Sample(g_WebS_12, uv);
+        else if (samplerIndex == 13) return g_WebT2D_21.Sample(g_WebS_13, uv);
+        else if (samplerIndex == 14) return g_WebT2D_21.Sample(g_WebS_14, uv);
+        else if (samplerIndex == 15) return g_WebT2D_21.Sample(g_WebS_15, uv);
+        else return g_WebT2D_21.Sample(g_WebS_0, uv);
+    }
+    else if (textureIndex == 22) {
+        uint2 dimensions;
+        g_WebT2D_22.GetDimensions(dimensions.x, dimensions.y);
+        float2 uv = texCoord + offset / dimensions;
+        if (samplerIndex == 0) return g_WebT2D_22.Sample(g_WebS_0, uv);
+        else if (samplerIndex == 1) return g_WebT2D_22.Sample(g_WebS_1, uv);
+        else if (samplerIndex == 2) return g_WebT2D_22.Sample(g_WebS_2, uv);
+        else if (samplerIndex == 3) return g_WebT2D_22.Sample(g_WebS_3, uv);
+        else if (samplerIndex == 4) return g_WebT2D_22.Sample(g_WebS_4, uv);
+        else if (samplerIndex == 5) return g_WebT2D_22.Sample(g_WebS_5, uv);
+        else if (samplerIndex == 6) return g_WebT2D_22.Sample(g_WebS_6, uv);
+        else if (samplerIndex == 7) return g_WebT2D_22.Sample(g_WebS_7, uv);
+        else if (samplerIndex == 8) return g_WebT2D_22.Sample(g_WebS_8, uv);
+        else if (samplerIndex == 9) return g_WebT2D_22.Sample(g_WebS_9, uv);
+        else if (samplerIndex == 10) return g_WebT2D_22.Sample(g_WebS_10, uv);
+        else if (samplerIndex == 11) return g_WebT2D_22.Sample(g_WebS_11, uv);
+        else if (samplerIndex == 12) return g_WebT2D_22.Sample(g_WebS_12, uv);
+        else if (samplerIndex == 13) return g_WebT2D_22.Sample(g_WebS_13, uv);
+        else if (samplerIndex == 14) return g_WebT2D_22.Sample(g_WebS_14, uv);
+        else if (samplerIndex == 15) return g_WebT2D_22.Sample(g_WebS_15, uv);
+        else return g_WebT2D_22.Sample(g_WebS_0, uv);
+    }
+    else if (textureIndex == 23) {
+        uint2 dimensions;
+        g_WebT2D_23.GetDimensions(dimensions.x, dimensions.y);
+        float2 uv = texCoord + offset / dimensions;
+        if (samplerIndex == 0) return g_WebT2D_23.Sample(g_WebS_0, uv);
+        else if (samplerIndex == 1) return g_WebT2D_23.Sample(g_WebS_1, uv);
+        else if (samplerIndex == 2) return g_WebT2D_23.Sample(g_WebS_2, uv);
+        else if (samplerIndex == 3) return g_WebT2D_23.Sample(g_WebS_3, uv);
+        else if (samplerIndex == 4) return g_WebT2D_23.Sample(g_WebS_4, uv);
+        else if (samplerIndex == 5) return g_WebT2D_23.Sample(g_WebS_5, uv);
+        else if (samplerIndex == 6) return g_WebT2D_23.Sample(g_WebS_6, uv);
+        else if (samplerIndex == 7) return g_WebT2D_23.Sample(g_WebS_7, uv);
+        else if (samplerIndex == 8) return g_WebT2D_23.Sample(g_WebS_8, uv);
+        else if (samplerIndex == 9) return g_WebT2D_23.Sample(g_WebS_9, uv);
+        else if (samplerIndex == 10) return g_WebT2D_23.Sample(g_WebS_10, uv);
+        else if (samplerIndex == 11) return g_WebT2D_23.Sample(g_WebS_11, uv);
+        else if (samplerIndex == 12) return g_WebT2D_23.Sample(g_WebS_12, uv);
+        else if (samplerIndex == 13) return g_WebT2D_23.Sample(g_WebS_13, uv);
+        else if (samplerIndex == 14) return g_WebT2D_23.Sample(g_WebS_14, uv);
+        else if (samplerIndex == 15) return g_WebT2D_23.Sample(g_WebS_15, uv);
+        else return g_WebT2D_23.Sample(g_WebS_0, uv);
+    }
+    else if (textureIndex == 24) {
+        uint2 dimensions;
+        g_WebT2D_24.GetDimensions(dimensions.x, dimensions.y);
+        float2 uv = texCoord + offset / dimensions;
+        if (samplerIndex == 0) return g_WebT2D_24.Sample(g_WebS_0, uv);
+        else if (samplerIndex == 1) return g_WebT2D_24.Sample(g_WebS_1, uv);
+        else if (samplerIndex == 2) return g_WebT2D_24.Sample(g_WebS_2, uv);
+        else if (samplerIndex == 3) return g_WebT2D_24.Sample(g_WebS_3, uv);
+        else if (samplerIndex == 4) return g_WebT2D_24.Sample(g_WebS_4, uv);
+        else if (samplerIndex == 5) return g_WebT2D_24.Sample(g_WebS_5, uv);
+        else if (samplerIndex == 6) return g_WebT2D_24.Sample(g_WebS_6, uv);
+        else if (samplerIndex == 7) return g_WebT2D_24.Sample(g_WebS_7, uv);
+        else if (samplerIndex == 8) return g_WebT2D_24.Sample(g_WebS_8, uv);
+        else if (samplerIndex == 9) return g_WebT2D_24.Sample(g_WebS_9, uv);
+        else if (samplerIndex == 10) return g_WebT2D_24.Sample(g_WebS_10, uv);
+        else if (samplerIndex == 11) return g_WebT2D_24.Sample(g_WebS_11, uv);
+        else if (samplerIndex == 12) return g_WebT2D_24.Sample(g_WebS_12, uv);
+        else if (samplerIndex == 13) return g_WebT2D_24.Sample(g_WebS_13, uv);
+        else if (samplerIndex == 14) return g_WebT2D_24.Sample(g_WebS_14, uv);
+        else if (samplerIndex == 15) return g_WebT2D_24.Sample(g_WebS_15, uv);
+        else return g_WebT2D_24.Sample(g_WebS_0, uv);
+    }
+    else if (textureIndex == 25) {
+        uint2 dimensions;
+        g_WebT2D_25.GetDimensions(dimensions.x, dimensions.y);
+        float2 uv = texCoord + offset / dimensions;
+        if (samplerIndex == 0) return g_WebT2D_25.Sample(g_WebS_0, uv);
+        else if (samplerIndex == 1) return g_WebT2D_25.Sample(g_WebS_1, uv);
+        else if (samplerIndex == 2) return g_WebT2D_25.Sample(g_WebS_2, uv);
+        else if (samplerIndex == 3) return g_WebT2D_25.Sample(g_WebS_3, uv);
+        else if (samplerIndex == 4) return g_WebT2D_25.Sample(g_WebS_4, uv);
+        else if (samplerIndex == 5) return g_WebT2D_25.Sample(g_WebS_5, uv);
+        else if (samplerIndex == 6) return g_WebT2D_25.Sample(g_WebS_6, uv);
+        else if (samplerIndex == 7) return g_WebT2D_25.Sample(g_WebS_7, uv);
+        else if (samplerIndex == 8) return g_WebT2D_25.Sample(g_WebS_8, uv);
+        else if (samplerIndex == 9) return g_WebT2D_25.Sample(g_WebS_9, uv);
+        else if (samplerIndex == 10) return g_WebT2D_25.Sample(g_WebS_10, uv);
+        else if (samplerIndex == 11) return g_WebT2D_25.Sample(g_WebS_11, uv);
+        else if (samplerIndex == 12) return g_WebT2D_25.Sample(g_WebS_12, uv);
+        else if (samplerIndex == 13) return g_WebT2D_25.Sample(g_WebS_13, uv);
+        else if (samplerIndex == 14) return g_WebT2D_25.Sample(g_WebS_14, uv);
+        else if (samplerIndex == 15) return g_WebT2D_25.Sample(g_WebS_15, uv);
+        else return g_WebT2D_25.Sample(g_WebS_0, uv);
+    }
+    else if (textureIndex == 26) {
+        uint2 dimensions;
+        g_WebT2D_26.GetDimensions(dimensions.x, dimensions.y);
+        float2 uv = texCoord + offset / dimensions;
+        if (samplerIndex == 0) return g_WebT2D_26.Sample(g_WebS_0, uv);
+        else if (samplerIndex == 1) return g_WebT2D_26.Sample(g_WebS_1, uv);
+        else if (samplerIndex == 2) return g_WebT2D_26.Sample(g_WebS_2, uv);
+        else if (samplerIndex == 3) return g_WebT2D_26.Sample(g_WebS_3, uv);
+        else if (samplerIndex == 4) return g_WebT2D_26.Sample(g_WebS_4, uv);
+        else if (samplerIndex == 5) return g_WebT2D_26.Sample(g_WebS_5, uv);
+        else if (samplerIndex == 6) return g_WebT2D_26.Sample(g_WebS_6, uv);
+        else if (samplerIndex == 7) return g_WebT2D_26.Sample(g_WebS_7, uv);
+        else if (samplerIndex == 8) return g_WebT2D_26.Sample(g_WebS_8, uv);
+        else if (samplerIndex == 9) return g_WebT2D_26.Sample(g_WebS_9, uv);
+        else if (samplerIndex == 10) return g_WebT2D_26.Sample(g_WebS_10, uv);
+        else if (samplerIndex == 11) return g_WebT2D_26.Sample(g_WebS_11, uv);
+        else if (samplerIndex == 12) return g_WebT2D_26.Sample(g_WebS_12, uv);
+        else if (samplerIndex == 13) return g_WebT2D_26.Sample(g_WebS_13, uv);
+        else if (samplerIndex == 14) return g_WebT2D_26.Sample(g_WebS_14, uv);
+        else if (samplerIndex == 15) return g_WebT2D_26.Sample(g_WebS_15, uv);
+        else return g_WebT2D_26.Sample(g_WebS_0, uv);
+    }
+    else if (textureIndex == 27) {
+        uint2 dimensions;
+        g_WebT2D_27.GetDimensions(dimensions.x, dimensions.y);
+        float2 uv = texCoord + offset / dimensions;
+        if (samplerIndex == 0) return g_WebT2D_27.Sample(g_WebS_0, uv);
+        else if (samplerIndex == 1) return g_WebT2D_27.Sample(g_WebS_1, uv);
+        else if (samplerIndex == 2) return g_WebT2D_27.Sample(g_WebS_2, uv);
+        else if (samplerIndex == 3) return g_WebT2D_27.Sample(g_WebS_3, uv);
+        else if (samplerIndex == 4) return g_WebT2D_27.Sample(g_WebS_4, uv);
+        else if (samplerIndex == 5) return g_WebT2D_27.Sample(g_WebS_5, uv);
+        else if (samplerIndex == 6) return g_WebT2D_27.Sample(g_WebS_6, uv);
+        else if (samplerIndex == 7) return g_WebT2D_27.Sample(g_WebS_7, uv);
+        else if (samplerIndex == 8) return g_WebT2D_27.Sample(g_WebS_8, uv);
+        else if (samplerIndex == 9) return g_WebT2D_27.Sample(g_WebS_9, uv);
+        else if (samplerIndex == 10) return g_WebT2D_27.Sample(g_WebS_10, uv);
+        else if (samplerIndex == 11) return g_WebT2D_27.Sample(g_WebS_11, uv);
+        else if (samplerIndex == 12) return g_WebT2D_27.Sample(g_WebS_12, uv);
+        else if (samplerIndex == 13) return g_WebT2D_27.Sample(g_WebS_13, uv);
+        else if (samplerIndex == 14) return g_WebT2D_27.Sample(g_WebS_14, uv);
+        else if (samplerIndex == 15) return g_WebT2D_27.Sample(g_WebS_15, uv);
+        else return g_WebT2D_27.Sample(g_WebS_0, uv);
+    }
+    else if (textureIndex == 28) {
+        uint2 dimensions;
+        g_WebT2D_28.GetDimensions(dimensions.x, dimensions.y);
+        float2 uv = texCoord + offset / dimensions;
+        if (samplerIndex == 0) return g_WebT2D_28.Sample(g_WebS_0, uv);
+        else if (samplerIndex == 1) return g_WebT2D_28.Sample(g_WebS_1, uv);
+        else if (samplerIndex == 2) return g_WebT2D_28.Sample(g_WebS_2, uv);
+        else if (samplerIndex == 3) return g_WebT2D_28.Sample(g_WebS_3, uv);
+        else if (samplerIndex == 4) return g_WebT2D_28.Sample(g_WebS_4, uv);
+        else if (samplerIndex == 5) return g_WebT2D_28.Sample(g_WebS_5, uv);
+        else if (samplerIndex == 6) return g_WebT2D_28.Sample(g_WebS_6, uv);
+        else if (samplerIndex == 7) return g_WebT2D_28.Sample(g_WebS_7, uv);
+        else if (samplerIndex == 8) return g_WebT2D_28.Sample(g_WebS_8, uv);
+        else if (samplerIndex == 9) return g_WebT2D_28.Sample(g_WebS_9, uv);
+        else if (samplerIndex == 10) return g_WebT2D_28.Sample(g_WebS_10, uv);
+        else if (samplerIndex == 11) return g_WebT2D_28.Sample(g_WebS_11, uv);
+        else if (samplerIndex == 12) return g_WebT2D_28.Sample(g_WebS_12, uv);
+        else if (samplerIndex == 13) return g_WebT2D_28.Sample(g_WebS_13, uv);
+        else if (samplerIndex == 14) return g_WebT2D_28.Sample(g_WebS_14, uv);
+        else if (samplerIndex == 15) return g_WebT2D_28.Sample(g_WebS_15, uv);
+        else return g_WebT2D_28.Sample(g_WebS_0, uv);
+    }
+    else if (textureIndex == 29) {
+        uint2 dimensions;
+        g_WebT2D_29.GetDimensions(dimensions.x, dimensions.y);
+        float2 uv = texCoord + offset / dimensions;
+        if (samplerIndex == 0) return g_WebT2D_29.Sample(g_WebS_0, uv);
+        else if (samplerIndex == 1) return g_WebT2D_29.Sample(g_WebS_1, uv);
+        else if (samplerIndex == 2) return g_WebT2D_29.Sample(g_WebS_2, uv);
+        else if (samplerIndex == 3) return g_WebT2D_29.Sample(g_WebS_3, uv);
+        else if (samplerIndex == 4) return g_WebT2D_29.Sample(g_WebS_4, uv);
+        else if (samplerIndex == 5) return g_WebT2D_29.Sample(g_WebS_5, uv);
+        else if (samplerIndex == 6) return g_WebT2D_29.Sample(g_WebS_6, uv);
+        else if (samplerIndex == 7) return g_WebT2D_29.Sample(g_WebS_7, uv);
+        else if (samplerIndex == 8) return g_WebT2D_29.Sample(g_WebS_8, uv);
+        else if (samplerIndex == 9) return g_WebT2D_29.Sample(g_WebS_9, uv);
+        else if (samplerIndex == 10) return g_WebT2D_29.Sample(g_WebS_10, uv);
+        else if (samplerIndex == 11) return g_WebT2D_29.Sample(g_WebS_11, uv);
+        else if (samplerIndex == 12) return g_WebT2D_29.Sample(g_WebS_12, uv);
+        else if (samplerIndex == 13) return g_WebT2D_29.Sample(g_WebS_13, uv);
+        else if (samplerIndex == 14) return g_WebT2D_29.Sample(g_WebS_14, uv);
+        else if (samplerIndex == 15) return g_WebT2D_29.Sample(g_WebS_15, uv);
+        else return g_WebT2D_29.Sample(g_WebS_0, uv);
+    }
+    else if (textureIndex == 30) {
+        uint2 dimensions;
+        g_WebT2D_30.GetDimensions(dimensions.x, dimensions.y);
+        float2 uv = texCoord + offset / dimensions;
+        if (samplerIndex == 0) return g_WebT2D_30.Sample(g_WebS_0, uv);
+        else if (samplerIndex == 1) return g_WebT2D_30.Sample(g_WebS_1, uv);
+        else if (samplerIndex == 2) return g_WebT2D_30.Sample(g_WebS_2, uv);
+        else if (samplerIndex == 3) return g_WebT2D_30.Sample(g_WebS_3, uv);
+        else if (samplerIndex == 4) return g_WebT2D_30.Sample(g_WebS_4, uv);
+        else if (samplerIndex == 5) return g_WebT2D_30.Sample(g_WebS_5, uv);
+        else if (samplerIndex == 6) return g_WebT2D_30.Sample(g_WebS_6, uv);
+        else if (samplerIndex == 7) return g_WebT2D_30.Sample(g_WebS_7, uv);
+        else if (samplerIndex == 8) return g_WebT2D_30.Sample(g_WebS_8, uv);
+        else if (samplerIndex == 9) return g_WebT2D_30.Sample(g_WebS_9, uv);
+        else if (samplerIndex == 10) return g_WebT2D_30.Sample(g_WebS_10, uv);
+        else if (samplerIndex == 11) return g_WebT2D_30.Sample(g_WebS_11, uv);
+        else if (samplerIndex == 12) return g_WebT2D_30.Sample(g_WebS_12, uv);
+        else if (samplerIndex == 13) return g_WebT2D_30.Sample(g_WebS_13, uv);
+        else if (samplerIndex == 14) return g_WebT2D_30.Sample(g_WebS_14, uv);
+        else if (samplerIndex == 15) return g_WebT2D_30.Sample(g_WebS_15, uv);
+        else return g_WebT2D_30.Sample(g_WebS_0, uv);
+    }
+    else if (textureIndex == 31) {
+        uint2 dimensions;
+        g_WebT2D_31.GetDimensions(dimensions.x, dimensions.y);
+        float2 uv = texCoord + offset / dimensions;
+        if (samplerIndex == 0) return g_WebT2D_31.Sample(g_WebS_0, uv);
+        else if (samplerIndex == 1) return g_WebT2D_31.Sample(g_WebS_1, uv);
+        else if (samplerIndex == 2) return g_WebT2D_31.Sample(g_WebS_2, uv);
+        else if (samplerIndex == 3) return g_WebT2D_31.Sample(g_WebS_3, uv);
+        else if (samplerIndex == 4) return g_WebT2D_31.Sample(g_WebS_4, uv);
+        else if (samplerIndex == 5) return g_WebT2D_31.Sample(g_WebS_5, uv);
+        else if (samplerIndex == 6) return g_WebT2D_31.Sample(g_WebS_6, uv);
+        else if (samplerIndex == 7) return g_WebT2D_31.Sample(g_WebS_7, uv);
+        else if (samplerIndex == 8) return g_WebT2D_31.Sample(g_WebS_8, uv);
+        else if (samplerIndex == 9) return g_WebT2D_31.Sample(g_WebS_9, uv);
+        else if (samplerIndex == 10) return g_WebT2D_31.Sample(g_WebS_10, uv);
+        else if (samplerIndex == 11) return g_WebT2D_31.Sample(g_WebS_11, uv);
+        else if (samplerIndex == 12) return g_WebT2D_31.Sample(g_WebS_12, uv);
+        else if (samplerIndex == 13) return g_WebT2D_31.Sample(g_WebS_13, uv);
+        else if (samplerIndex == 14) return g_WebT2D_31.Sample(g_WebS_14, uv);
+        else if (samplerIndex == 15) return g_WebT2D_31.Sample(g_WebS_15, uv);
+        else return g_WebT2D_31.Sample(g_WebS_0, uv);
+    }
+    return 0;
 }
 float4 webSample1D(uint textureIndex, uint samplerIndex, float texCoord, float offset) {
-    switch (textureIndex) {
-        case 0: {
-            uint width;
-            g_WebT1D_0.GetDimensions(width);
-            float u = texCoord + offset / width;
-            switch (samplerIndex) {
-                case 0: return g_WebT1D_0.SampleLevel(g_WebS_0, u, 0);
-                case 1: return g_WebT1D_0.SampleLevel(g_WebS_1, u, 0);
-                case 2: return g_WebT1D_0.SampleLevel(g_WebS_2, u, 0);
-                case 3: return g_WebT1D_0.SampleLevel(g_WebS_3, u, 0);
-                case 4: return g_WebT1D_0.SampleLevel(g_WebS_4, u, 0);
-                case 5: return g_WebT1D_0.SampleLevel(g_WebS_5, u, 0);
-                case 6: return g_WebT1D_0.SampleLevel(g_WebS_6, u, 0);
-                case 7: return g_WebT1D_0.SampleLevel(g_WebS_7, u, 0);
-                case 8: return g_WebT1D_0.SampleLevel(g_WebS_8, u, 0);
-                case 9: return g_WebT1D_0.SampleLevel(g_WebS_9, u, 0);
-                case 10: return g_WebT1D_0.SampleLevel(g_WebS_10, u, 0);
-                case 11: return g_WebT1D_0.SampleLevel(g_WebS_11, u, 0);
-                case 12: return g_WebT1D_0.SampleLevel(g_WebS_12, u, 0);
-                case 13: return g_WebT1D_0.SampleLevel(g_WebS_13, u, 0);
-                case 14: return g_WebT1D_0.SampleLevel(g_WebS_14, u, 0);
-                case 15: return g_WebT1D_0.SampleLevel(g_WebS_15, u, 0);
-                default: return g_WebT1D_0.SampleLevel(g_WebS_0, u, 0);
-            }
-        }
-        case 1: {
-            uint width;
-            g_WebT1D_1.GetDimensions(width);
-            float u = texCoord + offset / width;
-            switch (samplerIndex) {
-                case 0: return g_WebT1D_1.SampleLevel(g_WebS_0, u, 0);
-                case 1: return g_WebT1D_1.SampleLevel(g_WebS_1, u, 0);
-                case 2: return g_WebT1D_1.SampleLevel(g_WebS_2, u, 0);
-                case 3: return g_WebT1D_1.SampleLevel(g_WebS_3, u, 0);
-                case 4: return g_WebT1D_1.SampleLevel(g_WebS_4, u, 0);
-                case 5: return g_WebT1D_1.SampleLevel(g_WebS_5, u, 0);
-                case 6: return g_WebT1D_1.SampleLevel(g_WebS_6, u, 0);
-                case 7: return g_WebT1D_1.SampleLevel(g_WebS_7, u, 0);
-                case 8: return g_WebT1D_1.SampleLevel(g_WebS_8, u, 0);
-                case 9: return g_WebT1D_1.SampleLevel(g_WebS_9, u, 0);
-                case 10: return g_WebT1D_1.SampleLevel(g_WebS_10, u, 0);
-                case 11: return g_WebT1D_1.SampleLevel(g_WebS_11, u, 0);
-                case 12: return g_WebT1D_1.SampleLevel(g_WebS_12, u, 0);
-                case 13: return g_WebT1D_1.SampleLevel(g_WebS_13, u, 0);
-                case 14: return g_WebT1D_1.SampleLevel(g_WebS_14, u, 0);
-                case 15: return g_WebT1D_1.SampleLevel(g_WebS_15, u, 0);
-                default: return g_WebT1D_1.SampleLevel(g_WebS_0, u, 0);
-            }
-        }
-        case 2: {
-            uint width;
-            g_WebT1D_2.GetDimensions(width);
-            float u = texCoord + offset / width;
-            switch (samplerIndex) {
-                case 0: return g_WebT1D_2.SampleLevel(g_WebS_0, u, 0);
-                case 1: return g_WebT1D_2.SampleLevel(g_WebS_1, u, 0);
-                case 2: return g_WebT1D_2.SampleLevel(g_WebS_2, u, 0);
-                case 3: return g_WebT1D_2.SampleLevel(g_WebS_3, u, 0);
-                case 4: return g_WebT1D_2.SampleLevel(g_WebS_4, u, 0);
-                case 5: return g_WebT1D_2.SampleLevel(g_WebS_5, u, 0);
-                case 6: return g_WebT1D_2.SampleLevel(g_WebS_6, u, 0);
-                case 7: return g_WebT1D_2.SampleLevel(g_WebS_7, u, 0);
-                case 8: return g_WebT1D_2.SampleLevel(g_WebS_8, u, 0);
-                case 9: return g_WebT1D_2.SampleLevel(g_WebS_9, u, 0);
-                case 10: return g_WebT1D_2.SampleLevel(g_WebS_10, u, 0);
-                case 11: return g_WebT1D_2.SampleLevel(g_WebS_11, u, 0);
-                case 12: return g_WebT1D_2.SampleLevel(g_WebS_12, u, 0);
-                case 13: return g_WebT1D_2.SampleLevel(g_WebS_13, u, 0);
-                case 14: return g_WebT1D_2.SampleLevel(g_WebS_14, u, 0);
-                case 15: return g_WebT1D_2.SampleLevel(g_WebS_15, u, 0);
-                default: return g_WebT1D_2.SampleLevel(g_WebS_0, u, 0);
-            }
-        }
-        case 3: {
-            uint width;
-            g_WebT1D_3.GetDimensions(width);
-            float u = texCoord + offset / width;
-            switch (samplerIndex) {
-                case 0: return g_WebT1D_3.SampleLevel(g_WebS_0, u, 0);
-                case 1: return g_WebT1D_3.SampleLevel(g_WebS_1, u, 0);
-                case 2: return g_WebT1D_3.SampleLevel(g_WebS_2, u, 0);
-                case 3: return g_WebT1D_3.SampleLevel(g_WebS_3, u, 0);
-                case 4: return g_WebT1D_3.SampleLevel(g_WebS_4, u, 0);
-                case 5: return g_WebT1D_3.SampleLevel(g_WebS_5, u, 0);
-                case 6: return g_WebT1D_3.SampleLevel(g_WebS_6, u, 0);
-                case 7: return g_WebT1D_3.SampleLevel(g_WebS_7, u, 0);
-                case 8: return g_WebT1D_3.SampleLevel(g_WebS_8, u, 0);
-                case 9: return g_WebT1D_3.SampleLevel(g_WebS_9, u, 0);
-                case 10: return g_WebT1D_3.SampleLevel(g_WebS_10, u, 0);
-                case 11: return g_WebT1D_3.SampleLevel(g_WebS_11, u, 0);
-                case 12: return g_WebT1D_3.SampleLevel(g_WebS_12, u, 0);
-                case 13: return g_WebT1D_3.SampleLevel(g_WebS_13, u, 0);
-                case 14: return g_WebT1D_3.SampleLevel(g_WebS_14, u, 0);
-                case 15: return g_WebT1D_3.SampleLevel(g_WebS_15, u, 0);
-                default: return g_WebT1D_3.SampleLevel(g_WebS_0, u, 0);
-            }
-        }
-        case 4: {
-            uint width;
-            g_WebT1D_4.GetDimensions(width);
-            float u = texCoord + offset / width;
-            switch (samplerIndex) {
-                case 0: return g_WebT1D_4.SampleLevel(g_WebS_0, u, 0);
-                case 1: return g_WebT1D_4.SampleLevel(g_WebS_1, u, 0);
-                case 2: return g_WebT1D_4.SampleLevel(g_WebS_2, u, 0);
-                case 3: return g_WebT1D_4.SampleLevel(g_WebS_3, u, 0);
-                case 4: return g_WebT1D_4.SampleLevel(g_WebS_4, u, 0);
-                case 5: return g_WebT1D_4.SampleLevel(g_WebS_5, u, 0);
-                case 6: return g_WebT1D_4.SampleLevel(g_WebS_6, u, 0);
-                case 7: return g_WebT1D_4.SampleLevel(g_WebS_7, u, 0);
-                case 8: return g_WebT1D_4.SampleLevel(g_WebS_8, u, 0);
-                case 9: return g_WebT1D_4.SampleLevel(g_WebS_9, u, 0);
-                case 10: return g_WebT1D_4.SampleLevel(g_WebS_10, u, 0);
-                case 11: return g_WebT1D_4.SampleLevel(g_WebS_11, u, 0);
-                case 12: return g_WebT1D_4.SampleLevel(g_WebS_12, u, 0);
-                case 13: return g_WebT1D_4.SampleLevel(g_WebS_13, u, 0);
-                case 14: return g_WebT1D_4.SampleLevel(g_WebS_14, u, 0);
-                case 15: return g_WebT1D_4.SampleLevel(g_WebS_15, u, 0);
-                default: return g_WebT1D_4.SampleLevel(g_WebS_0, u, 0);
-            }
-        }
-        case 5: {
-            uint width;
-            g_WebT1D_5.GetDimensions(width);
-            float u = texCoord + offset / width;
-            switch (samplerIndex) {
-                case 0: return g_WebT1D_5.SampleLevel(g_WebS_0, u, 0);
-                case 1: return g_WebT1D_5.SampleLevel(g_WebS_1, u, 0);
-                case 2: return g_WebT1D_5.SampleLevel(g_WebS_2, u, 0);
-                case 3: return g_WebT1D_5.SampleLevel(g_WebS_3, u, 0);
-                case 4: return g_WebT1D_5.SampleLevel(g_WebS_4, u, 0);
-                case 5: return g_WebT1D_5.SampleLevel(g_WebS_5, u, 0);
-                case 6: return g_WebT1D_5.SampleLevel(g_WebS_6, u, 0);
-                case 7: return g_WebT1D_5.SampleLevel(g_WebS_7, u, 0);
-                case 8: return g_WebT1D_5.SampleLevel(g_WebS_8, u, 0);
-                case 9: return g_WebT1D_5.SampleLevel(g_WebS_9, u, 0);
-                case 10: return g_WebT1D_5.SampleLevel(g_WebS_10, u, 0);
-                case 11: return g_WebT1D_5.SampleLevel(g_WebS_11, u, 0);
-                case 12: return g_WebT1D_5.SampleLevel(g_WebS_12, u, 0);
-                case 13: return g_WebT1D_5.SampleLevel(g_WebS_13, u, 0);
-                case 14: return g_WebT1D_5.SampleLevel(g_WebS_14, u, 0);
-                case 15: return g_WebT1D_5.SampleLevel(g_WebS_15, u, 0);
-                default: return g_WebT1D_5.SampleLevel(g_WebS_0, u, 0);
-            }
-        }
-        case 6: {
-            uint width;
-            g_WebT1D_6.GetDimensions(width);
-            float u = texCoord + offset / width;
-            switch (samplerIndex) {
-                case 0: return g_WebT1D_6.SampleLevel(g_WebS_0, u, 0);
-                case 1: return g_WebT1D_6.SampleLevel(g_WebS_1, u, 0);
-                case 2: return g_WebT1D_6.SampleLevel(g_WebS_2, u, 0);
-                case 3: return g_WebT1D_6.SampleLevel(g_WebS_3, u, 0);
-                case 4: return g_WebT1D_6.SampleLevel(g_WebS_4, u, 0);
-                case 5: return g_WebT1D_6.SampleLevel(g_WebS_5, u, 0);
-                case 6: return g_WebT1D_6.SampleLevel(g_WebS_6, u, 0);
-                case 7: return g_WebT1D_6.SampleLevel(g_WebS_7, u, 0);
-                case 8: return g_WebT1D_6.SampleLevel(g_WebS_8, u, 0);
-                case 9: return g_WebT1D_6.SampleLevel(g_WebS_9, u, 0);
-                case 10: return g_WebT1D_6.SampleLevel(g_WebS_10, u, 0);
-                case 11: return g_WebT1D_6.SampleLevel(g_WebS_11, u, 0);
-                case 12: return g_WebT1D_6.SampleLevel(g_WebS_12, u, 0);
-                case 13: return g_WebT1D_6.SampleLevel(g_WebS_13, u, 0);
-                case 14: return g_WebT1D_6.SampleLevel(g_WebS_14, u, 0);
-                case 15: return g_WebT1D_6.SampleLevel(g_WebS_15, u, 0);
-                default: return g_WebT1D_6.SampleLevel(g_WebS_0, u, 0);
-            }
-        }
-        case 7: {
-            uint width;
-            g_WebT1D_7.GetDimensions(width);
-            float u = texCoord + offset / width;
-            switch (samplerIndex) {
-                case 0: return g_WebT1D_7.SampleLevel(g_WebS_0, u, 0);
-                case 1: return g_WebT1D_7.SampleLevel(g_WebS_1, u, 0);
-                case 2: return g_WebT1D_7.SampleLevel(g_WebS_2, u, 0);
-                case 3: return g_WebT1D_7.SampleLevel(g_WebS_3, u, 0);
-                case 4: return g_WebT1D_7.SampleLevel(g_WebS_4, u, 0);
-                case 5: return g_WebT1D_7.SampleLevel(g_WebS_5, u, 0);
-                case 6: return g_WebT1D_7.SampleLevel(g_WebS_6, u, 0);
-                case 7: return g_WebT1D_7.SampleLevel(g_WebS_7, u, 0);
-                case 8: return g_WebT1D_7.SampleLevel(g_WebS_8, u, 0);
-                case 9: return g_WebT1D_7.SampleLevel(g_WebS_9, u, 0);
-                case 10: return g_WebT1D_7.SampleLevel(g_WebS_10, u, 0);
-                case 11: return g_WebT1D_7.SampleLevel(g_WebS_11, u, 0);
-                case 12: return g_WebT1D_7.SampleLevel(g_WebS_12, u, 0);
-                case 13: return g_WebT1D_7.SampleLevel(g_WebS_13, u, 0);
-                case 14: return g_WebT1D_7.SampleLevel(g_WebS_14, u, 0);
-                case 15: return g_WebT1D_7.SampleLevel(g_WebS_15, u, 0);
-                default: return g_WebT1D_7.SampleLevel(g_WebS_0, u, 0);
-            }
-        }
-        case 8: {
-            uint width;
-            g_WebT1D_8.GetDimensions(width);
-            float u = texCoord + offset / width;
-            switch (samplerIndex) {
-                case 0: return g_WebT1D_8.SampleLevel(g_WebS_0, u, 0);
-                case 1: return g_WebT1D_8.SampleLevel(g_WebS_1, u, 0);
-                case 2: return g_WebT1D_8.SampleLevel(g_WebS_2, u, 0);
-                case 3: return g_WebT1D_8.SampleLevel(g_WebS_3, u, 0);
-                case 4: return g_WebT1D_8.SampleLevel(g_WebS_4, u, 0);
-                case 5: return g_WebT1D_8.SampleLevel(g_WebS_5, u, 0);
-                case 6: return g_WebT1D_8.SampleLevel(g_WebS_6, u, 0);
-                case 7: return g_WebT1D_8.SampleLevel(g_WebS_7, u, 0);
-                case 8: return g_WebT1D_8.SampleLevel(g_WebS_8, u, 0);
-                case 9: return g_WebT1D_8.SampleLevel(g_WebS_9, u, 0);
-                case 10: return g_WebT1D_8.SampleLevel(g_WebS_10, u, 0);
-                case 11: return g_WebT1D_8.SampleLevel(g_WebS_11, u, 0);
-                case 12: return g_WebT1D_8.SampleLevel(g_WebS_12, u, 0);
-                case 13: return g_WebT1D_8.SampleLevel(g_WebS_13, u, 0);
-                case 14: return g_WebT1D_8.SampleLevel(g_WebS_14, u, 0);
-                case 15: return g_WebT1D_8.SampleLevel(g_WebS_15, u, 0);
-                default: return g_WebT1D_8.SampleLevel(g_WebS_0, u, 0);
-            }
-        }
-        case 9: {
-            uint width;
-            g_WebT1D_9.GetDimensions(width);
-            float u = texCoord + offset / width;
-            switch (samplerIndex) {
-                case 0: return g_WebT1D_9.SampleLevel(g_WebS_0, u, 0);
-                case 1: return g_WebT1D_9.SampleLevel(g_WebS_1, u, 0);
-                case 2: return g_WebT1D_9.SampleLevel(g_WebS_2, u, 0);
-                case 3: return g_WebT1D_9.SampleLevel(g_WebS_3, u, 0);
-                case 4: return g_WebT1D_9.SampleLevel(g_WebS_4, u, 0);
-                case 5: return g_WebT1D_9.SampleLevel(g_WebS_5, u, 0);
-                case 6: return g_WebT1D_9.SampleLevel(g_WebS_6, u, 0);
-                case 7: return g_WebT1D_9.SampleLevel(g_WebS_7, u, 0);
-                case 8: return g_WebT1D_9.SampleLevel(g_WebS_8, u, 0);
-                case 9: return g_WebT1D_9.SampleLevel(g_WebS_9, u, 0);
-                case 10: return g_WebT1D_9.SampleLevel(g_WebS_10, u, 0);
-                case 11: return g_WebT1D_9.SampleLevel(g_WebS_11, u, 0);
-                case 12: return g_WebT1D_9.SampleLevel(g_WebS_12, u, 0);
-                case 13: return g_WebT1D_9.SampleLevel(g_WebS_13, u, 0);
-                case 14: return g_WebT1D_9.SampleLevel(g_WebS_14, u, 0);
-                case 15: return g_WebT1D_9.SampleLevel(g_WebS_15, u, 0);
-                default: return g_WebT1D_9.SampleLevel(g_WebS_0, u, 0);
-            }
-        }
-        case 10: {
-            uint width;
-            g_WebT1D_10.GetDimensions(width);
-            float u = texCoord + offset / width;
-            switch (samplerIndex) {
-                case 0: return g_WebT1D_10.SampleLevel(g_WebS_0, u, 0);
-                case 1: return g_WebT1D_10.SampleLevel(g_WebS_1, u, 0);
-                case 2: return g_WebT1D_10.SampleLevel(g_WebS_2, u, 0);
-                case 3: return g_WebT1D_10.SampleLevel(g_WebS_3, u, 0);
-                case 4: return g_WebT1D_10.SampleLevel(g_WebS_4, u, 0);
-                case 5: return g_WebT1D_10.SampleLevel(g_WebS_5, u, 0);
-                case 6: return g_WebT1D_10.SampleLevel(g_WebS_6, u, 0);
-                case 7: return g_WebT1D_10.SampleLevel(g_WebS_7, u, 0);
-                case 8: return g_WebT1D_10.SampleLevel(g_WebS_8, u, 0);
-                case 9: return g_WebT1D_10.SampleLevel(g_WebS_9, u, 0);
-                case 10: return g_WebT1D_10.SampleLevel(g_WebS_10, u, 0);
-                case 11: return g_WebT1D_10.SampleLevel(g_WebS_11, u, 0);
-                case 12: return g_WebT1D_10.SampleLevel(g_WebS_12, u, 0);
-                case 13: return g_WebT1D_10.SampleLevel(g_WebS_13, u, 0);
-                case 14: return g_WebT1D_10.SampleLevel(g_WebS_14, u, 0);
-                case 15: return g_WebT1D_10.SampleLevel(g_WebS_15, u, 0);
-                default: return g_WebT1D_10.SampleLevel(g_WebS_0, u, 0);
-            }
-        }
-        case 11: {
-            uint width;
-            g_WebT1D_11.GetDimensions(width);
-            float u = texCoord + offset / width;
-            switch (samplerIndex) {
-                case 0: return g_WebT1D_11.SampleLevel(g_WebS_0, u, 0);
-                case 1: return g_WebT1D_11.SampleLevel(g_WebS_1, u, 0);
-                case 2: return g_WebT1D_11.SampleLevel(g_WebS_2, u, 0);
-                case 3: return g_WebT1D_11.SampleLevel(g_WebS_3, u, 0);
-                case 4: return g_WebT1D_11.SampleLevel(g_WebS_4, u, 0);
-                case 5: return g_WebT1D_11.SampleLevel(g_WebS_5, u, 0);
-                case 6: return g_WebT1D_11.SampleLevel(g_WebS_6, u, 0);
-                case 7: return g_WebT1D_11.SampleLevel(g_WebS_7, u, 0);
-                case 8: return g_WebT1D_11.SampleLevel(g_WebS_8, u, 0);
-                case 9: return g_WebT1D_11.SampleLevel(g_WebS_9, u, 0);
-                case 10: return g_WebT1D_11.SampleLevel(g_WebS_10, u, 0);
-                case 11: return g_WebT1D_11.SampleLevel(g_WebS_11, u, 0);
-                case 12: return g_WebT1D_11.SampleLevel(g_WebS_12, u, 0);
-                case 13: return g_WebT1D_11.SampleLevel(g_WebS_13, u, 0);
-                case 14: return g_WebT1D_11.SampleLevel(g_WebS_14, u, 0);
-                case 15: return g_WebT1D_11.SampleLevel(g_WebS_15, u, 0);
-                default: return g_WebT1D_11.SampleLevel(g_WebS_0, u, 0);
-            }
-        }
-        case 12: {
-            uint width;
-            g_WebT1D_12.GetDimensions(width);
-            float u = texCoord + offset / width;
-            switch (samplerIndex) {
-                case 0: return g_WebT1D_12.SampleLevel(g_WebS_0, u, 0);
-                case 1: return g_WebT1D_12.SampleLevel(g_WebS_1, u, 0);
-                case 2: return g_WebT1D_12.SampleLevel(g_WebS_2, u, 0);
-                case 3: return g_WebT1D_12.SampleLevel(g_WebS_3, u, 0);
-                case 4: return g_WebT1D_12.SampleLevel(g_WebS_4, u, 0);
-                case 5: return g_WebT1D_12.SampleLevel(g_WebS_5, u, 0);
-                case 6: return g_WebT1D_12.SampleLevel(g_WebS_6, u, 0);
-                case 7: return g_WebT1D_12.SampleLevel(g_WebS_7, u, 0);
-                case 8: return g_WebT1D_12.SampleLevel(g_WebS_8, u, 0);
-                case 9: return g_WebT1D_12.SampleLevel(g_WebS_9, u, 0);
-                case 10: return g_WebT1D_12.SampleLevel(g_WebS_10, u, 0);
-                case 11: return g_WebT1D_12.SampleLevel(g_WebS_11, u, 0);
-                case 12: return g_WebT1D_12.SampleLevel(g_WebS_12, u, 0);
-                case 13: return g_WebT1D_12.SampleLevel(g_WebS_13, u, 0);
-                case 14: return g_WebT1D_12.SampleLevel(g_WebS_14, u, 0);
-                case 15: return g_WebT1D_12.SampleLevel(g_WebS_15, u, 0);
-                default: return g_WebT1D_12.SampleLevel(g_WebS_0, u, 0);
-            }
-        }
-        case 13: {
-            uint width;
-            g_WebT1D_13.GetDimensions(width);
-            float u = texCoord + offset / width;
-            switch (samplerIndex) {
-                case 0: return g_WebT1D_13.SampleLevel(g_WebS_0, u, 0);
-                case 1: return g_WebT1D_13.SampleLevel(g_WebS_1, u, 0);
-                case 2: return g_WebT1D_13.SampleLevel(g_WebS_2, u, 0);
-                case 3: return g_WebT1D_13.SampleLevel(g_WebS_3, u, 0);
-                case 4: return g_WebT1D_13.SampleLevel(g_WebS_4, u, 0);
-                case 5: return g_WebT1D_13.SampleLevel(g_WebS_5, u, 0);
-                case 6: return g_WebT1D_13.SampleLevel(g_WebS_6, u, 0);
-                case 7: return g_WebT1D_13.SampleLevel(g_WebS_7, u, 0);
-                case 8: return g_WebT1D_13.SampleLevel(g_WebS_8, u, 0);
-                case 9: return g_WebT1D_13.SampleLevel(g_WebS_9, u, 0);
-                case 10: return g_WebT1D_13.SampleLevel(g_WebS_10, u, 0);
-                case 11: return g_WebT1D_13.SampleLevel(g_WebS_11, u, 0);
-                case 12: return g_WebT1D_13.SampleLevel(g_WebS_12, u, 0);
-                case 13: return g_WebT1D_13.SampleLevel(g_WebS_13, u, 0);
-                case 14: return g_WebT1D_13.SampleLevel(g_WebS_14, u, 0);
-                case 15: return g_WebT1D_13.SampleLevel(g_WebS_15, u, 0);
-                default: return g_WebT1D_13.SampleLevel(g_WebS_0, u, 0);
-            }
-        }
-        case 14: {
-            uint width;
-            g_WebT1D_14.GetDimensions(width);
-            float u = texCoord + offset / width;
-            switch (samplerIndex) {
-                case 0: return g_WebT1D_14.SampleLevel(g_WebS_0, u, 0);
-                case 1: return g_WebT1D_14.SampleLevel(g_WebS_1, u, 0);
-                case 2: return g_WebT1D_14.SampleLevel(g_WebS_2, u, 0);
-                case 3: return g_WebT1D_14.SampleLevel(g_WebS_3, u, 0);
-                case 4: return g_WebT1D_14.SampleLevel(g_WebS_4, u, 0);
-                case 5: return g_WebT1D_14.SampleLevel(g_WebS_5, u, 0);
-                case 6: return g_WebT1D_14.SampleLevel(g_WebS_6, u, 0);
-                case 7: return g_WebT1D_14.SampleLevel(g_WebS_7, u, 0);
-                case 8: return g_WebT1D_14.SampleLevel(g_WebS_8, u, 0);
-                case 9: return g_WebT1D_14.SampleLevel(g_WebS_9, u, 0);
-                case 10: return g_WebT1D_14.SampleLevel(g_WebS_10, u, 0);
-                case 11: return g_WebT1D_14.SampleLevel(g_WebS_11, u, 0);
-                case 12: return g_WebT1D_14.SampleLevel(g_WebS_12, u, 0);
-                case 13: return g_WebT1D_14.SampleLevel(g_WebS_13, u, 0);
-                case 14: return g_WebT1D_14.SampleLevel(g_WebS_14, u, 0);
-                case 15: return g_WebT1D_14.SampleLevel(g_WebS_15, u, 0);
-                default: return g_WebT1D_14.SampleLevel(g_WebS_0, u, 0);
-            }
-        }
-        case 15: {
-            uint width;
-            g_WebT1D_15.GetDimensions(width);
-            float u = texCoord + offset / width;
-            switch (samplerIndex) {
-                case 0: return g_WebT1D_15.SampleLevel(g_WebS_0, u, 0);
-                case 1: return g_WebT1D_15.SampleLevel(g_WebS_1, u, 0);
-                case 2: return g_WebT1D_15.SampleLevel(g_WebS_2, u, 0);
-                case 3: return g_WebT1D_15.SampleLevel(g_WebS_3, u, 0);
-                case 4: return g_WebT1D_15.SampleLevel(g_WebS_4, u, 0);
-                case 5: return g_WebT1D_15.SampleLevel(g_WebS_5, u, 0);
-                case 6: return g_WebT1D_15.SampleLevel(g_WebS_6, u, 0);
-                case 7: return g_WebT1D_15.SampleLevel(g_WebS_7, u, 0);
-                case 8: return g_WebT1D_15.SampleLevel(g_WebS_8, u, 0);
-                case 9: return g_WebT1D_15.SampleLevel(g_WebS_9, u, 0);
-                case 10: return g_WebT1D_15.SampleLevel(g_WebS_10, u, 0);
-                case 11: return g_WebT1D_15.SampleLevel(g_WebS_11, u, 0);
-                case 12: return g_WebT1D_15.SampleLevel(g_WebS_12, u, 0);
-                case 13: return g_WebT1D_15.SampleLevel(g_WebS_13, u, 0);
-                case 14: return g_WebT1D_15.SampleLevel(g_WebS_14, u, 0);
-                case 15: return g_WebT1D_15.SampleLevel(g_WebS_15, u, 0);
-                default: return g_WebT1D_15.SampleLevel(g_WebS_0, u, 0);
-            }
-        }
-        default: return 0;
+    if (textureIndex == 0) {
+        uint width;
+        g_WebT1D_0.GetDimensions(width);
+        float u = texCoord + offset / width;
+        if (samplerIndex == 0) return g_WebT1D_0.SampleLevel(g_WebS_0, u, 0);
+        else if (samplerIndex == 1) return g_WebT1D_0.SampleLevel(g_WebS_1, u, 0);
+        else if (samplerIndex == 2) return g_WebT1D_0.SampleLevel(g_WebS_2, u, 0);
+        else if (samplerIndex == 3) return g_WebT1D_0.SampleLevel(g_WebS_3, u, 0);
+        else if (samplerIndex == 4) return g_WebT1D_0.SampleLevel(g_WebS_4, u, 0);
+        else if (samplerIndex == 5) return g_WebT1D_0.SampleLevel(g_WebS_5, u, 0);
+        else if (samplerIndex == 6) return g_WebT1D_0.SampleLevel(g_WebS_6, u, 0);
+        else if (samplerIndex == 7) return g_WebT1D_0.SampleLevel(g_WebS_7, u, 0);
+        else if (samplerIndex == 8) return g_WebT1D_0.SampleLevel(g_WebS_8, u, 0);
+        else if (samplerIndex == 9) return g_WebT1D_0.SampleLevel(g_WebS_9, u, 0);
+        else if (samplerIndex == 10) return g_WebT1D_0.SampleLevel(g_WebS_10, u, 0);
+        else if (samplerIndex == 11) return g_WebT1D_0.SampleLevel(g_WebS_11, u, 0);
+        else if (samplerIndex == 12) return g_WebT1D_0.SampleLevel(g_WebS_12, u, 0);
+        else if (samplerIndex == 13) return g_WebT1D_0.SampleLevel(g_WebS_13, u, 0);
+        else if (samplerIndex == 14) return g_WebT1D_0.SampleLevel(g_WebS_14, u, 0);
+        else if (samplerIndex == 15) return g_WebT1D_0.SampleLevel(g_WebS_15, u, 0);
+        else return g_WebT1D_0.SampleLevel(g_WebS_0, u, 0);
     }
+    else if (textureIndex == 1) {
+        uint width;
+        g_WebT1D_1.GetDimensions(width);
+        float u = texCoord + offset / width;
+        if (samplerIndex == 0) return g_WebT1D_1.SampleLevel(g_WebS_0, u, 0);
+        else if (samplerIndex == 1) return g_WebT1D_1.SampleLevel(g_WebS_1, u, 0);
+        else if (samplerIndex == 2) return g_WebT1D_1.SampleLevel(g_WebS_2, u, 0);
+        else if (samplerIndex == 3) return g_WebT1D_1.SampleLevel(g_WebS_3, u, 0);
+        else if (samplerIndex == 4) return g_WebT1D_1.SampleLevel(g_WebS_4, u, 0);
+        else if (samplerIndex == 5) return g_WebT1D_1.SampleLevel(g_WebS_5, u, 0);
+        else if (samplerIndex == 6) return g_WebT1D_1.SampleLevel(g_WebS_6, u, 0);
+        else if (samplerIndex == 7) return g_WebT1D_1.SampleLevel(g_WebS_7, u, 0);
+        else if (samplerIndex == 8) return g_WebT1D_1.SampleLevel(g_WebS_8, u, 0);
+        else if (samplerIndex == 9) return g_WebT1D_1.SampleLevel(g_WebS_9, u, 0);
+        else if (samplerIndex == 10) return g_WebT1D_1.SampleLevel(g_WebS_10, u, 0);
+        else if (samplerIndex == 11) return g_WebT1D_1.SampleLevel(g_WebS_11, u, 0);
+        else if (samplerIndex == 12) return g_WebT1D_1.SampleLevel(g_WebS_12, u, 0);
+        else if (samplerIndex == 13) return g_WebT1D_1.SampleLevel(g_WebS_13, u, 0);
+        else if (samplerIndex == 14) return g_WebT1D_1.SampleLevel(g_WebS_14, u, 0);
+        else if (samplerIndex == 15) return g_WebT1D_1.SampleLevel(g_WebS_15, u, 0);
+        else return g_WebT1D_1.SampleLevel(g_WebS_0, u, 0);
+    }
+    else if (textureIndex == 2) {
+        uint width;
+        g_WebT1D_2.GetDimensions(width);
+        float u = texCoord + offset / width;
+        if (samplerIndex == 0) return g_WebT1D_2.SampleLevel(g_WebS_0, u, 0);
+        else if (samplerIndex == 1) return g_WebT1D_2.SampleLevel(g_WebS_1, u, 0);
+        else if (samplerIndex == 2) return g_WebT1D_2.SampleLevel(g_WebS_2, u, 0);
+        else if (samplerIndex == 3) return g_WebT1D_2.SampleLevel(g_WebS_3, u, 0);
+        else if (samplerIndex == 4) return g_WebT1D_2.SampleLevel(g_WebS_4, u, 0);
+        else if (samplerIndex == 5) return g_WebT1D_2.SampleLevel(g_WebS_5, u, 0);
+        else if (samplerIndex == 6) return g_WebT1D_2.SampleLevel(g_WebS_6, u, 0);
+        else if (samplerIndex == 7) return g_WebT1D_2.SampleLevel(g_WebS_7, u, 0);
+        else if (samplerIndex == 8) return g_WebT1D_2.SampleLevel(g_WebS_8, u, 0);
+        else if (samplerIndex == 9) return g_WebT1D_2.SampleLevel(g_WebS_9, u, 0);
+        else if (samplerIndex == 10) return g_WebT1D_2.SampleLevel(g_WebS_10, u, 0);
+        else if (samplerIndex == 11) return g_WebT1D_2.SampleLevel(g_WebS_11, u, 0);
+        else if (samplerIndex == 12) return g_WebT1D_2.SampleLevel(g_WebS_12, u, 0);
+        else if (samplerIndex == 13) return g_WebT1D_2.SampleLevel(g_WebS_13, u, 0);
+        else if (samplerIndex == 14) return g_WebT1D_2.SampleLevel(g_WebS_14, u, 0);
+        else if (samplerIndex == 15) return g_WebT1D_2.SampleLevel(g_WebS_15, u, 0);
+        else return g_WebT1D_2.SampleLevel(g_WebS_0, u, 0);
+    }
+    else if (textureIndex == 3) {
+        uint width;
+        g_WebT1D_3.GetDimensions(width);
+        float u = texCoord + offset / width;
+        if (samplerIndex == 0) return g_WebT1D_3.SampleLevel(g_WebS_0, u, 0);
+        else if (samplerIndex == 1) return g_WebT1D_3.SampleLevel(g_WebS_1, u, 0);
+        else if (samplerIndex == 2) return g_WebT1D_3.SampleLevel(g_WebS_2, u, 0);
+        else if (samplerIndex == 3) return g_WebT1D_3.SampleLevel(g_WebS_3, u, 0);
+        else if (samplerIndex == 4) return g_WebT1D_3.SampleLevel(g_WebS_4, u, 0);
+        else if (samplerIndex == 5) return g_WebT1D_3.SampleLevel(g_WebS_5, u, 0);
+        else if (samplerIndex == 6) return g_WebT1D_3.SampleLevel(g_WebS_6, u, 0);
+        else if (samplerIndex == 7) return g_WebT1D_3.SampleLevel(g_WebS_7, u, 0);
+        else if (samplerIndex == 8) return g_WebT1D_3.SampleLevel(g_WebS_8, u, 0);
+        else if (samplerIndex == 9) return g_WebT1D_3.SampleLevel(g_WebS_9, u, 0);
+        else if (samplerIndex == 10) return g_WebT1D_3.SampleLevel(g_WebS_10, u, 0);
+        else if (samplerIndex == 11) return g_WebT1D_3.SampleLevel(g_WebS_11, u, 0);
+        else if (samplerIndex == 12) return g_WebT1D_3.SampleLevel(g_WebS_12, u, 0);
+        else if (samplerIndex == 13) return g_WebT1D_3.SampleLevel(g_WebS_13, u, 0);
+        else if (samplerIndex == 14) return g_WebT1D_3.SampleLevel(g_WebS_14, u, 0);
+        else if (samplerIndex == 15) return g_WebT1D_3.SampleLevel(g_WebS_15, u, 0);
+        else return g_WebT1D_3.SampleLevel(g_WebS_0, u, 0);
+    }
+    else if (textureIndex == 4) {
+        uint width;
+        g_WebT1D_4.GetDimensions(width);
+        float u = texCoord + offset / width;
+        if (samplerIndex == 0) return g_WebT1D_4.SampleLevel(g_WebS_0, u, 0);
+        else if (samplerIndex == 1) return g_WebT1D_4.SampleLevel(g_WebS_1, u, 0);
+        else if (samplerIndex == 2) return g_WebT1D_4.SampleLevel(g_WebS_2, u, 0);
+        else if (samplerIndex == 3) return g_WebT1D_4.SampleLevel(g_WebS_3, u, 0);
+        else if (samplerIndex == 4) return g_WebT1D_4.SampleLevel(g_WebS_4, u, 0);
+        else if (samplerIndex == 5) return g_WebT1D_4.SampleLevel(g_WebS_5, u, 0);
+        else if (samplerIndex == 6) return g_WebT1D_4.SampleLevel(g_WebS_6, u, 0);
+        else if (samplerIndex == 7) return g_WebT1D_4.SampleLevel(g_WebS_7, u, 0);
+        else if (samplerIndex == 8) return g_WebT1D_4.SampleLevel(g_WebS_8, u, 0);
+        else if (samplerIndex == 9) return g_WebT1D_4.SampleLevel(g_WebS_9, u, 0);
+        else if (samplerIndex == 10) return g_WebT1D_4.SampleLevel(g_WebS_10, u, 0);
+        else if (samplerIndex == 11) return g_WebT1D_4.SampleLevel(g_WebS_11, u, 0);
+        else if (samplerIndex == 12) return g_WebT1D_4.SampleLevel(g_WebS_12, u, 0);
+        else if (samplerIndex == 13) return g_WebT1D_4.SampleLevel(g_WebS_13, u, 0);
+        else if (samplerIndex == 14) return g_WebT1D_4.SampleLevel(g_WebS_14, u, 0);
+        else if (samplerIndex == 15) return g_WebT1D_4.SampleLevel(g_WebS_15, u, 0);
+        else return g_WebT1D_4.SampleLevel(g_WebS_0, u, 0);
+    }
+    else if (textureIndex == 5) {
+        uint width;
+        g_WebT1D_5.GetDimensions(width);
+        float u = texCoord + offset / width;
+        if (samplerIndex == 0) return g_WebT1D_5.SampleLevel(g_WebS_0, u, 0);
+        else if (samplerIndex == 1) return g_WebT1D_5.SampleLevel(g_WebS_1, u, 0);
+        else if (samplerIndex == 2) return g_WebT1D_5.SampleLevel(g_WebS_2, u, 0);
+        else if (samplerIndex == 3) return g_WebT1D_5.SampleLevel(g_WebS_3, u, 0);
+        else if (samplerIndex == 4) return g_WebT1D_5.SampleLevel(g_WebS_4, u, 0);
+        else if (samplerIndex == 5) return g_WebT1D_5.SampleLevel(g_WebS_5, u, 0);
+        else if (samplerIndex == 6) return g_WebT1D_5.SampleLevel(g_WebS_6, u, 0);
+        else if (samplerIndex == 7) return g_WebT1D_5.SampleLevel(g_WebS_7, u, 0);
+        else if (samplerIndex == 8) return g_WebT1D_5.SampleLevel(g_WebS_8, u, 0);
+        else if (samplerIndex == 9) return g_WebT1D_5.SampleLevel(g_WebS_9, u, 0);
+        else if (samplerIndex == 10) return g_WebT1D_5.SampleLevel(g_WebS_10, u, 0);
+        else if (samplerIndex == 11) return g_WebT1D_5.SampleLevel(g_WebS_11, u, 0);
+        else if (samplerIndex == 12) return g_WebT1D_5.SampleLevel(g_WebS_12, u, 0);
+        else if (samplerIndex == 13) return g_WebT1D_5.SampleLevel(g_WebS_13, u, 0);
+        else if (samplerIndex == 14) return g_WebT1D_5.SampleLevel(g_WebS_14, u, 0);
+        else if (samplerIndex == 15) return g_WebT1D_5.SampleLevel(g_WebS_15, u, 0);
+        else return g_WebT1D_5.SampleLevel(g_WebS_0, u, 0);
+    }
+    else if (textureIndex == 6) {
+        uint width;
+        g_WebT1D_6.GetDimensions(width);
+        float u = texCoord + offset / width;
+        if (samplerIndex == 0) return g_WebT1D_6.SampleLevel(g_WebS_0, u, 0);
+        else if (samplerIndex == 1) return g_WebT1D_6.SampleLevel(g_WebS_1, u, 0);
+        else if (samplerIndex == 2) return g_WebT1D_6.SampleLevel(g_WebS_2, u, 0);
+        else if (samplerIndex == 3) return g_WebT1D_6.SampleLevel(g_WebS_3, u, 0);
+        else if (samplerIndex == 4) return g_WebT1D_6.SampleLevel(g_WebS_4, u, 0);
+        else if (samplerIndex == 5) return g_WebT1D_6.SampleLevel(g_WebS_5, u, 0);
+        else if (samplerIndex == 6) return g_WebT1D_6.SampleLevel(g_WebS_6, u, 0);
+        else if (samplerIndex == 7) return g_WebT1D_6.SampleLevel(g_WebS_7, u, 0);
+        else if (samplerIndex == 8) return g_WebT1D_6.SampleLevel(g_WebS_8, u, 0);
+        else if (samplerIndex == 9) return g_WebT1D_6.SampleLevel(g_WebS_9, u, 0);
+        else if (samplerIndex == 10) return g_WebT1D_6.SampleLevel(g_WebS_10, u, 0);
+        else if (samplerIndex == 11) return g_WebT1D_6.SampleLevel(g_WebS_11, u, 0);
+        else if (samplerIndex == 12) return g_WebT1D_6.SampleLevel(g_WebS_12, u, 0);
+        else if (samplerIndex == 13) return g_WebT1D_6.SampleLevel(g_WebS_13, u, 0);
+        else if (samplerIndex == 14) return g_WebT1D_6.SampleLevel(g_WebS_14, u, 0);
+        else if (samplerIndex == 15) return g_WebT1D_6.SampleLevel(g_WebS_15, u, 0);
+        else return g_WebT1D_6.SampleLevel(g_WebS_0, u, 0);
+    }
+    else if (textureIndex == 7) {
+        uint width;
+        g_WebT1D_7.GetDimensions(width);
+        float u = texCoord + offset / width;
+        if (samplerIndex == 0) return g_WebT1D_7.SampleLevel(g_WebS_0, u, 0);
+        else if (samplerIndex == 1) return g_WebT1D_7.SampleLevel(g_WebS_1, u, 0);
+        else if (samplerIndex == 2) return g_WebT1D_7.SampleLevel(g_WebS_2, u, 0);
+        else if (samplerIndex == 3) return g_WebT1D_7.SampleLevel(g_WebS_3, u, 0);
+        else if (samplerIndex == 4) return g_WebT1D_7.SampleLevel(g_WebS_4, u, 0);
+        else if (samplerIndex == 5) return g_WebT1D_7.SampleLevel(g_WebS_5, u, 0);
+        else if (samplerIndex == 6) return g_WebT1D_7.SampleLevel(g_WebS_6, u, 0);
+        else if (samplerIndex == 7) return g_WebT1D_7.SampleLevel(g_WebS_7, u, 0);
+        else if (samplerIndex == 8) return g_WebT1D_7.SampleLevel(g_WebS_8, u, 0);
+        else if (samplerIndex == 9) return g_WebT1D_7.SampleLevel(g_WebS_9, u, 0);
+        else if (samplerIndex == 10) return g_WebT1D_7.SampleLevel(g_WebS_10, u, 0);
+        else if (samplerIndex == 11) return g_WebT1D_7.SampleLevel(g_WebS_11, u, 0);
+        else if (samplerIndex == 12) return g_WebT1D_7.SampleLevel(g_WebS_12, u, 0);
+        else if (samplerIndex == 13) return g_WebT1D_7.SampleLevel(g_WebS_13, u, 0);
+        else if (samplerIndex == 14) return g_WebT1D_7.SampleLevel(g_WebS_14, u, 0);
+        else if (samplerIndex == 15) return g_WebT1D_7.SampleLevel(g_WebS_15, u, 0);
+        else return g_WebT1D_7.SampleLevel(g_WebS_0, u, 0);
+    }
+    else if (textureIndex == 8) {
+        uint width;
+        g_WebT1D_8.GetDimensions(width);
+        float u = texCoord + offset / width;
+        if (samplerIndex == 0) return g_WebT1D_8.SampleLevel(g_WebS_0, u, 0);
+        else if (samplerIndex == 1) return g_WebT1D_8.SampleLevel(g_WebS_1, u, 0);
+        else if (samplerIndex == 2) return g_WebT1D_8.SampleLevel(g_WebS_2, u, 0);
+        else if (samplerIndex == 3) return g_WebT1D_8.SampleLevel(g_WebS_3, u, 0);
+        else if (samplerIndex == 4) return g_WebT1D_8.SampleLevel(g_WebS_4, u, 0);
+        else if (samplerIndex == 5) return g_WebT1D_8.SampleLevel(g_WebS_5, u, 0);
+        else if (samplerIndex == 6) return g_WebT1D_8.SampleLevel(g_WebS_6, u, 0);
+        else if (samplerIndex == 7) return g_WebT1D_8.SampleLevel(g_WebS_7, u, 0);
+        else if (samplerIndex == 8) return g_WebT1D_8.SampleLevel(g_WebS_8, u, 0);
+        else if (samplerIndex == 9) return g_WebT1D_8.SampleLevel(g_WebS_9, u, 0);
+        else if (samplerIndex == 10) return g_WebT1D_8.SampleLevel(g_WebS_10, u, 0);
+        else if (samplerIndex == 11) return g_WebT1D_8.SampleLevel(g_WebS_11, u, 0);
+        else if (samplerIndex == 12) return g_WebT1D_8.SampleLevel(g_WebS_12, u, 0);
+        else if (samplerIndex == 13) return g_WebT1D_8.SampleLevel(g_WebS_13, u, 0);
+        else if (samplerIndex == 14) return g_WebT1D_8.SampleLevel(g_WebS_14, u, 0);
+        else if (samplerIndex == 15) return g_WebT1D_8.SampleLevel(g_WebS_15, u, 0);
+        else return g_WebT1D_8.SampleLevel(g_WebS_0, u, 0);
+    }
+    else if (textureIndex == 9) {
+        uint width;
+        g_WebT1D_9.GetDimensions(width);
+        float u = texCoord + offset / width;
+        if (samplerIndex == 0) return g_WebT1D_9.SampleLevel(g_WebS_0, u, 0);
+        else if (samplerIndex == 1) return g_WebT1D_9.SampleLevel(g_WebS_1, u, 0);
+        else if (samplerIndex == 2) return g_WebT1D_9.SampleLevel(g_WebS_2, u, 0);
+        else if (samplerIndex == 3) return g_WebT1D_9.SampleLevel(g_WebS_3, u, 0);
+        else if (samplerIndex == 4) return g_WebT1D_9.SampleLevel(g_WebS_4, u, 0);
+        else if (samplerIndex == 5) return g_WebT1D_9.SampleLevel(g_WebS_5, u, 0);
+        else if (samplerIndex == 6) return g_WebT1D_9.SampleLevel(g_WebS_6, u, 0);
+        else if (samplerIndex == 7) return g_WebT1D_9.SampleLevel(g_WebS_7, u, 0);
+        else if (samplerIndex == 8) return g_WebT1D_9.SampleLevel(g_WebS_8, u, 0);
+        else if (samplerIndex == 9) return g_WebT1D_9.SampleLevel(g_WebS_9, u, 0);
+        else if (samplerIndex == 10) return g_WebT1D_9.SampleLevel(g_WebS_10, u, 0);
+        else if (samplerIndex == 11) return g_WebT1D_9.SampleLevel(g_WebS_11, u, 0);
+        else if (samplerIndex == 12) return g_WebT1D_9.SampleLevel(g_WebS_12, u, 0);
+        else if (samplerIndex == 13) return g_WebT1D_9.SampleLevel(g_WebS_13, u, 0);
+        else if (samplerIndex == 14) return g_WebT1D_9.SampleLevel(g_WebS_14, u, 0);
+        else if (samplerIndex == 15) return g_WebT1D_9.SampleLevel(g_WebS_15, u, 0);
+        else return g_WebT1D_9.SampleLevel(g_WebS_0, u, 0);
+    }
+    else if (textureIndex == 10) {
+        uint width;
+        g_WebT1D_10.GetDimensions(width);
+        float u = texCoord + offset / width;
+        if (samplerIndex == 0) return g_WebT1D_10.SampleLevel(g_WebS_0, u, 0);
+        else if (samplerIndex == 1) return g_WebT1D_10.SampleLevel(g_WebS_1, u, 0);
+        else if (samplerIndex == 2) return g_WebT1D_10.SampleLevel(g_WebS_2, u, 0);
+        else if (samplerIndex == 3) return g_WebT1D_10.SampleLevel(g_WebS_3, u, 0);
+        else if (samplerIndex == 4) return g_WebT1D_10.SampleLevel(g_WebS_4, u, 0);
+        else if (samplerIndex == 5) return g_WebT1D_10.SampleLevel(g_WebS_5, u, 0);
+        else if (samplerIndex == 6) return g_WebT1D_10.SampleLevel(g_WebS_6, u, 0);
+        else if (samplerIndex == 7) return g_WebT1D_10.SampleLevel(g_WebS_7, u, 0);
+        else if (samplerIndex == 8) return g_WebT1D_10.SampleLevel(g_WebS_8, u, 0);
+        else if (samplerIndex == 9) return g_WebT1D_10.SampleLevel(g_WebS_9, u, 0);
+        else if (samplerIndex == 10) return g_WebT1D_10.SampleLevel(g_WebS_10, u, 0);
+        else if (samplerIndex == 11) return g_WebT1D_10.SampleLevel(g_WebS_11, u, 0);
+        else if (samplerIndex == 12) return g_WebT1D_10.SampleLevel(g_WebS_12, u, 0);
+        else if (samplerIndex == 13) return g_WebT1D_10.SampleLevel(g_WebS_13, u, 0);
+        else if (samplerIndex == 14) return g_WebT1D_10.SampleLevel(g_WebS_14, u, 0);
+        else if (samplerIndex == 15) return g_WebT1D_10.SampleLevel(g_WebS_15, u, 0);
+        else return g_WebT1D_10.SampleLevel(g_WebS_0, u, 0);
+    }
+    else if (textureIndex == 11) {
+        uint width;
+        g_WebT1D_11.GetDimensions(width);
+        float u = texCoord + offset / width;
+        if (samplerIndex == 0) return g_WebT1D_11.SampleLevel(g_WebS_0, u, 0);
+        else if (samplerIndex == 1) return g_WebT1D_11.SampleLevel(g_WebS_1, u, 0);
+        else if (samplerIndex == 2) return g_WebT1D_11.SampleLevel(g_WebS_2, u, 0);
+        else if (samplerIndex == 3) return g_WebT1D_11.SampleLevel(g_WebS_3, u, 0);
+        else if (samplerIndex == 4) return g_WebT1D_11.SampleLevel(g_WebS_4, u, 0);
+        else if (samplerIndex == 5) return g_WebT1D_11.SampleLevel(g_WebS_5, u, 0);
+        else if (samplerIndex == 6) return g_WebT1D_11.SampleLevel(g_WebS_6, u, 0);
+        else if (samplerIndex == 7) return g_WebT1D_11.SampleLevel(g_WebS_7, u, 0);
+        else if (samplerIndex == 8) return g_WebT1D_11.SampleLevel(g_WebS_8, u, 0);
+        else if (samplerIndex == 9) return g_WebT1D_11.SampleLevel(g_WebS_9, u, 0);
+        else if (samplerIndex == 10) return g_WebT1D_11.SampleLevel(g_WebS_10, u, 0);
+        else if (samplerIndex == 11) return g_WebT1D_11.SampleLevel(g_WebS_11, u, 0);
+        else if (samplerIndex == 12) return g_WebT1D_11.SampleLevel(g_WebS_12, u, 0);
+        else if (samplerIndex == 13) return g_WebT1D_11.SampleLevel(g_WebS_13, u, 0);
+        else if (samplerIndex == 14) return g_WebT1D_11.SampleLevel(g_WebS_14, u, 0);
+        else if (samplerIndex == 15) return g_WebT1D_11.SampleLevel(g_WebS_15, u, 0);
+        else return g_WebT1D_11.SampleLevel(g_WebS_0, u, 0);
+    }
+    else if (textureIndex == 12) {
+        uint width;
+        g_WebT1D_12.GetDimensions(width);
+        float u = texCoord + offset / width;
+        if (samplerIndex == 0) return g_WebT1D_12.SampleLevel(g_WebS_0, u, 0);
+        else if (samplerIndex == 1) return g_WebT1D_12.SampleLevel(g_WebS_1, u, 0);
+        else if (samplerIndex == 2) return g_WebT1D_12.SampleLevel(g_WebS_2, u, 0);
+        else if (samplerIndex == 3) return g_WebT1D_12.SampleLevel(g_WebS_3, u, 0);
+        else if (samplerIndex == 4) return g_WebT1D_12.SampleLevel(g_WebS_4, u, 0);
+        else if (samplerIndex == 5) return g_WebT1D_12.SampleLevel(g_WebS_5, u, 0);
+        else if (samplerIndex == 6) return g_WebT1D_12.SampleLevel(g_WebS_6, u, 0);
+        else if (samplerIndex == 7) return g_WebT1D_12.SampleLevel(g_WebS_7, u, 0);
+        else if (samplerIndex == 8) return g_WebT1D_12.SampleLevel(g_WebS_8, u, 0);
+        else if (samplerIndex == 9) return g_WebT1D_12.SampleLevel(g_WebS_9, u, 0);
+        else if (samplerIndex == 10) return g_WebT1D_12.SampleLevel(g_WebS_10, u, 0);
+        else if (samplerIndex == 11) return g_WebT1D_12.SampleLevel(g_WebS_11, u, 0);
+        else if (samplerIndex == 12) return g_WebT1D_12.SampleLevel(g_WebS_12, u, 0);
+        else if (samplerIndex == 13) return g_WebT1D_12.SampleLevel(g_WebS_13, u, 0);
+        else if (samplerIndex == 14) return g_WebT1D_12.SampleLevel(g_WebS_14, u, 0);
+        else if (samplerIndex == 15) return g_WebT1D_12.SampleLevel(g_WebS_15, u, 0);
+        else return g_WebT1D_12.SampleLevel(g_WebS_0, u, 0);
+    }
+    else if (textureIndex == 13) {
+        uint width;
+        g_WebT1D_13.GetDimensions(width);
+        float u = texCoord + offset / width;
+        if (samplerIndex == 0) return g_WebT1D_13.SampleLevel(g_WebS_0, u, 0);
+        else if (samplerIndex == 1) return g_WebT1D_13.SampleLevel(g_WebS_1, u, 0);
+        else if (samplerIndex == 2) return g_WebT1D_13.SampleLevel(g_WebS_2, u, 0);
+        else if (samplerIndex == 3) return g_WebT1D_13.SampleLevel(g_WebS_3, u, 0);
+        else if (samplerIndex == 4) return g_WebT1D_13.SampleLevel(g_WebS_4, u, 0);
+        else if (samplerIndex == 5) return g_WebT1D_13.SampleLevel(g_WebS_5, u, 0);
+        else if (samplerIndex == 6) return g_WebT1D_13.SampleLevel(g_WebS_6, u, 0);
+        else if (samplerIndex == 7) return g_WebT1D_13.SampleLevel(g_WebS_7, u, 0);
+        else if (samplerIndex == 8) return g_WebT1D_13.SampleLevel(g_WebS_8, u, 0);
+        else if (samplerIndex == 9) return g_WebT1D_13.SampleLevel(g_WebS_9, u, 0);
+        else if (samplerIndex == 10) return g_WebT1D_13.SampleLevel(g_WebS_10, u, 0);
+        else if (samplerIndex == 11) return g_WebT1D_13.SampleLevel(g_WebS_11, u, 0);
+        else if (samplerIndex == 12) return g_WebT1D_13.SampleLevel(g_WebS_12, u, 0);
+        else if (samplerIndex == 13) return g_WebT1D_13.SampleLevel(g_WebS_13, u, 0);
+        else if (samplerIndex == 14) return g_WebT1D_13.SampleLevel(g_WebS_14, u, 0);
+        else if (samplerIndex == 15) return g_WebT1D_13.SampleLevel(g_WebS_15, u, 0);
+        else return g_WebT1D_13.SampleLevel(g_WebS_0, u, 0);
+    }
+    else if (textureIndex == 14) {
+        uint width;
+        g_WebT1D_14.GetDimensions(width);
+        float u = texCoord + offset / width;
+        if (samplerIndex == 0) return g_WebT1D_14.SampleLevel(g_WebS_0, u, 0);
+        else if (samplerIndex == 1) return g_WebT1D_14.SampleLevel(g_WebS_1, u, 0);
+        else if (samplerIndex == 2) return g_WebT1D_14.SampleLevel(g_WebS_2, u, 0);
+        else if (samplerIndex == 3) return g_WebT1D_14.SampleLevel(g_WebS_3, u, 0);
+        else if (samplerIndex == 4) return g_WebT1D_14.SampleLevel(g_WebS_4, u, 0);
+        else if (samplerIndex == 5) return g_WebT1D_14.SampleLevel(g_WebS_5, u, 0);
+        else if (samplerIndex == 6) return g_WebT1D_14.SampleLevel(g_WebS_6, u, 0);
+        else if (samplerIndex == 7) return g_WebT1D_14.SampleLevel(g_WebS_7, u, 0);
+        else if (samplerIndex == 8) return g_WebT1D_14.SampleLevel(g_WebS_8, u, 0);
+        else if (samplerIndex == 9) return g_WebT1D_14.SampleLevel(g_WebS_9, u, 0);
+        else if (samplerIndex == 10) return g_WebT1D_14.SampleLevel(g_WebS_10, u, 0);
+        else if (samplerIndex == 11) return g_WebT1D_14.SampleLevel(g_WebS_11, u, 0);
+        else if (samplerIndex == 12) return g_WebT1D_14.SampleLevel(g_WebS_12, u, 0);
+        else if (samplerIndex == 13) return g_WebT1D_14.SampleLevel(g_WebS_13, u, 0);
+        else if (samplerIndex == 14) return g_WebT1D_14.SampleLevel(g_WebS_14, u, 0);
+        else if (samplerIndex == 15) return g_WebT1D_14.SampleLevel(g_WebS_15, u, 0);
+        else return g_WebT1D_14.SampleLevel(g_WebS_0, u, 0);
+    }
+    else if (textureIndex == 15) {
+        uint width;
+        g_WebT1D_15.GetDimensions(width);
+        float u = texCoord + offset / width;
+        if (samplerIndex == 0) return g_WebT1D_15.SampleLevel(g_WebS_0, u, 0);
+        else if (samplerIndex == 1) return g_WebT1D_15.SampleLevel(g_WebS_1, u, 0);
+        else if (samplerIndex == 2) return g_WebT1D_15.SampleLevel(g_WebS_2, u, 0);
+        else if (samplerIndex == 3) return g_WebT1D_15.SampleLevel(g_WebS_3, u, 0);
+        else if (samplerIndex == 4) return g_WebT1D_15.SampleLevel(g_WebS_4, u, 0);
+        else if (samplerIndex == 5) return g_WebT1D_15.SampleLevel(g_WebS_5, u, 0);
+        else if (samplerIndex == 6) return g_WebT1D_15.SampleLevel(g_WebS_6, u, 0);
+        else if (samplerIndex == 7) return g_WebT1D_15.SampleLevel(g_WebS_7, u, 0);
+        else if (samplerIndex == 8) return g_WebT1D_15.SampleLevel(g_WebS_8, u, 0);
+        else if (samplerIndex == 9) return g_WebT1D_15.SampleLevel(g_WebS_9, u, 0);
+        else if (samplerIndex == 10) return g_WebT1D_15.SampleLevel(g_WebS_10, u, 0);
+        else if (samplerIndex == 11) return g_WebT1D_15.SampleLevel(g_WebS_11, u, 0);
+        else if (samplerIndex == 12) return g_WebT1D_15.SampleLevel(g_WebS_12, u, 0);
+        else if (samplerIndex == 13) return g_WebT1D_15.SampleLevel(g_WebS_13, u, 0);
+        else if (samplerIndex == 14) return g_WebT1D_15.SampleLevel(g_WebS_14, u, 0);
+        else if (samplerIndex == 15) return g_WebT1D_15.SampleLevel(g_WebS_15, u, 0);
+        else return g_WebT1D_15.SampleLevel(g_WebS_0, u, 0);
+    }
+    return 0;
 }
 float4 webSample3D(uint textureIndex, uint samplerIndex, float3 texCoord) {
-    switch (textureIndex) {
-        case 0: {
-            switch (samplerIndex) {
-                case 0: return g_WebT3D_0.Sample(g_WebS_0, texCoord);
-                case 1: return g_WebT3D_0.Sample(g_WebS_1, texCoord);
-                case 2: return g_WebT3D_0.Sample(g_WebS_2, texCoord);
-                case 3: return g_WebT3D_0.Sample(g_WebS_3, texCoord);
-                case 4: return g_WebT3D_0.Sample(g_WebS_4, texCoord);
-                case 5: return g_WebT3D_0.Sample(g_WebS_5, texCoord);
-                case 6: return g_WebT3D_0.Sample(g_WebS_6, texCoord);
-                case 7: return g_WebT3D_0.Sample(g_WebS_7, texCoord);
-                case 8: return g_WebT3D_0.Sample(g_WebS_8, texCoord);
-                case 9: return g_WebT3D_0.Sample(g_WebS_9, texCoord);
-                case 10: return g_WebT3D_0.Sample(g_WebS_10, texCoord);
-                case 11: return g_WebT3D_0.Sample(g_WebS_11, texCoord);
-                case 12: return g_WebT3D_0.Sample(g_WebS_12, texCoord);
-                case 13: return g_WebT3D_0.Sample(g_WebS_13, texCoord);
-                case 14: return g_WebT3D_0.Sample(g_WebS_14, texCoord);
-                case 15: return g_WebT3D_0.Sample(g_WebS_15, texCoord);
-                default: return g_WebT3D_0.Sample(g_WebS_0, texCoord);
-            }
-        }
-        case 1: {
-            switch (samplerIndex) {
-                case 0: return g_WebT3D_1.Sample(g_WebS_0, texCoord);
-                case 1: return g_WebT3D_1.Sample(g_WebS_1, texCoord);
-                case 2: return g_WebT3D_1.Sample(g_WebS_2, texCoord);
-                case 3: return g_WebT3D_1.Sample(g_WebS_3, texCoord);
-                case 4: return g_WebT3D_1.Sample(g_WebS_4, texCoord);
-                case 5: return g_WebT3D_1.Sample(g_WebS_5, texCoord);
-                case 6: return g_WebT3D_1.Sample(g_WebS_6, texCoord);
-                case 7: return g_WebT3D_1.Sample(g_WebS_7, texCoord);
-                case 8: return g_WebT3D_1.Sample(g_WebS_8, texCoord);
-                case 9: return g_WebT3D_1.Sample(g_WebS_9, texCoord);
-                case 10: return g_WebT3D_1.Sample(g_WebS_10, texCoord);
-                case 11: return g_WebT3D_1.Sample(g_WebS_11, texCoord);
-                case 12: return g_WebT3D_1.Sample(g_WebS_12, texCoord);
-                case 13: return g_WebT3D_1.Sample(g_WebS_13, texCoord);
-                case 14: return g_WebT3D_1.Sample(g_WebS_14, texCoord);
-                case 15: return g_WebT3D_1.Sample(g_WebS_15, texCoord);
-                default: return g_WebT3D_1.Sample(g_WebS_0, texCoord);
-            }
-        }
-        case 2: {
-            switch (samplerIndex) {
-                case 0: return g_WebT3D_2.Sample(g_WebS_0, texCoord);
-                case 1: return g_WebT3D_2.Sample(g_WebS_1, texCoord);
-                case 2: return g_WebT3D_2.Sample(g_WebS_2, texCoord);
-                case 3: return g_WebT3D_2.Sample(g_WebS_3, texCoord);
-                case 4: return g_WebT3D_2.Sample(g_WebS_4, texCoord);
-                case 5: return g_WebT3D_2.Sample(g_WebS_5, texCoord);
-                case 6: return g_WebT3D_2.Sample(g_WebS_6, texCoord);
-                case 7: return g_WebT3D_2.Sample(g_WebS_7, texCoord);
-                case 8: return g_WebT3D_2.Sample(g_WebS_8, texCoord);
-                case 9: return g_WebT3D_2.Sample(g_WebS_9, texCoord);
-                case 10: return g_WebT3D_2.Sample(g_WebS_10, texCoord);
-                case 11: return g_WebT3D_2.Sample(g_WebS_11, texCoord);
-                case 12: return g_WebT3D_2.Sample(g_WebS_12, texCoord);
-                case 13: return g_WebT3D_2.Sample(g_WebS_13, texCoord);
-                case 14: return g_WebT3D_2.Sample(g_WebS_14, texCoord);
-                case 15: return g_WebT3D_2.Sample(g_WebS_15, texCoord);
-                default: return g_WebT3D_2.Sample(g_WebS_0, texCoord);
-            }
-        }
-        case 3: {
-            switch (samplerIndex) {
-                case 0: return g_WebT3D_3.Sample(g_WebS_0, texCoord);
-                case 1: return g_WebT3D_3.Sample(g_WebS_1, texCoord);
-                case 2: return g_WebT3D_3.Sample(g_WebS_2, texCoord);
-                case 3: return g_WebT3D_3.Sample(g_WebS_3, texCoord);
-                case 4: return g_WebT3D_3.Sample(g_WebS_4, texCoord);
-                case 5: return g_WebT3D_3.Sample(g_WebS_5, texCoord);
-                case 6: return g_WebT3D_3.Sample(g_WebS_6, texCoord);
-                case 7: return g_WebT3D_3.Sample(g_WebS_7, texCoord);
-                case 8: return g_WebT3D_3.Sample(g_WebS_8, texCoord);
-                case 9: return g_WebT3D_3.Sample(g_WebS_9, texCoord);
-                case 10: return g_WebT3D_3.Sample(g_WebS_10, texCoord);
-                case 11: return g_WebT3D_3.Sample(g_WebS_11, texCoord);
-                case 12: return g_WebT3D_3.Sample(g_WebS_12, texCoord);
-                case 13: return g_WebT3D_3.Sample(g_WebS_13, texCoord);
-                case 14: return g_WebT3D_3.Sample(g_WebS_14, texCoord);
-                case 15: return g_WebT3D_3.Sample(g_WebS_15, texCoord);
-                default: return g_WebT3D_3.Sample(g_WebS_0, texCoord);
-            }
-        }
-        default: return 0;
+    if (textureIndex == 0) {
+        if (samplerIndex == 0) return g_WebT3D_0.Sample(g_WebS_0, texCoord);
+        else if (samplerIndex == 1) return g_WebT3D_0.Sample(g_WebS_1, texCoord);
+        else if (samplerIndex == 2) return g_WebT3D_0.Sample(g_WebS_2, texCoord);
+        else if (samplerIndex == 3) return g_WebT3D_0.Sample(g_WebS_3, texCoord);
+        else if (samplerIndex == 4) return g_WebT3D_0.Sample(g_WebS_4, texCoord);
+        else if (samplerIndex == 5) return g_WebT3D_0.Sample(g_WebS_5, texCoord);
+        else if (samplerIndex == 6) return g_WebT3D_0.Sample(g_WebS_6, texCoord);
+        else if (samplerIndex == 7) return g_WebT3D_0.Sample(g_WebS_7, texCoord);
+        else if (samplerIndex == 8) return g_WebT3D_0.Sample(g_WebS_8, texCoord);
+        else if (samplerIndex == 9) return g_WebT3D_0.Sample(g_WebS_9, texCoord);
+        else if (samplerIndex == 10) return g_WebT3D_0.Sample(g_WebS_10, texCoord);
+        else if (samplerIndex == 11) return g_WebT3D_0.Sample(g_WebS_11, texCoord);
+        else if (samplerIndex == 12) return g_WebT3D_0.Sample(g_WebS_12, texCoord);
+        else if (samplerIndex == 13) return g_WebT3D_0.Sample(g_WebS_13, texCoord);
+        else if (samplerIndex == 14) return g_WebT3D_0.Sample(g_WebS_14, texCoord);
+        else if (samplerIndex == 15) return g_WebT3D_0.Sample(g_WebS_15, texCoord);
+        else return g_WebT3D_0.Sample(g_WebS_0, texCoord);
     }
+    else if (textureIndex == 1) {
+        if (samplerIndex == 0) return g_WebT3D_1.Sample(g_WebS_0, texCoord);
+        else if (samplerIndex == 1) return g_WebT3D_1.Sample(g_WebS_1, texCoord);
+        else if (samplerIndex == 2) return g_WebT3D_1.Sample(g_WebS_2, texCoord);
+        else if (samplerIndex == 3) return g_WebT3D_1.Sample(g_WebS_3, texCoord);
+        else if (samplerIndex == 4) return g_WebT3D_1.Sample(g_WebS_4, texCoord);
+        else if (samplerIndex == 5) return g_WebT3D_1.Sample(g_WebS_5, texCoord);
+        else if (samplerIndex == 6) return g_WebT3D_1.Sample(g_WebS_6, texCoord);
+        else if (samplerIndex == 7) return g_WebT3D_1.Sample(g_WebS_7, texCoord);
+        else if (samplerIndex == 8) return g_WebT3D_1.Sample(g_WebS_8, texCoord);
+        else if (samplerIndex == 9) return g_WebT3D_1.Sample(g_WebS_9, texCoord);
+        else if (samplerIndex == 10) return g_WebT3D_1.Sample(g_WebS_10, texCoord);
+        else if (samplerIndex == 11) return g_WebT3D_1.Sample(g_WebS_11, texCoord);
+        else if (samplerIndex == 12) return g_WebT3D_1.Sample(g_WebS_12, texCoord);
+        else if (samplerIndex == 13) return g_WebT3D_1.Sample(g_WebS_13, texCoord);
+        else if (samplerIndex == 14) return g_WebT3D_1.Sample(g_WebS_14, texCoord);
+        else if (samplerIndex == 15) return g_WebT3D_1.Sample(g_WebS_15, texCoord);
+        else return g_WebT3D_1.Sample(g_WebS_0, texCoord);
+    }
+    else if (textureIndex == 2) {
+        if (samplerIndex == 0) return g_WebT3D_2.Sample(g_WebS_0, texCoord);
+        else if (samplerIndex == 1) return g_WebT3D_2.Sample(g_WebS_1, texCoord);
+        else if (samplerIndex == 2) return g_WebT3D_2.Sample(g_WebS_2, texCoord);
+        else if (samplerIndex == 3) return g_WebT3D_2.Sample(g_WebS_3, texCoord);
+        else if (samplerIndex == 4) return g_WebT3D_2.Sample(g_WebS_4, texCoord);
+        else if (samplerIndex == 5) return g_WebT3D_2.Sample(g_WebS_5, texCoord);
+        else if (samplerIndex == 6) return g_WebT3D_2.Sample(g_WebS_6, texCoord);
+        else if (samplerIndex == 7) return g_WebT3D_2.Sample(g_WebS_7, texCoord);
+        else if (samplerIndex == 8) return g_WebT3D_2.Sample(g_WebS_8, texCoord);
+        else if (samplerIndex == 9) return g_WebT3D_2.Sample(g_WebS_9, texCoord);
+        else if (samplerIndex == 10) return g_WebT3D_2.Sample(g_WebS_10, texCoord);
+        else if (samplerIndex == 11) return g_WebT3D_2.Sample(g_WebS_11, texCoord);
+        else if (samplerIndex == 12) return g_WebT3D_2.Sample(g_WebS_12, texCoord);
+        else if (samplerIndex == 13) return g_WebT3D_2.Sample(g_WebS_13, texCoord);
+        else if (samplerIndex == 14) return g_WebT3D_2.Sample(g_WebS_14, texCoord);
+        else if (samplerIndex == 15) return g_WebT3D_2.Sample(g_WebS_15, texCoord);
+        else return g_WebT3D_2.Sample(g_WebS_0, texCoord);
+    }
+    else if (textureIndex == 3) {
+        if (samplerIndex == 0) return g_WebT3D_3.Sample(g_WebS_0, texCoord);
+        else if (samplerIndex == 1) return g_WebT3D_3.Sample(g_WebS_1, texCoord);
+        else if (samplerIndex == 2) return g_WebT3D_3.Sample(g_WebS_2, texCoord);
+        else if (samplerIndex == 3) return g_WebT3D_3.Sample(g_WebS_3, texCoord);
+        else if (samplerIndex == 4) return g_WebT3D_3.Sample(g_WebS_4, texCoord);
+        else if (samplerIndex == 5) return g_WebT3D_3.Sample(g_WebS_5, texCoord);
+        else if (samplerIndex == 6) return g_WebT3D_3.Sample(g_WebS_6, texCoord);
+        else if (samplerIndex == 7) return g_WebT3D_3.Sample(g_WebS_7, texCoord);
+        else if (samplerIndex == 8) return g_WebT3D_3.Sample(g_WebS_8, texCoord);
+        else if (samplerIndex == 9) return g_WebT3D_3.Sample(g_WebS_9, texCoord);
+        else if (samplerIndex == 10) return g_WebT3D_3.Sample(g_WebS_10, texCoord);
+        else if (samplerIndex == 11) return g_WebT3D_3.Sample(g_WebS_11, texCoord);
+        else if (samplerIndex == 12) return g_WebT3D_3.Sample(g_WebS_12, texCoord);
+        else if (samplerIndex == 13) return g_WebT3D_3.Sample(g_WebS_13, texCoord);
+        else if (samplerIndex == 14) return g_WebT3D_3.Sample(g_WebS_14, texCoord);
+        else if (samplerIndex == 15) return g_WebT3D_3.Sample(g_WebS_15, texCoord);
+        else return g_WebT3D_3.Sample(g_WebS_0, texCoord);
+    }
+    return 0;
 }
 float4 webSampleCube(uint textureIndex, uint samplerIndex, float3 texCoord) {
-    switch (textureIndex) {
-        case 0: {
-            switch (samplerIndex) {
-                case 0: return g_WebTCube_0.Sample(g_WebS_0, texCoord);
-                case 1: return g_WebTCube_0.Sample(g_WebS_1, texCoord);
-                case 2: return g_WebTCube_0.Sample(g_WebS_2, texCoord);
-                case 3: return g_WebTCube_0.Sample(g_WebS_3, texCoord);
-                case 4: return g_WebTCube_0.Sample(g_WebS_4, texCoord);
-                case 5: return g_WebTCube_0.Sample(g_WebS_5, texCoord);
-                case 6: return g_WebTCube_0.Sample(g_WebS_6, texCoord);
-                case 7: return g_WebTCube_0.Sample(g_WebS_7, texCoord);
-                case 8: return g_WebTCube_0.Sample(g_WebS_8, texCoord);
-                case 9: return g_WebTCube_0.Sample(g_WebS_9, texCoord);
-                case 10: return g_WebTCube_0.Sample(g_WebS_10, texCoord);
-                case 11: return g_WebTCube_0.Sample(g_WebS_11, texCoord);
-                case 12: return g_WebTCube_0.Sample(g_WebS_12, texCoord);
-                case 13: return g_WebTCube_0.Sample(g_WebS_13, texCoord);
-                case 14: return g_WebTCube_0.Sample(g_WebS_14, texCoord);
-                case 15: return g_WebTCube_0.Sample(g_WebS_15, texCoord);
-                default: return g_WebTCube_0.Sample(g_WebS_0, texCoord);
-            }
-        }
-        case 1: {
-            switch (samplerIndex) {
-                case 0: return g_WebTCube_1.Sample(g_WebS_0, texCoord);
-                case 1: return g_WebTCube_1.Sample(g_WebS_1, texCoord);
-                case 2: return g_WebTCube_1.Sample(g_WebS_2, texCoord);
-                case 3: return g_WebTCube_1.Sample(g_WebS_3, texCoord);
-                case 4: return g_WebTCube_1.Sample(g_WebS_4, texCoord);
-                case 5: return g_WebTCube_1.Sample(g_WebS_5, texCoord);
-                case 6: return g_WebTCube_1.Sample(g_WebS_6, texCoord);
-                case 7: return g_WebTCube_1.Sample(g_WebS_7, texCoord);
-                case 8: return g_WebTCube_1.Sample(g_WebS_8, texCoord);
-                case 9: return g_WebTCube_1.Sample(g_WebS_9, texCoord);
-                case 10: return g_WebTCube_1.Sample(g_WebS_10, texCoord);
-                case 11: return g_WebTCube_1.Sample(g_WebS_11, texCoord);
-                case 12: return g_WebTCube_1.Sample(g_WebS_12, texCoord);
-                case 13: return g_WebTCube_1.Sample(g_WebS_13, texCoord);
-                case 14: return g_WebTCube_1.Sample(g_WebS_14, texCoord);
-                case 15: return g_WebTCube_1.Sample(g_WebS_15, texCoord);
-                default: return g_WebTCube_1.Sample(g_WebS_0, texCoord);
-            }
-        }
-        case 2: {
-            switch (samplerIndex) {
-                case 0: return g_WebTCube_2.Sample(g_WebS_0, texCoord);
-                case 1: return g_WebTCube_2.Sample(g_WebS_1, texCoord);
-                case 2: return g_WebTCube_2.Sample(g_WebS_2, texCoord);
-                case 3: return g_WebTCube_2.Sample(g_WebS_3, texCoord);
-                case 4: return g_WebTCube_2.Sample(g_WebS_4, texCoord);
-                case 5: return g_WebTCube_2.Sample(g_WebS_5, texCoord);
-                case 6: return g_WebTCube_2.Sample(g_WebS_6, texCoord);
-                case 7: return g_WebTCube_2.Sample(g_WebS_7, texCoord);
-                case 8: return g_WebTCube_2.Sample(g_WebS_8, texCoord);
-                case 9: return g_WebTCube_2.Sample(g_WebS_9, texCoord);
-                case 10: return g_WebTCube_2.Sample(g_WebS_10, texCoord);
-                case 11: return g_WebTCube_2.Sample(g_WebS_11, texCoord);
-                case 12: return g_WebTCube_2.Sample(g_WebS_12, texCoord);
-                case 13: return g_WebTCube_2.Sample(g_WebS_13, texCoord);
-                case 14: return g_WebTCube_2.Sample(g_WebS_14, texCoord);
-                case 15: return g_WebTCube_2.Sample(g_WebS_15, texCoord);
-                default: return g_WebTCube_2.Sample(g_WebS_0, texCoord);
-            }
-        }
-        case 3: {
-            switch (samplerIndex) {
-                case 0: return g_WebTCube_3.Sample(g_WebS_0, texCoord);
-                case 1: return g_WebTCube_3.Sample(g_WebS_1, texCoord);
-                case 2: return g_WebTCube_3.Sample(g_WebS_2, texCoord);
-                case 3: return g_WebTCube_3.Sample(g_WebS_3, texCoord);
-                case 4: return g_WebTCube_3.Sample(g_WebS_4, texCoord);
-                case 5: return g_WebTCube_3.Sample(g_WebS_5, texCoord);
-                case 6: return g_WebTCube_3.Sample(g_WebS_6, texCoord);
-                case 7: return g_WebTCube_3.Sample(g_WebS_7, texCoord);
-                case 8: return g_WebTCube_3.Sample(g_WebS_8, texCoord);
-                case 9: return g_WebTCube_3.Sample(g_WebS_9, texCoord);
-                case 10: return g_WebTCube_3.Sample(g_WebS_10, texCoord);
-                case 11: return g_WebTCube_3.Sample(g_WebS_11, texCoord);
-                case 12: return g_WebTCube_3.Sample(g_WebS_12, texCoord);
-                case 13: return g_WebTCube_3.Sample(g_WebS_13, texCoord);
-                case 14: return g_WebTCube_3.Sample(g_WebS_14, texCoord);
-                case 15: return g_WebTCube_3.Sample(g_WebS_15, texCoord);
-                default: return g_WebTCube_3.Sample(g_WebS_0, texCoord);
-            }
-        }
-        case 4: {
-            switch (samplerIndex) {
-                case 0: return g_WebTCube_4.Sample(g_WebS_0, texCoord);
-                case 1: return g_WebTCube_4.Sample(g_WebS_1, texCoord);
-                case 2: return g_WebTCube_4.Sample(g_WebS_2, texCoord);
-                case 3: return g_WebTCube_4.Sample(g_WebS_3, texCoord);
-                case 4: return g_WebTCube_4.Sample(g_WebS_4, texCoord);
-                case 5: return g_WebTCube_4.Sample(g_WebS_5, texCoord);
-                case 6: return g_WebTCube_4.Sample(g_WebS_6, texCoord);
-                case 7: return g_WebTCube_4.Sample(g_WebS_7, texCoord);
-                case 8: return g_WebTCube_4.Sample(g_WebS_8, texCoord);
-                case 9: return g_WebTCube_4.Sample(g_WebS_9, texCoord);
-                case 10: return g_WebTCube_4.Sample(g_WebS_10, texCoord);
-                case 11: return g_WebTCube_4.Sample(g_WebS_11, texCoord);
-                case 12: return g_WebTCube_4.Sample(g_WebS_12, texCoord);
-                case 13: return g_WebTCube_4.Sample(g_WebS_13, texCoord);
-                case 14: return g_WebTCube_4.Sample(g_WebS_14, texCoord);
-                case 15: return g_WebTCube_4.Sample(g_WebS_15, texCoord);
-                default: return g_WebTCube_4.Sample(g_WebS_0, texCoord);
-            }
-        }
-        case 5: {
-            switch (samplerIndex) {
-                case 0: return g_WebTCube_5.Sample(g_WebS_0, texCoord);
-                case 1: return g_WebTCube_5.Sample(g_WebS_1, texCoord);
-                case 2: return g_WebTCube_5.Sample(g_WebS_2, texCoord);
-                case 3: return g_WebTCube_5.Sample(g_WebS_3, texCoord);
-                case 4: return g_WebTCube_5.Sample(g_WebS_4, texCoord);
-                case 5: return g_WebTCube_5.Sample(g_WebS_5, texCoord);
-                case 6: return g_WebTCube_5.Sample(g_WebS_6, texCoord);
-                case 7: return g_WebTCube_5.Sample(g_WebS_7, texCoord);
-                case 8: return g_WebTCube_5.Sample(g_WebS_8, texCoord);
-                case 9: return g_WebTCube_5.Sample(g_WebS_9, texCoord);
-                case 10: return g_WebTCube_5.Sample(g_WebS_10, texCoord);
-                case 11: return g_WebTCube_5.Sample(g_WebS_11, texCoord);
-                case 12: return g_WebTCube_5.Sample(g_WebS_12, texCoord);
-                case 13: return g_WebTCube_5.Sample(g_WebS_13, texCoord);
-                case 14: return g_WebTCube_5.Sample(g_WebS_14, texCoord);
-                case 15: return g_WebTCube_5.Sample(g_WebS_15, texCoord);
-                default: return g_WebTCube_5.Sample(g_WebS_0, texCoord);
-            }
-        }
-        case 6: {
-            switch (samplerIndex) {
-                case 0: return g_WebTCube_6.Sample(g_WebS_0, texCoord);
-                case 1: return g_WebTCube_6.Sample(g_WebS_1, texCoord);
-                case 2: return g_WebTCube_6.Sample(g_WebS_2, texCoord);
-                case 3: return g_WebTCube_6.Sample(g_WebS_3, texCoord);
-                case 4: return g_WebTCube_6.Sample(g_WebS_4, texCoord);
-                case 5: return g_WebTCube_6.Sample(g_WebS_5, texCoord);
-                case 6: return g_WebTCube_6.Sample(g_WebS_6, texCoord);
-                case 7: return g_WebTCube_6.Sample(g_WebS_7, texCoord);
-                case 8: return g_WebTCube_6.Sample(g_WebS_8, texCoord);
-                case 9: return g_WebTCube_6.Sample(g_WebS_9, texCoord);
-                case 10: return g_WebTCube_6.Sample(g_WebS_10, texCoord);
-                case 11: return g_WebTCube_6.Sample(g_WebS_11, texCoord);
-                case 12: return g_WebTCube_6.Sample(g_WebS_12, texCoord);
-                case 13: return g_WebTCube_6.Sample(g_WebS_13, texCoord);
-                case 14: return g_WebTCube_6.Sample(g_WebS_14, texCoord);
-                case 15: return g_WebTCube_6.Sample(g_WebS_15, texCoord);
-                default: return g_WebTCube_6.Sample(g_WebS_0, texCoord);
-            }
-        }
-        case 7: {
-            switch (samplerIndex) {
-                case 0: return g_WebTCube_7.Sample(g_WebS_0, texCoord);
-                case 1: return g_WebTCube_7.Sample(g_WebS_1, texCoord);
-                case 2: return g_WebTCube_7.Sample(g_WebS_2, texCoord);
-                case 3: return g_WebTCube_7.Sample(g_WebS_3, texCoord);
-                case 4: return g_WebTCube_7.Sample(g_WebS_4, texCoord);
-                case 5: return g_WebTCube_7.Sample(g_WebS_5, texCoord);
-                case 6: return g_WebTCube_7.Sample(g_WebS_6, texCoord);
-                case 7: return g_WebTCube_7.Sample(g_WebS_7, texCoord);
-                case 8: return g_WebTCube_7.Sample(g_WebS_8, texCoord);
-                case 9: return g_WebTCube_7.Sample(g_WebS_9, texCoord);
-                case 10: return g_WebTCube_7.Sample(g_WebS_10, texCoord);
-                case 11: return g_WebTCube_7.Sample(g_WebS_11, texCoord);
-                case 12: return g_WebTCube_7.Sample(g_WebS_12, texCoord);
-                case 13: return g_WebTCube_7.Sample(g_WebS_13, texCoord);
-                case 14: return g_WebTCube_7.Sample(g_WebS_14, texCoord);
-                case 15: return g_WebTCube_7.Sample(g_WebS_15, texCoord);
-                default: return g_WebTCube_7.Sample(g_WebS_0, texCoord);
-            }
-        }
-        default: return 0;
+    if (textureIndex == 0) {
+        if (samplerIndex == 0) return g_WebTCube_0.Sample(g_WebS_0, texCoord);
+        else if (samplerIndex == 1) return g_WebTCube_0.Sample(g_WebS_1, texCoord);
+        else if (samplerIndex == 2) return g_WebTCube_0.Sample(g_WebS_2, texCoord);
+        else if (samplerIndex == 3) return g_WebTCube_0.Sample(g_WebS_3, texCoord);
+        else if (samplerIndex == 4) return g_WebTCube_0.Sample(g_WebS_4, texCoord);
+        else if (samplerIndex == 5) return g_WebTCube_0.Sample(g_WebS_5, texCoord);
+        else if (samplerIndex == 6) return g_WebTCube_0.Sample(g_WebS_6, texCoord);
+        else if (samplerIndex == 7) return g_WebTCube_0.Sample(g_WebS_7, texCoord);
+        else if (samplerIndex == 8) return g_WebTCube_0.Sample(g_WebS_8, texCoord);
+        else if (samplerIndex == 9) return g_WebTCube_0.Sample(g_WebS_9, texCoord);
+        else if (samplerIndex == 10) return g_WebTCube_0.Sample(g_WebS_10, texCoord);
+        else if (samplerIndex == 11) return g_WebTCube_0.Sample(g_WebS_11, texCoord);
+        else if (samplerIndex == 12) return g_WebTCube_0.Sample(g_WebS_12, texCoord);
+        else if (samplerIndex == 13) return g_WebTCube_0.Sample(g_WebS_13, texCoord);
+        else if (samplerIndex == 14) return g_WebTCube_0.Sample(g_WebS_14, texCoord);
+        else if (samplerIndex == 15) return g_WebTCube_0.Sample(g_WebS_15, texCoord);
+        else return g_WebTCube_0.Sample(g_WebS_0, texCoord);
     }
+    else if (textureIndex == 1) {
+        if (samplerIndex == 0) return g_WebTCube_1.Sample(g_WebS_0, texCoord);
+        else if (samplerIndex == 1) return g_WebTCube_1.Sample(g_WebS_1, texCoord);
+        else if (samplerIndex == 2) return g_WebTCube_1.Sample(g_WebS_2, texCoord);
+        else if (samplerIndex == 3) return g_WebTCube_1.Sample(g_WebS_3, texCoord);
+        else if (samplerIndex == 4) return g_WebTCube_1.Sample(g_WebS_4, texCoord);
+        else if (samplerIndex == 5) return g_WebTCube_1.Sample(g_WebS_5, texCoord);
+        else if (samplerIndex == 6) return g_WebTCube_1.Sample(g_WebS_6, texCoord);
+        else if (samplerIndex == 7) return g_WebTCube_1.Sample(g_WebS_7, texCoord);
+        else if (samplerIndex == 8) return g_WebTCube_1.Sample(g_WebS_8, texCoord);
+        else if (samplerIndex == 9) return g_WebTCube_1.Sample(g_WebS_9, texCoord);
+        else if (samplerIndex == 10) return g_WebTCube_1.Sample(g_WebS_10, texCoord);
+        else if (samplerIndex == 11) return g_WebTCube_1.Sample(g_WebS_11, texCoord);
+        else if (samplerIndex == 12) return g_WebTCube_1.Sample(g_WebS_12, texCoord);
+        else if (samplerIndex == 13) return g_WebTCube_1.Sample(g_WebS_13, texCoord);
+        else if (samplerIndex == 14) return g_WebTCube_1.Sample(g_WebS_14, texCoord);
+        else if (samplerIndex == 15) return g_WebTCube_1.Sample(g_WebS_15, texCoord);
+        else return g_WebTCube_1.Sample(g_WebS_0, texCoord);
+    }
+    else if (textureIndex == 2) {
+        if (samplerIndex == 0) return g_WebTCube_2.Sample(g_WebS_0, texCoord);
+        else if (samplerIndex == 1) return g_WebTCube_2.Sample(g_WebS_1, texCoord);
+        else if (samplerIndex == 2) return g_WebTCube_2.Sample(g_WebS_2, texCoord);
+        else if (samplerIndex == 3) return g_WebTCube_2.Sample(g_WebS_3, texCoord);
+        else if (samplerIndex == 4) return g_WebTCube_2.Sample(g_WebS_4, texCoord);
+        else if (samplerIndex == 5) return g_WebTCube_2.Sample(g_WebS_5, texCoord);
+        else if (samplerIndex == 6) return g_WebTCube_2.Sample(g_WebS_6, texCoord);
+        else if (samplerIndex == 7) return g_WebTCube_2.Sample(g_WebS_7, texCoord);
+        else if (samplerIndex == 8) return g_WebTCube_2.Sample(g_WebS_8, texCoord);
+        else if (samplerIndex == 9) return g_WebTCube_2.Sample(g_WebS_9, texCoord);
+        else if (samplerIndex == 10) return g_WebTCube_2.Sample(g_WebS_10, texCoord);
+        else if (samplerIndex == 11) return g_WebTCube_2.Sample(g_WebS_11, texCoord);
+        else if (samplerIndex == 12) return g_WebTCube_2.Sample(g_WebS_12, texCoord);
+        else if (samplerIndex == 13) return g_WebTCube_2.Sample(g_WebS_13, texCoord);
+        else if (samplerIndex == 14) return g_WebTCube_2.Sample(g_WebS_14, texCoord);
+        else if (samplerIndex == 15) return g_WebTCube_2.Sample(g_WebS_15, texCoord);
+        else return g_WebTCube_2.Sample(g_WebS_0, texCoord);
+    }
+    else if (textureIndex == 3) {
+        if (samplerIndex == 0) return g_WebTCube_3.Sample(g_WebS_0, texCoord);
+        else if (samplerIndex == 1) return g_WebTCube_3.Sample(g_WebS_1, texCoord);
+        else if (samplerIndex == 2) return g_WebTCube_3.Sample(g_WebS_2, texCoord);
+        else if (samplerIndex == 3) return g_WebTCube_3.Sample(g_WebS_3, texCoord);
+        else if (samplerIndex == 4) return g_WebTCube_3.Sample(g_WebS_4, texCoord);
+        else if (samplerIndex == 5) return g_WebTCube_3.Sample(g_WebS_5, texCoord);
+        else if (samplerIndex == 6) return g_WebTCube_3.Sample(g_WebS_6, texCoord);
+        else if (samplerIndex == 7) return g_WebTCube_3.Sample(g_WebS_7, texCoord);
+        else if (samplerIndex == 8) return g_WebTCube_3.Sample(g_WebS_8, texCoord);
+        else if (samplerIndex == 9) return g_WebTCube_3.Sample(g_WebS_9, texCoord);
+        else if (samplerIndex == 10) return g_WebTCube_3.Sample(g_WebS_10, texCoord);
+        else if (samplerIndex == 11) return g_WebTCube_3.Sample(g_WebS_11, texCoord);
+        else if (samplerIndex == 12) return g_WebTCube_3.Sample(g_WebS_12, texCoord);
+        else if (samplerIndex == 13) return g_WebTCube_3.Sample(g_WebS_13, texCoord);
+        else if (samplerIndex == 14) return g_WebTCube_3.Sample(g_WebS_14, texCoord);
+        else if (samplerIndex == 15) return g_WebTCube_3.Sample(g_WebS_15, texCoord);
+        else return g_WebTCube_3.Sample(g_WebS_0, texCoord);
+    }
+    else if (textureIndex == 4) {
+        if (samplerIndex == 0) return g_WebTCube_4.Sample(g_WebS_0, texCoord);
+        else if (samplerIndex == 1) return g_WebTCube_4.Sample(g_WebS_1, texCoord);
+        else if (samplerIndex == 2) return g_WebTCube_4.Sample(g_WebS_2, texCoord);
+        else if (samplerIndex == 3) return g_WebTCube_4.Sample(g_WebS_3, texCoord);
+        else if (samplerIndex == 4) return g_WebTCube_4.Sample(g_WebS_4, texCoord);
+        else if (samplerIndex == 5) return g_WebTCube_4.Sample(g_WebS_5, texCoord);
+        else if (samplerIndex == 6) return g_WebTCube_4.Sample(g_WebS_6, texCoord);
+        else if (samplerIndex == 7) return g_WebTCube_4.Sample(g_WebS_7, texCoord);
+        else if (samplerIndex == 8) return g_WebTCube_4.Sample(g_WebS_8, texCoord);
+        else if (samplerIndex == 9) return g_WebTCube_4.Sample(g_WebS_9, texCoord);
+        else if (samplerIndex == 10) return g_WebTCube_4.Sample(g_WebS_10, texCoord);
+        else if (samplerIndex == 11) return g_WebTCube_4.Sample(g_WebS_11, texCoord);
+        else if (samplerIndex == 12) return g_WebTCube_4.Sample(g_WebS_12, texCoord);
+        else if (samplerIndex == 13) return g_WebTCube_4.Sample(g_WebS_13, texCoord);
+        else if (samplerIndex == 14) return g_WebTCube_4.Sample(g_WebS_14, texCoord);
+        else if (samplerIndex == 15) return g_WebTCube_4.Sample(g_WebS_15, texCoord);
+        else return g_WebTCube_4.Sample(g_WebS_0, texCoord);
+    }
+    else if (textureIndex == 5) {
+        if (samplerIndex == 0) return g_WebTCube_5.Sample(g_WebS_0, texCoord);
+        else if (samplerIndex == 1) return g_WebTCube_5.Sample(g_WebS_1, texCoord);
+        else if (samplerIndex == 2) return g_WebTCube_5.Sample(g_WebS_2, texCoord);
+        else if (samplerIndex == 3) return g_WebTCube_5.Sample(g_WebS_3, texCoord);
+        else if (samplerIndex == 4) return g_WebTCube_5.Sample(g_WebS_4, texCoord);
+        else if (samplerIndex == 5) return g_WebTCube_5.Sample(g_WebS_5, texCoord);
+        else if (samplerIndex == 6) return g_WebTCube_5.Sample(g_WebS_6, texCoord);
+        else if (samplerIndex == 7) return g_WebTCube_5.Sample(g_WebS_7, texCoord);
+        else if (samplerIndex == 8) return g_WebTCube_5.Sample(g_WebS_8, texCoord);
+        else if (samplerIndex == 9) return g_WebTCube_5.Sample(g_WebS_9, texCoord);
+        else if (samplerIndex == 10) return g_WebTCube_5.Sample(g_WebS_10, texCoord);
+        else if (samplerIndex == 11) return g_WebTCube_5.Sample(g_WebS_11, texCoord);
+        else if (samplerIndex == 12) return g_WebTCube_5.Sample(g_WebS_12, texCoord);
+        else if (samplerIndex == 13) return g_WebTCube_5.Sample(g_WebS_13, texCoord);
+        else if (samplerIndex == 14) return g_WebTCube_5.Sample(g_WebS_14, texCoord);
+        else if (samplerIndex == 15) return g_WebTCube_5.Sample(g_WebS_15, texCoord);
+        else return g_WebTCube_5.Sample(g_WebS_0, texCoord);
+    }
+    else if (textureIndex == 6) {
+        if (samplerIndex == 0) return g_WebTCube_6.Sample(g_WebS_0, texCoord);
+        else if (samplerIndex == 1) return g_WebTCube_6.Sample(g_WebS_1, texCoord);
+        else if (samplerIndex == 2) return g_WebTCube_6.Sample(g_WebS_2, texCoord);
+        else if (samplerIndex == 3) return g_WebTCube_6.Sample(g_WebS_3, texCoord);
+        else if (samplerIndex == 4) return g_WebTCube_6.Sample(g_WebS_4, texCoord);
+        else if (samplerIndex == 5) return g_WebTCube_6.Sample(g_WebS_5, texCoord);
+        else if (samplerIndex == 6) return g_WebTCube_6.Sample(g_WebS_6, texCoord);
+        else if (samplerIndex == 7) return g_WebTCube_6.Sample(g_WebS_7, texCoord);
+        else if (samplerIndex == 8) return g_WebTCube_6.Sample(g_WebS_8, texCoord);
+        else if (samplerIndex == 9) return g_WebTCube_6.Sample(g_WebS_9, texCoord);
+        else if (samplerIndex == 10) return g_WebTCube_6.Sample(g_WebS_10, texCoord);
+        else if (samplerIndex == 11) return g_WebTCube_6.Sample(g_WebS_11, texCoord);
+        else if (samplerIndex == 12) return g_WebTCube_6.Sample(g_WebS_12, texCoord);
+        else if (samplerIndex == 13) return g_WebTCube_6.Sample(g_WebS_13, texCoord);
+        else if (samplerIndex == 14) return g_WebTCube_6.Sample(g_WebS_14, texCoord);
+        else if (samplerIndex == 15) return g_WebTCube_6.Sample(g_WebS_15, texCoord);
+        else return g_WebTCube_6.Sample(g_WebS_0, texCoord);
+    }
+    else if (textureIndex == 7) {
+        if (samplerIndex == 0) return g_WebTCube_7.Sample(g_WebS_0, texCoord);
+        else if (samplerIndex == 1) return g_WebTCube_7.Sample(g_WebS_1, texCoord);
+        else if (samplerIndex == 2) return g_WebTCube_7.Sample(g_WebS_2, texCoord);
+        else if (samplerIndex == 3) return g_WebTCube_7.Sample(g_WebS_3, texCoord);
+        else if (samplerIndex == 4) return g_WebTCube_7.Sample(g_WebS_4, texCoord);
+        else if (samplerIndex == 5) return g_WebTCube_7.Sample(g_WebS_5, texCoord);
+        else if (samplerIndex == 6) return g_WebTCube_7.Sample(g_WebS_6, texCoord);
+        else if (samplerIndex == 7) return g_WebTCube_7.Sample(g_WebS_7, texCoord);
+        else if (samplerIndex == 8) return g_WebTCube_7.Sample(g_WebS_8, texCoord);
+        else if (samplerIndex == 9) return g_WebTCube_7.Sample(g_WebS_9, texCoord);
+        else if (samplerIndex == 10) return g_WebTCube_7.Sample(g_WebS_10, texCoord);
+        else if (samplerIndex == 11) return g_WebTCube_7.Sample(g_WebS_11, texCoord);
+        else if (samplerIndex == 12) return g_WebTCube_7.Sample(g_WebS_12, texCoord);
+        else if (samplerIndex == 13) return g_WebTCube_7.Sample(g_WebS_13, texCoord);
+        else if (samplerIndex == 14) return g_WebTCube_7.Sample(g_WebS_14, texCoord);
+        else if (samplerIndex == 15) return g_WebTCube_7.Sample(g_WebS_15, texCoord);
+        else return g_WebTCube_7.Sample(g_WebS_0, texCoord);
+    }
+    return 0;
 }
 uint2 webDimensions2D(uint textureIndex) {
     uint2 dimensions;
-    switch (textureIndex) {
-        case 0: g_WebT2D_0.GetDimensions(dimensions.x, dimensions.y); break;
-        case 1: g_WebT2D_1.GetDimensions(dimensions.x, dimensions.y); break;
-        case 2: g_WebT2D_2.GetDimensions(dimensions.x, dimensions.y); break;
-        case 3: g_WebT2D_3.GetDimensions(dimensions.x, dimensions.y); break;
-        case 4: g_WebT2D_4.GetDimensions(dimensions.x, dimensions.y); break;
-        case 5: g_WebT2D_5.GetDimensions(dimensions.x, dimensions.y); break;
-        case 6: g_WebT2D_6.GetDimensions(dimensions.x, dimensions.y); break;
-        case 7: g_WebT2D_7.GetDimensions(dimensions.x, dimensions.y); break;
-        case 8: g_WebT2D_8.GetDimensions(dimensions.x, dimensions.y); break;
-        case 9: g_WebT2D_9.GetDimensions(dimensions.x, dimensions.y); break;
-        case 10: g_WebT2D_10.GetDimensions(dimensions.x, dimensions.y); break;
-        case 11: g_WebT2D_11.GetDimensions(dimensions.x, dimensions.y); break;
-        case 12: g_WebT2D_12.GetDimensions(dimensions.x, dimensions.y); break;
-        case 13: g_WebT2D_13.GetDimensions(dimensions.x, dimensions.y); break;
-        case 14: g_WebT2D_14.GetDimensions(dimensions.x, dimensions.y); break;
-        case 15: g_WebT2D_15.GetDimensions(dimensions.x, dimensions.y); break;
-        case 16: g_WebT2D_16.GetDimensions(dimensions.x, dimensions.y); break;
-        case 17: g_WebT2D_17.GetDimensions(dimensions.x, dimensions.y); break;
-        case 18: g_WebT2D_18.GetDimensions(dimensions.x, dimensions.y); break;
-        case 19: g_WebT2D_19.GetDimensions(dimensions.x, dimensions.y); break;
-        case 20: g_WebT2D_20.GetDimensions(dimensions.x, dimensions.y); break;
-        case 21: g_WebT2D_21.GetDimensions(dimensions.x, dimensions.y); break;
-        case 22: g_WebT2D_22.GetDimensions(dimensions.x, dimensions.y); break;
-        case 23: g_WebT2D_23.GetDimensions(dimensions.x, dimensions.y); break;
-        case 24: g_WebT2D_24.GetDimensions(dimensions.x, dimensions.y); break;
-        case 25: g_WebT2D_25.GetDimensions(dimensions.x, dimensions.y); break;
-        case 26: g_WebT2D_26.GetDimensions(dimensions.x, dimensions.y); break;
-        case 27: g_WebT2D_27.GetDimensions(dimensions.x, dimensions.y); break;
-        case 28: g_WebT2D_28.GetDimensions(dimensions.x, dimensions.y); break;
-        case 29: g_WebT2D_29.GetDimensions(dimensions.x, dimensions.y); break;
-        case 30: g_WebT2D_30.GetDimensions(dimensions.x, dimensions.y); break;
-        case 31: g_WebT2D_31.GetDimensions(dimensions.x, dimensions.y); break;
-        default: g_WebT2D_0.GetDimensions(dimensions.x, dimensions.y); break;
-    }
+    if (textureIndex == 0) g_WebT2D_0.GetDimensions(dimensions.x, dimensions.y);
+    else if (textureIndex == 1) g_WebT2D_1.GetDimensions(dimensions.x, dimensions.y);
+    else if (textureIndex == 2) g_WebT2D_2.GetDimensions(dimensions.x, dimensions.y);
+    else if (textureIndex == 3) g_WebT2D_3.GetDimensions(dimensions.x, dimensions.y);
+    else if (textureIndex == 4) g_WebT2D_4.GetDimensions(dimensions.x, dimensions.y);
+    else if (textureIndex == 5) g_WebT2D_5.GetDimensions(dimensions.x, dimensions.y);
+    else if (textureIndex == 6) g_WebT2D_6.GetDimensions(dimensions.x, dimensions.y);
+    else if (textureIndex == 7) g_WebT2D_7.GetDimensions(dimensions.x, dimensions.y);
+    else if (textureIndex == 8) g_WebT2D_8.GetDimensions(dimensions.x, dimensions.y);
+    else if (textureIndex == 9) g_WebT2D_9.GetDimensions(dimensions.x, dimensions.y);
+    else if (textureIndex == 10) g_WebT2D_10.GetDimensions(dimensions.x, dimensions.y);
+    else if (textureIndex == 11) g_WebT2D_11.GetDimensions(dimensions.x, dimensions.y);
+    else if (textureIndex == 12) g_WebT2D_12.GetDimensions(dimensions.x, dimensions.y);
+    else if (textureIndex == 13) g_WebT2D_13.GetDimensions(dimensions.x, dimensions.y);
+    else if (textureIndex == 14) g_WebT2D_14.GetDimensions(dimensions.x, dimensions.y);
+    else if (textureIndex == 15) g_WebT2D_15.GetDimensions(dimensions.x, dimensions.y);
+    else if (textureIndex == 16) g_WebT2D_16.GetDimensions(dimensions.x, dimensions.y);
+    else if (textureIndex == 17) g_WebT2D_17.GetDimensions(dimensions.x, dimensions.y);
+    else if (textureIndex == 18) g_WebT2D_18.GetDimensions(dimensions.x, dimensions.y);
+    else if (textureIndex == 19) g_WebT2D_19.GetDimensions(dimensions.x, dimensions.y);
+    else if (textureIndex == 20) g_WebT2D_20.GetDimensions(dimensions.x, dimensions.y);
+    else if (textureIndex == 21) g_WebT2D_21.GetDimensions(dimensions.x, dimensions.y);
+    else if (textureIndex == 22) g_WebT2D_22.GetDimensions(dimensions.x, dimensions.y);
+    else if (textureIndex == 23) g_WebT2D_23.GetDimensions(dimensions.x, dimensions.y);
+    else if (textureIndex == 24) g_WebT2D_24.GetDimensions(dimensions.x, dimensions.y);
+    else if (textureIndex == 25) g_WebT2D_25.GetDimensions(dimensions.x, dimensions.y);
+    else if (textureIndex == 26) g_WebT2D_26.GetDimensions(dimensions.x, dimensions.y);
+    else if (textureIndex == 27) g_WebT2D_27.GetDimensions(dimensions.x, dimensions.y);
+    else if (textureIndex == 28) g_WebT2D_28.GetDimensions(dimensions.x, dimensions.y);
+    else if (textureIndex == 29) g_WebT2D_29.GetDimensions(dimensions.x, dimensions.y);
+    else if (textureIndex == 30) g_WebT2D_30.GetDimensions(dimensions.x, dimensions.y);
+    else if (textureIndex == 31) g_WebT2D_31.GetDimensions(dimensions.x, dimensions.y);
+    else g_WebT2D_0.GetDimensions(dimensions.x, dimensions.y);
     return dimensions;
 }
 #else
@@ -1842,7 +1724,11 @@ float4 tfetchR11G11B10(uint4 value)
 
 float4 tfetchTexcoord(uint swappedTexcoords, float4 value, uint semanticIndex)
 {
+#if defined(BROKEN_BOND_WGSL)
+    return (swappedTexcoords & (1u << semanticIndex)) != 0 ? value.yxwz : value;
+#else
     return (swappedTexcoords & (1ull << semanticIndex)) != 0 ? value.yxwz : value;
+#endif
 }
 
 float4 cube(float4 value, inout CubeMapData cubeMapData)

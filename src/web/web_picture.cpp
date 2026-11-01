@@ -1,4 +1,5 @@
 #include "web/web_picture.h"
+#include "web/web_draw.h"
 
 #include "gfx/texture.h"
 #include "web/guest_fold.h"
@@ -341,6 +342,8 @@ extern "C" EMSCRIPTEN_KEEPALIVE int broken_bond_web_start_picture() {
   return StartPicture() ? 0 : 1;
 }
 
+void ReleasePicture() { State() = Picture{}; }
+
 void ShowFrontbuffer(uint32_t texture, uint8_t* base) {
   Picture& picture = State();
   if (!picture.ready) return;
@@ -365,6 +368,8 @@ void ShowFrontbuffer(uint32_t texture, uint8_t* base) {
 
 extern "C" void __imp__sub_821B1DD0(PPCContext& __restrict ctx, uint8_t* base);
 REX_HOOK_RAW(sub_821B1DD0) {
-  broken_bond::web::ShowFrontbuffer(ctx.r4.u32, base);
+  if (!broken_bond::web::PresentRenderer(ctx.r4.u32, base)) {
+    broken_bond::web::ShowFrontbuffer(ctx.r4.u32, base);
+  }
   __imp__sub_821B1DD0(ctx, base);
 }

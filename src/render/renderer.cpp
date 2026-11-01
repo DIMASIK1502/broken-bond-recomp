@@ -22,7 +22,9 @@
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/xenos.h>
 #include <rex/system/xmemory.h>
+#if !defined(__EMSCRIPTEN__)
 #include <smolv.h>
+#endif
 #include <zstd.h>
 
 #include "gfx/shader_cache.h"
@@ -38,10 +40,16 @@ extern "C" __declspec(dllimport) short __stdcall GetAsyncKeyState(int key);
 
 #include "render/interpolation.h"
 
+#if !defined(__EMSCRIPTEN__)
 #include "depth_resolve_ps.h"
 #include "depth_resolve_vs.h"
 #include "present_ps.h"
 #include "present_vs.h"
+#else
+#include <emscripten.h>
+#include <emscripten/threading.h>
+#include <plume_device_thread.h>
+#endif
 #include "host/shadow_draw.h"
 
 namespace plume {
@@ -139,6 +147,23 @@ namespace xenos = rex::graphics::xenos;
 using broken_bond::gfx::DeclUsage;
 
 constexpr plume::RenderFormat kColorFormat = plume::RenderFormat::B8G8R8A8_UNORM;
+#if defined(__EMSCRIPTEN__)
+// The browser heap is 32 2D + 16 1D textures and 16 samplers: the adapter's
+// per-stage caps. Cube and 3D fetches stay on the white slot.
+constexpr uint32_t kTexture2DCount = gfx::kWebTexture2DCount;
+constexpr uint32_t kTexture3DCount = gfx::kWebTexture3DCount;
+constexpr uint32_t kTextureCubeCount = gfx::kWebTextureCubeCount;
+constexpr uint32_t kTexture1DCount = gfx::kWebTexture1DCount;
+constexpr uint32_t kSamplerCount = gfx::kWebSamplerCount;
+constexpr uint32_t kDescriptorSets = 3;
+#else
+constexpr uint32_t kTexture2DCount = 8192;
+constexpr uint32_t kTexture3DCount = 64;
+constexpr uint32_t kTextureCubeCount = 256;
+constexpr uint32_t kTexture1DCount = 1024;
+constexpr uint32_t kSamplerCount = 1024;
+constexpr uint32_t kDescriptorSets = 6;
+#endif
 constexpr plume::RenderFormat kDepthFormat = plume::RenderFormat::D32_FLOAT_S8_UINT;
 // What a guest depth resolve becomes on the host: the depth value itself.
 constexpr plume::RenderFormat kDepthCopyFormat = plume::RenderFormat::R32_FLOAT;
@@ -148,11 +173,6 @@ constexpr plume::RenderFormat kDepthCopyFormat = plume::RenderFormat::R32_FLOAT;
 constexpr uint32_t kSwapChainBuffers = 2;
 constexpr uint32_t kInterpolationSwapChainBuffers = 4;
 constexpr uint64_t kUploadBytes = 256ull << 20;
-constexpr uint32_t kTexture2DCount = 8192;
-constexpr uint32_t kTexture3DCount = 64;
-constexpr uint32_t kTextureCubeCount = 256;
-constexpr uint32_t kTexture1DCount = 1024;
-constexpr uint32_t kSamplerCount = 1024;
 
 // Guest frame the D3D viewport registers describe; the host target scales it.
 constexpr float kGuestWidth = 1280.0f;
@@ -898,7 +918,12 @@ struct Renderer::State {
   // Shader cache from XenosRecomp, decompressed once.
   std::vector<uint8_t> spirv;
   std::unordered_map<uint64_t, const ShaderCacheEntry*> entries;
+  std::vector<ShaderCacheEntry> web_entries;
   std::unordered_map<uint64_t, std::unique_ptr<plume::RenderShader>> shaders;
+  // Depth-only draws have no pixel shader. WebGPU still requires the pipeline
+  // to name the pass's color attachment, so these draws use a shader that
+  // writes nothing.
+  std::unique_ptr<plume::RenderShader> depth_only_ps;
   std::unordered_map<uint64_t, std::unique_ptr<plume::RenderPipeline>> pipelines;
 
   struct Texture {
@@ -906,6 +931,7 @@ struct Renderer::State {
     std::unique_ptr<plume::RenderTextureView> view;
     uint32_t index = 0;
     bool resolved = false;  // a host copy of the target, at host scale
+    bool copied = false;    // the last resolve wrote this texture, not just allocated it
     uint64_t content = 0;   // XXH3 of the guest texels last uploaded
     uint64_t sample = 0;    // SampleHash of the same texels
     uint64_t checked = UINT64_MAX;  // present the content was last compared
@@ -947,6 +973,7 @@ struct Renderer::State {
   std::unique_ptr<plume::RenderPipeline> depth_resolve_pipeline;
 
   void CreateDepthResolvePipeline() {
+#if !defined(__EMSCRIPTEN__)
     depth_resolve_vs = device->createShader(g_depth_resolve_vs, sizeof(g_depth_resolve_vs), "VSMain",
                                             plume::RenderShaderFormat::SPIRV);
     depth_resolve_ps = device->createShader(g_depth_resolve_ps, sizeof(g_depth_resolve_ps), "PSMain",
@@ -961,9 +988,11 @@ struct Renderer::State {
     desc.renderTargetFormat[0] = kDepthCopyFormat;
     desc.renderTargetBlend[0] = plume::RenderBlendDesc::Copy();
     depth_resolve_pipeline = device->createGraphicsPipeline(desc);
+#endif
   }
 
   void CreatePresentPipeline() {
+#if !defined(__EMSCRIPTEN__)
     present_vs = device->createShader(g_present_vs, sizeof(g_present_vs), "VSMain", plume::RenderShaderFormat::SPIRV);
     present_ps = device->createShader(g_present_ps, sizeof(g_present_ps), "PSMain", plume::RenderShaderFormat::SPIRV);
     plume::RenderGraphicsPipelineDesc desc;
@@ -976,6 +1005,7 @@ struct Renderer::State {
     desc.renderTargetFormat[0] = kColorFormat;
     desc.renderTargetBlend[0] = plume::RenderBlendDesc::Copy();
     present_pipeline = device->createGraphicsPipeline(desc);
+#endif
   }
 
   // Bilinear, clamped sampler for scaling the frontbuffer to the window.
@@ -1001,6 +1031,99 @@ struct Renderer::State {
     }
     return framebuffer.get();
   }
+
+#if defined(__EMSCRIPTEN__)
+  std::unique_ptr<plume::RenderShader> blit_vs, blit_ps;
+  std::unique_ptr<plume::RenderPipelineLayout> blit_layout;
+  std::unique_ptr<plume::RenderPipeline> blit_pipeline;
+  std::unique_ptr<plume::RenderDescriptorSet> blit_textures, blit_samplers;
+  std::unique_ptr<plume::RenderSampler> blit_sampler;
+
+  bool EnsureBlitPipeline() {
+    if (blit_pipeline) return true;
+    const char* wgsl = R"WGSL(
+struct VsOut {
+  @builtin(position) pos: vec4f,
+  @location(0) uv: vec2f,
+}
+@group(0) @binding(0) var src: texture_2d<f32>;
+@group(1) @binding(0) var src_sampler: sampler;
+@vertex
+fn VSMain(@builtin(vertex_index) id: u32) -> VsOut {
+  let xy = vec2f(f32((id << 1u) & 2u), f32(id & 2u));
+  var out: VsOut;
+  out.pos = vec4f(xy * 2.0 - 1.0, 0.0, 1.0);
+  out.uv = vec2f(xy.x * 0.5, 1.0 - xy.y * 0.5);
+  return out;
+}
+@fragment
+fn PSMain(in: VsOut) -> @location(0) vec4f {
+  return textureSampleLevel(src, src_sampler, in.uv, 0.0);
+}
+)WGSL";
+    const size_t bytes = std::char_traits<char>::length(wgsl);
+    blit_vs = device->createShader(wgsl, bytes, "VSMain", plume::RenderShaderFormat::WGSL);
+    blit_ps = device->createShader(wgsl, bytes, "PSMain", plume::RenderShaderFormat::WGSL);
+    if (!blit_vs || !blit_ps) return false;
+    using R = plume::RenderDescriptorRangeType;
+    const plume::RenderDescriptorRange texture_range(R::TEXTURE, 0, 1);
+    const plume::RenderDescriptorRange sampler_range(R::SAMPLER, 0, 1);
+    plume::RenderDescriptorSetDesc set_descs[2] = {
+        plume::RenderDescriptorSetDesc(&texture_range, 1),
+        plume::RenderDescriptorSetDesc(&sampler_range, 1),
+    };
+    blit_textures = device->createDescriptorSet(set_descs[0]);
+    blit_samplers = device->createDescriptorSet(set_descs[1]);
+    plume::RenderPipelineLayoutDesc layout_desc(nullptr, 0, set_descs, 2, false, false);
+    blit_layout = device->createPipelineLayout(layout_desc);
+    if (!blit_textures || !blit_samplers || !blit_layout) return false;
+    plume::RenderSamplerDesc sampler_desc;
+    sampler_desc.addressU = sampler_desc.addressV = sampler_desc.addressW = plume::RenderTextureAddressMode::CLAMP;
+    sampler_desc.minFilter = sampler_desc.magFilter = plume::RenderFilter::LINEAR;
+    sampler_desc.mipmapMode = plume::RenderMipmapMode::NEAREST;
+    blit_sampler = device->createSampler(sampler_desc);
+    blit_samplers->setSampler(0, blit_sampler.get());
+    plume::RenderGraphicsPipelineDesc desc;
+    desc.pipelineLayout = blit_layout.get();
+    desc.vertexShader = blit_vs.get();
+    desc.pixelShader = blit_ps.get();
+    desc.primitiveTopology = plume::RenderPrimitiveTopology::TRIANGLE_LIST;
+    desc.cullMode = plume::RenderCullMode::NONE;
+    desc.renderTargetCount = 1;
+    desc.renderTargetFormat[0] = kColorFormat;
+    desc.renderTargetBlend[0] = plume::RenderBlendDesc::Copy();
+    blit_pipeline = device->createGraphicsPipeline(desc);
+    return blit_pipeline != nullptr;
+  }
+
+  // The render target is not the window size. Draw it scaled into the swapchain
+  // instead of presenting nothing.
+  bool BlitToWindow(uint32_t image, plume::RenderTexture* picture) {
+    if (!picture || !EnsureBlitPipeline()) return false;
+    plume::RenderTexture* target = swap_chain->getTexture(image);
+    blit_textures->setTexture(0, picture, plume::RenderTextureLayout::SHADER_READ, nullptr);
+    commands->barriers(plume::RenderBarrierStage::GRAPHICS,
+                       plume::RenderTextureBarrier(picture, plume::RenderTextureLayout::SHADER_READ));
+    commands->barriers(plume::RenderBarrierStage::GRAPHICS,
+                       plume::RenderTextureBarrier(target, plume::RenderTextureLayout::COLOR_WRITE));
+    commands->setFramebuffer(SwapFramebuffer(image));
+    commands->setGraphicsPipelineLayout(blit_layout.get());
+    commands->setGraphicsDescriptorSet(blit_textures.get(), 0);
+    commands->setGraphicsDescriptorSet(blit_samplers.get(), 1);
+    commands->setPipeline(blit_pipeline.get());
+    const plume::RenderViewport viewport(0.0f, 0.0f, float(width), float(height));
+    commands->setViewports(&viewport, 1);
+    const plume::RenderRect scissor(0, 0, int32_t(width), int32_t(height));
+    commands->setScissors(&scissor, 1);
+    commands->drawInstanced(3, 1, 0, 0);
+    plume::RenderTextureBarrier after[] = {
+        plume::RenderTextureBarrier(target, plume::RenderTextureLayout::PRESENT),
+        plume::RenderTextureBarrier(picture, plume::RenderTextureLayout::COLOR_WRITE)};
+    commands->barriers(plume::RenderBarrierStage::NONE, after, 2);
+    current = nullptr;
+    return true;
+  }
+#endif
   // Cube textures, keyed like 2D ones, in the cube heap.
   std::unordered_map<uint64_t, Texture> cube_textures;
   uint32_t next_texture_cube = 1;
@@ -1298,6 +1421,27 @@ struct Renderer::State {
   std::array<std::vector<Bound>, 6> bound;
   void SetTexture(uint32_t set, uint32_t index, plume::RenderTexture* texture, plume::RenderTextureLayout layout,
                   plume::RenderTextureView* view) {
+#if defined(__EMSCRIPTEN__)
+    // PC sets 0/1/2/5 are one group in the WGSL heap. Cube and 3D are outside
+    // the 48-texture cap, so those draws keep the white texture. setTexture's
+    // index is the slot in that group's binding vector, which is the 2D heap
+    // followed by the 1D heap. The WGSL binding numbers (1D starts at 44) are
+    // not that index.
+    uint32_t base = 0;
+    uint32_t cap = 0;
+    if (set == 0) {
+      base = 0;
+      cap = kTexture2DCount;
+    } else if (set == 5) {
+      base = kTexture2DCount;
+      cap = kTexture1DCount;
+    } else {
+      return;
+    }
+    if (index >= cap) return;
+    set = 0;
+    index = base + index;
+#endif
     std::vector<Bound>& slots = bound[set];
     if (slots.size() <= index) slots.resize(index + 1);
     Bound& b = slots[index];
@@ -1358,6 +1502,14 @@ struct Renderer::State {
     return true;
   }
 
+  // The upload ring stays mapped. WebGPU would otherwise copy all 256 MiB of it
+  // at every submit. The note has to be queued before the submit that reads it.
+  void PublishUpload() {
+#if defined(__EMSCRIPTEN__)
+    if (upload && upload_used > upload_begin) upload->noteMappedWrite(upload_begin, upload_used);
+#endif
+  }
+
   void Skip(const std::string& reason) { ++skipped[reason]; }
 
   bool CreateTarget() {
@@ -1406,11 +1558,36 @@ struct Renderer::State {
   void BindTarget() {
     if (framebuffer) commands->setFramebuffer(framebuffer);
     commands->setGraphicsPipelineLayout(layout.get());
-    for (uint32_t i = 0; i < 6; ++i) commands->setGraphicsDescriptorSet(sets[i].get(), i);
+    for (uint32_t i = 0; i < kDescriptorSets; ++i) commands->setGraphicsDescriptorSet(sets[i].get(), i);
   }
 
   bool CreateLayout() {
     using R = plume::RenderDescriptorRangeType;
+#if defined(__EMSCRIPTEN__)
+    // Group 0 is the fixed heap, group 1 the samplers, group 2 the upload
+    // ring. Push constants occupy group 3, so this is the last set.
+    const plume::RenderDescriptorRange textures[] = {
+        plume::RenderDescriptorRange(R::TEXTURE, gfx::kWebTexture2DBinding, kTexture2DCount),
+        plume::RenderDescriptorRange(R::TEXTURE, gfx::kWebTexture1DBinding, kTexture1DCount),
+    };
+    const plume::RenderDescriptorRange sampler_range(R::SAMPLER, 0, kSamplerCount);
+    const plume::RenderDescriptorRange upload_range(R::BYTE_ADDRESS_BUFFER, 0, 1);
+    plume::RenderDescriptorSetDesc set_descs[3] = {
+        plume::RenderDescriptorSetDesc(textures, 2),
+        plume::RenderDescriptorSetDesc(&sampler_range, 1),
+        plume::RenderDescriptorSetDesc(&upload_range, 1),
+    };
+    for (uint32_t i = 0; i < 3; ++i) {
+      sets[i] = device->createDescriptorSet(set_descs[i]);
+      if (!sets[i]) return false;
+    }
+    const plume::RenderPushConstantRange push(0, 0, 0, 24,
+                                              plume::RenderShaderStageFlag::VERTEX |
+                                                  plume::RenderShaderStageFlag::PIXEL);
+    plume::RenderPipelineLayoutDesc desc(&push, 1, set_descs, 3, false, true);
+    layout = device->createPipelineLayout(desc);
+    return layout != nullptr;
+#else
     const plume::RenderDescriptorRange ranges[6] = {
         plume::RenderDescriptorRange(R::TEXTURE, 0, kTexture2DCount),
         plume::RenderDescriptorRange(R::TEXTURE, 0, kTexture3DCount),
@@ -1437,6 +1614,7 @@ struct Renderer::State {
       CreateDepthResolvePipeline();
     }
     return layout != nullptr;
+#endif
   }
 
   void CreateDefaults() {
@@ -1450,8 +1628,17 @@ struct Renderer::State {
     defaults.push_back(device->createTexture(cube));
     defaults.push_back(device->createTexture(plume::RenderTextureDesc::Texture1D(1, 1, F::R8G8B8A8_UNORM)));
     samplers.push_back(device->createSampler(plume::RenderSamplerDesc()));
+#if defined(__EMSCRIPTEN__)
+    // Every sampler the if/else can name has to be in the layout, or the
+    // pipeline is rejected. The white default fills the slots a draw has not
+    // used yet.
+    for (uint32_t i = 0; i < kSamplerCount; ++i) {
+      sets[1]->setSampler(i, samplers[0].get());
+    }
+#else
     sets[3]->setSampler(0, samplers[0].get());
     sets[4]->setSampler(0, samplers[0].get());
+#endif
   }
 
   bool defaults_uploaded = false;
@@ -1475,13 +1662,63 @@ struct Renderer::State {
       commands->barriers(plume::RenderBarrierStage::GRAPHICS,
                          plume::RenderTextureBarrier(defaults[d].get(), plume::RenderTextureLayout::SHADER_READ));
     }
+#if defined(__EMSCRIPTEN__)
+    for (uint32_t i = 0; i < kTexture2DCount; ++i) {
+      sets[0]->setTexture(i, defaults[0].get(), plume::RenderTextureLayout::SHADER_READ);
+    }
+    for (uint32_t i = 0; i < kTexture1DCount; ++i) {
+      sets[0]->setTexture(kTexture2DCount + i, defaults[3].get(), plume::RenderTextureLayout::SHADER_READ);
+    }
+#else
     sets[0]->setTexture(0, defaults[0].get(), plume::RenderTextureLayout::SHADER_READ);
     sets[1]->setTexture(0, defaults[1].get(), plume::RenderTextureLayout::SHADER_READ);
     sets[2]->setTexture(0, defaults[2].get(), plume::RenderTextureLayout::SHADER_READ);
     sets[5]->setTexture(0, defaults[3].get(), plume::RenderTextureLayout::SHADER_READ);
+#endif
   }
 
   bool LoadShaderCache() {
+#if defined(__EMSCRIPTEN__)
+    // One zstd frame per shader. The concatenated WGSL is 1.5 GiB; the frames
+    // are the file embedded at /shader_cache_wgsl.bin.
+    FILE* file = std::fopen("/shader_cache_wgsl.bin", "rb");
+    if (!file) {
+      REXLOG_ERROR("WGSL shader cache is not at /shader_cache_wgsl.bin");
+      return false;
+    }
+    std::fseek(file, 0, SEEK_END);
+    const long bytes = std::ftell(file);
+    std::fseek(file, 0, SEEK_SET);
+    if (bytes < 16) {
+      std::fclose(file);
+      return false;
+    }
+    std::vector<uint8_t> file_bytes(static_cast<size_t>(bytes));
+    const bool read = std::fread(file_bytes.data(), 1, file_bytes.size(), file) == file_bytes.size();
+    std::fclose(file);
+    if (!read) return false;
+    uint32_t magic = 0, version = 0, count = 0;
+    std::memcpy(&magic, file_bytes.data(), 4);
+    std::memcpy(&version, file_bytes.data() + 4, 4);
+    std::memcpy(&count, file_bytes.data() + 8, 4);
+    const size_t table = 16 + static_cast<size_t>(count) * 24;
+    if (magic != 0x314C4757u || version != 1 || table > file_bytes.size()) return false;
+    web_entries.resize(count);
+    for (uint32_t i = 0; i < count; ++i) {
+      const uint8_t* row = file_bytes.data() + 16 + static_cast<size_t>(i) * 24;
+      ShaderCacheEntry& entry = web_entries[i];
+      std::memcpy(&entry.hash, row, 8);
+      std::memcpy(&entry.specConstantsMask, row + 8, 4);
+      std::memcpy(&entry.dxilSize, row + 12, 4);
+      std::memcpy(&entry.spirvOffset, row + 16, 4);
+      std::memcpy(&entry.spirvSize, row + 20, 4);
+      entry.dxilOffset = 0;
+      entries[entry.hash] = &entry;
+    }
+    spirv.assign(file_bytes.begin() + static_cast<std::ptrdiff_t>(table), file_bytes.end());
+    REXLOG_INFO("WGSL shader cache: {} shaders, {} bytes", count, spirv.size());
+    return true;
+#else
     spirv.resize(g_spirvCacheDecompressedSize);
     const size_t n = ZSTD_decompress(spirv.data(), spirv.size(), g_compressedSpirvCache,
                                      g_spirvCacheCompressedSize);
@@ -1490,6 +1727,7 @@ struct Renderer::State {
       entries[g_shaderCacheEntries[i].hash] = &g_shaderCacheEntries[i];
     }
     return true;
+#endif
   }
 
   plume::RenderShader* Shader(uint64_t key) {
@@ -1498,12 +1736,60 @@ struct Renderer::State {
     if (found != shaders.end()) return found->second.get();
     auto entry = entries.find(key);
     if (entry == entries.end()) return nullptr;
+#if defined(__EMSCRIPTEN__)
+    std::vector<uint8_t> code(entry->second->dxilSize);
+    const size_t decoded = ZSTD_decompress(code.data(), code.size(), spirv.data() + entry->second->spirvOffset,
+                                           entry->second->spirvSize);
+    if (ZSTD_isError(decoded) || decoded != code.size()) return nullptr;
+    // DXC keeps every heap texture, used or not. The unused cube and 3D
+    // declarations are bindings this layout does not have, so every pipeline
+    // was rejected and the splash stopped. Drop the ones nothing samples.
+    // A shader that really samples them stays out: creating it fails validation
+    // and a run of those failures drops the device.
+    std::string wgsl(reinterpret_cast<const char*>(code.data()), code.size());
+    for (const char* kind : {"texture_3d<", "texture_cube<"}) {
+      const size_t kind_len = std::char_traits<char>::length(kind);
+      for (size_t at = 0; (at = wgsl.find(kind, at)) != std::string::npos;) {
+        const size_t group = wgsl.rfind("@group(0)", at);
+        const size_t var_at = wgsl.rfind("var ", at);
+        const size_t semi = wgsl.find(';', at);
+        if (group == std::string::npos || var_at == std::string::npos || semi == std::string::npos ||
+            var_at < group) {
+          at += kind_len;
+          continue;
+        }
+        const size_t name_begin = var_at + 4;
+        const size_t name_end = wgsl.find(':', name_begin);
+        if (name_end == std::string::npos || name_end > at) {
+          at += kind_len;
+          continue;
+        }
+        const std::string name = wgsl.substr(name_begin, name_end - name_begin);
+        size_t uses = 0;
+        for (size_t found = 0; (found = wgsl.find(name, found)) != std::string::npos; found += name.size()) {
+          ++uses;
+        }
+        if (uses > 1) {
+          at = semi + 1;
+          continue;
+        }
+        wgsl.erase(group, semi + 1 - group);
+        at = group;
+      }
+    }
+    if (wgsl.find("texture_cube<") != std::string::npos || wgsl.find("texture_3d<") != std::string::npos) {
+      shaders.emplace(key, nullptr);
+      return nullptr;
+    }
+    auto shader = device->createShader(wgsl.data(), wgsl.size(), "main", plume::RenderShaderFormat::WGSL);
+#else
     const uint8_t* smol = spirv.data() + entry->second->spirvOffset;
     std::vector<uint8_t> code(smolv::GetDecodedBufferSize(smol, entry->second->spirvSize));
     if (code.empty() || !smolv::Decode(smol, entry->second->spirvSize, code.data(), code.size())) {
       return nullptr;
     }
     auto shader = device->createShader(code.data(), code.size(), "main", plume::RenderShaderFormat::SPIRV);
+#endif
     return shaders.emplace(key, std::move(shader)).first->second.get();
   }
 
@@ -1523,7 +1809,11 @@ struct Renderer::State {
     desc.mipmapMode = uint32_t(fetch.mip_filter) == 0 ? plume::RenderMipmapMode::NEAREST : plume::RenderMipmapMode::LINEAR;
     const uint32_t index = uint32_t(samplers.size());
     samplers.push_back(device->createSampler(desc));
+#if defined(__EMSCRIPTEN__)
+    sets[1]->setSampler(index, samplers.back().get());
+#else
     sets[3]->setSampler(index, samplers.back().get());
+#endif
     sampler_index[key] = index;
     return index;
   }
@@ -1861,7 +2151,7 @@ struct Renderer::State {
                        plume::RenderTextureBarrier(target, plume::RenderTextureLayout::COLOR_WRITE));
     commands->setFramebuffer(SwapFramebuffer(image));
     commands->setGraphicsPipelineLayout(layout.get());
-    for (uint32_t i = 0; i < 6; ++i) commands->setGraphicsDescriptorSet(sets[i].get(), i);
+    for (uint32_t i = 0; i < kDescriptorSets; ++i) commands->setGraphicsDescriptorSet(sets[i].get(), i);
     commands->setPipeline(present_pipeline.get());
     const uint64_t push[3] = {upload_gpu + constants, 0, 0};
     commands->setGraphicsPushConstants(0, push, 0, sizeof(push));
@@ -2292,6 +2582,7 @@ struct Renderer::State {
     const plume::RenderCommandList* list = commands.get();
     plume::RenderCommandSemaphore* wait = acquire.get();
     plume::RenderCommandSemaphore* signal = release[mid_image].get();
+    PublishUpload();
     queue->executeCommandLists(&list, 1, &wait, 1, &signal, 1, fence.get());
     swap_chain->present(mid_image, &signal, 1);
     if (second) {
@@ -2305,6 +2596,7 @@ struct Renderer::State {
       const plume::RenderCommandList* second_list = commands_second.get();
       plume::RenderCommandSemaphore* second_wait = acquire_second.get();
       plume::RenderCommandSemaphore* second_signal = release[real_image].get();
+      PublishUpload();
       queue->executeCommandLists(&second_list, 1, &second_wait, 1, &second_signal, 1, fence_second.get());
       swap_chain->present(real_image, &second_signal, 1);
       second_pending = true;
@@ -2424,6 +2716,7 @@ struct Renderer::State {
 
   void ExecuteResolve(const ResolveOp& op) {
     UseTarget(*op.target);
+    bool keep_picture = false;
     if (op.kind == ResolveOp::kDepth) {
       Texture& entry = textures[op.key];
       Image& depth_image = *op.target->depth;
@@ -2435,7 +2728,7 @@ struct Renderer::State {
                           depth_image.depth_view.get());
       commands->setFramebuffer(entry.framebuffer.get());
       commands->setGraphicsPipelineLayout(layout.get());
-      for (uint32_t i = 0; i < 6; ++i) commands->setGraphicsDescriptorSet(sets[i].get(), i);
+      for (uint32_t i = 0; i < kDescriptorSets; ++i) commands->setGraphicsDescriptorSet(sets[i].get(), i);
       commands->setPipeline(depth_resolve_pipeline.get());
       const uint64_t push[3] = {upload_gpu + op.constants, 0, 0};
       commands->setGraphicsPushConstants(0, push, 0, sizeof(push));
@@ -2459,6 +2752,18 @@ struct Renderer::State {
           plume::RenderTextureBarrier(entry.texture.get(), multisampled ? plume::RenderTextureLayout::RESOLVE_DEST
                                                                         : plume::RenderTextureLayout::COPY_DEST)};
       commands->barriers(plume::RenderBarrierStage::COPY, to_copy, 2);
+      const bool same_size = entry.width == target_width && entry.height == target_height;
+      const bool at_origin = op.dst_x == 0 && op.dst_y == 0;
+      // A band of a same-sized multisampled target still copies the whole target.
+      // Anything else does not, and the texture would be shown empty.
+      const bool copied = entry.texture && at_origin && same_size &&
+                          (multisampled || (op.src.left <= 0 && op.src.top <= 0 &&
+                                            op.src.right >= int32_t(target_width) &&
+                                            op.src.bottom >= int32_t(target_height)));
+#if defined(__EMSCRIPTEN__)
+      entry.copied = copied;
+      if (!copied) keep_picture = true;
+#endif
       if (multisampled) {
         commands->resolveTextureRegion(entry.texture.get(), uint32_t(op.dst_x), uint32_t(op.dst_y), color, &op.src);
       } else {
@@ -2475,8 +2780,8 @@ struct Renderer::State {
                           entry.view.get());
     }
     BindTarget();
-    if (op.clear_flags & 0x100) commands->clearColor(0, op.clear_color, &op.clear_region, 1);
-    if (op.clear_flags & 0x200) {
+    if (!keep_picture && (op.clear_flags & 0x100)) commands->clearColor(0, op.clear_color, &op.clear_region, 1);
+    if (!keep_picture && (op.clear_flags & 0x200)) {
       commands->clearDepthStencil(true, true, std::clamp(op.z, 0.0f, 1.0f), 0, &op.clear_region, 1);
     }
   }
@@ -2495,8 +2800,12 @@ const std::string& Renderer::device_name() const { return state_->device_name; }
 bool Renderer::Open(void* native_window, std::string& reason) {
   State& s = *state_;
 #if defined(__EMSCRIPTEN__)
-  // plume-web. The PC build takes the Vulkan call below.
-  s.render_interface = plume::CreateWebGPUInterface();
+  // Draws run on a guest pthread. The device thread carries WebGPU calls to
+  // the browser thread, the same way the first blue present does.
+  auto device_thread = plume::CreateEmscriptenDeviceThread(emscripten_main_runtime_thread_id());
+  s.render_interface = plume::CreateDeviceThreadInterface(std::move(device_thread), [] {
+    return plume::CreateWebGPUInterface();
+  });
 #else
   s.render_interface = plume::CreateVulkanInterface();
 #endif
@@ -2508,26 +2817,27 @@ bool Renderer::Open(void* native_window, std::string& reason) {
 #endif
     return false;
   }
+  s.device = s.render_interface->createDevice();
+  if (!s.device) {
+#if defined(__EMSCRIPTEN__)
+    reason = "no WebGPU device";
+#else
+    reason = "no Vulkan device";
+#endif
+    return false;
+  }
 #if defined(__EMSCRIPTEN__)
   if (s.render_interface->getCapabilities().shaderFormat != plume::RenderShaderFormat::WGSL) {
     reason = "WebGPU backend did not report WGSL shaders";
     return false;
   }
-  // This device has no buffer device addresses, and the cache is still SPIR-V.
-  // Drawing starts once the WGSL cache is bound. The PC path does not reach here.
-  reason = "WebGPU interface is linked; drawing waits on the WGSL shader cache";
-  return false;
-#endif
-  s.device = s.render_interface->createDevice();
-  if (!s.device) {
-    reason = "no Vulkan device";
-    return false;
-  }
+#else
   const plume::RenderDeviceCapabilities& caps = s.device->getCapabilities();
   if (!caps.descriptorIndexing || !caps.bufferDeviceAddress) {
     reason = "the device lacks descriptor indexing or buffer device address";
     return false;
   }
+#endif
   s.device_name = s.device->getDescription().name;
   s.queue = s.device->createCommandQueue(plume::RenderCommandListType::DIRECT);
   s.fence = s.device->createCommandFence();
@@ -2556,19 +2866,34 @@ bool Renderer::Open(void* native_window, std::string& reason) {
     reason = "no render target";
     return false;
   }
-  s.upload = s.device->createBuffer(plume::RenderBufferDesc::UploadBuffer(
-      kUploadBytes, plume::RenderBufferFlag::VERTEX | plume::RenderBufferFlag::INDEX |
-                        plume::RenderBufferFlag::CONSTANT | plume::RenderBufferFlag::DEVICE_ADDRESSABLE));
+#if defined(__EMSCRIPTEN__)
+  // The ring is a storage buffer the shaders load by byte offset. Mapping it
+  // keeps a shadow; plume writes that shadow to the GPU on submit.
+  const plume::RenderBufferFlags upload_flags =
+      plume::RenderBufferFlag::VERTEX | plume::RenderBufferFlag::INDEX | plume::RenderBufferFlag::STORAGE;
+#else
+  const plume::RenderBufferFlags upload_flags =
+      plume::RenderBufferFlag::VERTEX | plume::RenderBufferFlag::INDEX | plume::RenderBufferFlag::CONSTANT |
+      plume::RenderBufferFlag::DEVICE_ADDRESSABLE;
+#endif
+  s.upload = s.device->createBuffer(plume::RenderBufferDesc::UploadBuffer(kUploadBytes, upload_flags));
   if (!s.upload) {
     reason = "no upload buffer";
     return false;
   }
   s.upload_cpu = static_cast<uint8_t*>(s.upload->map());
+#if defined(__EMSCRIPTEN__)
+  s.upload_gpu = 0;
+#else
   s.upload_gpu = s.upload->getDeviceAddress();
+#endif
   if (!s.CreateLayout()) {
     reason = "no pipeline layout";
     return false;
   }
+#if defined(__EMSCRIPTEN__)
+  s.sets[2]->setBuffer(0, s.upload.get(), kUploadBytes);
+#endif
   s.CreateDefaults();
   if (!s.LoadShaderCache()) {
     reason = "the shader cache did not inflate";
@@ -2897,6 +3222,17 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
   const uint32_t blend_control = Reg(base, device, kRbBlendControl0);
   const uint32_t color_control = Reg(base, device, kRbColorControl);
   uint32_t color_mask = Reg(base, device, kRbColorMask) & 0xF;
+#if defined(__EMSCRIPTEN__)
+  if (!ps) {
+    if (!s.depth_only_ps) {
+      const char depth_only[] = "@fragment\nfn main() -> @location(0) vec4<f32> { return vec4<f32>(0.0); }\n";
+      s.depth_only_ps = s.device->createShader(depth_only, sizeof(depth_only) - 1, "main",
+                                               plume::RenderShaderFormat::WGSL);
+    }
+    ps = s.depth_only_ps.get();
+    color_mask = 0;
+  }
+#endif
   {
     static constexpr uint32_t kTintMasks[] = {0x1, 0x2, 0x4, 0x3};
     uint32_t n = 0;
@@ -3524,7 +3860,13 @@ void Renderer::Resolve(uint32_t device, uint32_t flags, uint32_t rect, uint32_t 
       s.Retire(entry.framebuffer);
       s.Retire(entry.view);
       s.Retire(entry.texture);
+#if defined(__EMSCRIPTEN__)
+      // WebGPU resolves only into a color target. A sampled texture used as the resolve
+      // target invalidates the command buffer.
+      entry.texture = s.device->createTexture(plume::RenderTextureDesc::ColorTarget(width, height, kColorFormat));
+#else
       entry.texture = s.device->createTexture(plume::RenderTextureDesc::Texture2D(width, height, 1, kColorFormat));
+#endif
       plume::RenderTextureViewDesc view = plume::RenderTextureViewDesc::Texture2D(kColorFormat);
       entry.view_swizzle = ResolvedSwizzle(fetch.swizzle, fetch.format);
       view.componentMapping = ComponentMapping(entry.view_swizzle);
@@ -3599,19 +3941,31 @@ void Renderer::Present(uint32_t frontbuffer, const uint8_t* base) {
   // Swap shows a texture: the last resolve into it when there was one, else
   // whatever the target holds.
   if (s.current) s.ResolveMsaa(*s.current->color);
-  plume::RenderTexture* source = s.current ? s.current->color->texture.get() : s.color;
+  plume::RenderTexture* picture = s.current ? s.current->color->texture.get() : s.color;
+  const bool picture_fits = picture && s.target_width == s.width && s.target_height == s.height;
+  plume::RenderTexture* source = picture_fits ? picture : nullptr;
   plume::RenderTextureLayout source_layout = plume::RenderTextureLayout::COLOR_WRITE;
-  if (source && (s.target_width != s.width || s.target_height != s.height)) source = nullptr;
   if (frontbuffer != 0 && !REXCVAR_GET(native_debug_target)) {
     uint32_t words[6];
     for (uint32_t w = 0; w < 6; ++w) words[w] = Be32(base, frontbuffer + 28 + 4 * w);
     auto found = s.textures.find(ImageKey(words));
-    if (found != s.textures.end() && found->second.resolved &&
-        (s.present_pipeline || (found->second.width == s.width && found->second.height == s.height))) {
+    const bool window_sized = found != s.textures.end() && found->second.width == s.width &&
+                              found->second.height == s.height;
+#if defined(__EMSCRIPTEN__)
+    // An allocated frontbuffer is not a picture until a resolve has written it.
+    const bool show_front = window_sized && found->second.copied;
+#else
+    const bool show_front = found != s.textures.end() && found->second.resolved &&
+                            (s.present_pipeline || window_sized);
+#endif
+    if (show_front) {
       source = found->second.texture.get();
       source_layout = plume::RenderTextureLayout::SHADER_READ;
     }
   }
+#if defined(__EMSCRIPTEN__)
+  const bool scale_picture = source == nullptr && picture != nullptr;
+#endif
   const bool resize = s.swap_chain->needsResize();
   bool shown = false;
   if (REXCVAR_GET(native_interpolate) && s.flip_interval.load(std::memory_order_relaxed) == 2 && !resize &&
@@ -3637,6 +3991,11 @@ void Renderer::Present(uint32_t frontbuffer, const uint8_t* base) {
   uint64_t present_constants = 0;
   const bool gamma = target && source_index != 0 && s.present_pipeline &&
                      s.Upload(16 + 256 * 4, 256, present_constants);
+#if defined(__EMSCRIPTEN__)
+  if (scale_picture && target && s.BlitToWindow(image, picture)) {
+    // The frame was drawn at another size and scaled into the window.
+  } else
+#endif
   if (target && !source) {
     // Nothing the size of the window to show yet.
     s.commands->barriers(plume::RenderBarrierStage::COPY,
@@ -3684,9 +4043,11 @@ void Renderer::Present(uint32_t frontbuffer, const uint8_t* base) {
   } else if (target) {
     plume::RenderCommandSemaphore* wait = s.acquire.get();
     plume::RenderCommandSemaphore* signal = s.release[image].get();
+    s.PublishUpload();
     s.queue->executeCommandLists(&list, 1, &wait, 1, &signal, 1, s.fence.get());
     s.swap_chain->present(image, &signal, 1);
   } else {
+    s.PublishUpload();
     s.queue->executeCommandLists(&list, 1, nullptr, 0, nullptr, 0, s.fence.get());
   }
   s.fence_pending[s.frame_slot] = true;
@@ -3783,6 +4144,9 @@ void Renderer::Present(uint32_t frontbuffer, const uint8_t* base) {
     REXLOG_INFO("native: wrote {}", path);
   }
   ++s.presents;
+#if defined(__EMSCRIPTEN__)
+  MAIN_THREAD_ASYNC_EM_ASM({ if (window.brokenBond && window.brokenBond.noteFrame) window.brokenBond.noteFrame(); });
+#endif
 #if defined(_WIN32)
   // F9 (on its press) dumps the next frame.
   const bool f9 = (GetAsyncKeyState(0x78) & 0x8000) != 0;

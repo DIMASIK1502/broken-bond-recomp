@@ -20,20 +20,33 @@ add_compile_options(
 set(PLUME_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 add_subdirectory("${_root}/thirdparty/plume-web" "${CMAKE_BINARY_DIR}/plume-web" EXCLUDE_FROM_ALL)
 
+set(ZSTD_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
+set(ZSTD_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(ZSTD_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+set(ZSTD_LEGACY_SUPPORT OFF CACHE BOOL "" FORCE)
+add_subdirectory("${_root}/thirdparty/xenosrecomp/thirdparty/zstd/build/cmake"
+    "${CMAKE_BINARY_DIR}/zstd" EXCLUDE_FROM_ALL)
+
 add_executable(broken_bond
     src/web/shell_main.cpp
     src/web/web_files.cpp
     src/web/web_input.cpp
     src/web/web_audio.cpp
     src/web/web_picture.cpp
+    src/web/web_draw.cpp
     src/web/ui_stub.cpp
+    src/render/renderer.cpp
+    src/render/interpolation.cpp
+    src/host/shadow_draw.cpp
     src/gfx/texture.cpp
     src/compat/xusbcam.cpp
 )
 target_include_directories(broken_bond PRIVATE
+    "${_root}"
     "${_root}/src"
     "${_root}/generated/default"
-    "${_root}/thirdparty/rexglue-sdk/include")
+    "${_root}/thirdparty/rexglue-sdk/include"
+    "${_root}/thirdparty/xenosrecomp/thirdparty/zstd/lib")
 target_compile_definitions(broken_bond PRIVATE BROKEN_BOND_WEB=1 FMT_HEADER_ONLY)
 target_compile_options(broken_bond PRIVATE --use-port=emdawnwebgpu)
 target_link_libraries(broken_bond PRIVATE
@@ -41,7 +54,8 @@ target_link_libraries(broken_bond PRIVATE
     broken_bond_web_recomp
     broken_bond_web_support
     broken_bond_web_ffmpeg
-    plume)
+    plume
+    libzstd_static)
 
 set(_page_files
     "${_root}/web/input.js"
@@ -76,6 +90,7 @@ target_link_options(broken_bond PRIVATE
     # functions. Last -O wins, so this stays after the build type's -O3 and
     # skips that pass. The objects are already LLVM-optimized.
     -O1
+    "SHELL:--embed-file ${CMAKE_BINARY_DIR}/shader_cache_wgsl.bin@/shader_cache_wgsl.bin"
 )
 set_target_properties(broken_bond PROPERTIES
     SUFFIX ".html"

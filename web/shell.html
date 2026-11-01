@@ -13,10 +13,13 @@
   #import-status { white-space: pre-wrap; }
   #log { display: none; position: fixed; left: 0; right: 0; bottom: 0; max-height: 35vh; overflow: auto;
          margin: 0; padding: 4px 8px; background: rgba(0, 0, 0, 0.6); white-space: pre-wrap; font: 12px monospace; }
+  #fps { position: fixed; top: 8px; left: 8px; z-index: 3; margin: 0; padding: 2px 8px;
+         background: rgba(0, 0, 0, 0.55); color: #fff; font: 16px monospace; pointer-events: none; }
 </style>
 </head>
 <body>
 <canvas id="canvas" tabindex="0"></canvas>
+<div id="fps">fps —</div>
 <pre id="log"></pre>
 <section id="import-panel" hidden aria-labelledby="import-title">
   <h1 id="import-title">Naruto: The Broken Bond</h1>
@@ -43,14 +46,35 @@
   function showLog(text) {
     console.log(text);
     logLines.push(text);
-    if (logLines.length > 200) logLines.shift();
+    if (logLines.length > 4000) logLines.shift();
     logElement.textContent = logLines.join('\n');
     logElement.scrollTop = logElement.scrollHeight;
+  }
+  for (const level of ['error', 'warn']) {
+    const original = console[level].bind(console);
+    console[level] = (...args) => {
+      original(...args);
+      const text = args.map((item) => (item && item.stack) ? item.stack : String(item)).join(' ');
+      const kept = window.brokenBond.shaderErrors;
+      if (kept.length < 8 && /ShaderModule|parse error|binding/i.test(text)) kept.push(text);
+      showLog(text);
+    };
   }
   const canvasElement = document.getElementById('canvas');
   canvasElement.width = Math.round(canvasElement.clientWidth * devicePixelRatio);
   canvasElement.height = Math.round(canvasElement.clientHeight * devicePixelRatio);
-  window.brokenBond = { started: performance.now(), exitCode: null };
+  window.brokenBond = { started: performance.now(), exitCode: null, shaderErrors: [], frames: 0, fpsTime: 0 };
+  window.brokenBond.noteFrame = () => {
+    const now = performance.now();
+    const state = window.brokenBond;
+    state.frames += 1;
+    if (state.fpsTime === 0) state.fpsTime = now;
+    const elapsed = now - state.fpsTime;
+    if (elapsed < 500) return;
+    document.getElementById('fps').textContent = `${(state.frames * 1000 / elapsed).toFixed(0)} fps`;
+    state.frames = 0;
+    state.fpsTime = now;
+  };
   window.brokenBond.filesStatus = (text, error = false) => {
     if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
     document.getElementById('import-panel').hidden = false;
