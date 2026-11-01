@@ -13,7 +13,10 @@
 #include <rex/input/input_system.h>
 #include <rex/kernel/init.h>
 #include <rex/logging.h>
+#include <rex/memory/utils.h>
+#include <rex/ppc/func.h>
 #include <rex/runtime.h>
+#include <rex/system/function_dispatcher.h>
 #include <rex/system/gpu_plugin.h>
 #include <rex/system/xthread.h>
 
@@ -43,6 +46,64 @@ extern "C" EMSCRIPTEN_KEEPALIVE void broken_bond_web_where() {
               << " lr " << (ctx ? ctx->lr : 0) << " ctr " << (ctx ? ctx->ctr.u32 : 0)
               << std::endl;
   }
+}
+
+// The only function that publishes the D3D device, and the destructor that
+// clears it. Both are reached through the function table.
+REX_EXTERN(sub_821C1190);
+REX_EXTERN(sub_821C2260);
+REX_EXTERN(__imp__sub_821C20A8);
+REX_EXTERN(__imp__sub_821C2188);
+REX_EXTERN(__imp__sub_821C28A0);
+REX_EXTERN(__imp__sub_821C2C80);
+REX_EXTERN(__imp__sub_821C1998);
+REX_EXTERN(__imp__sub_821CBB60);
+
+static void WebLogGuest(const char* name, PPCContext& ctx, uint8_t* base, void (*impl)(PPCContext&, uint8_t*)) {
+  impl(ctx, base);
+  std::cout << "broken_bond web: " << name << " -> " << std::hex << ctx.r3.u32 << std::dec << std::endl;
+}
+
+extern "C" void sub_821C20A8(PPCContext& ctx, uint8_t* base) {
+  WebLogGuest("step 20A8", ctx, base, __imp__sub_821C20A8);
+}
+extern "C" void sub_821C2188(PPCContext& ctx, uint8_t* base) {
+  WebLogGuest("ctor 2188", ctx, base, __imp__sub_821C2188);
+}
+extern "C" void sub_821C28A0(PPCContext& ctx, uint8_t* base) {
+  WebLogGuest("init 28A0", ctx, base, __imp__sub_821C28A0);
+}
+extern "C" void sub_821C2C80(PPCContext& ctx, uint8_t* base) {
+  WebLogGuest("step 2C80", ctx, base, __imp__sub_821C2C80);
+}
+extern "C" void sub_821C1998(PPCContext& ctx, uint8_t* base) {
+  WebLogGuest("step 1998", ctx, base, __imp__sub_821C1998);
+}
+extern "C" void sub_821CBB60(PPCContext& ctx, uint8_t* base) {
+  WebLogGuest("step BB60", ctx, base, __imp__sub_821CBB60);
+}
+
+static uint32_t WebDeviceSlot() {
+  auto* runtime = rex::Runtime::instance();
+  if (!runtime || !runtime->memory()) return 0;
+  return rex::memory::load_and_swap<uint32_t>(runtime->memory()->TranslateVirtual(0x833A37E0));
+}
+
+static void WebDeviceSetup(PPCContext& ctx, uint8_t* base) {
+  std::cout << "broken_bond web: device setup lr " << std::hex << static_cast<uint32_t>(ctx.lr)
+            << " r3 " << ctx.r3.u32 << " r4 " << ctx.r4.u32 << " slot " << WebDeviceSlot() << std::dec
+            << std::endl;
+  sub_821C1190(ctx, base);
+  std::cout << "broken_bond web: device setup result " << std::hex << ctx.r3.u32 << " slot "
+            << WebDeviceSlot() << std::dec << std::endl;
+}
+
+static void WebDeviceShutdown(PPCContext& ctx, uint8_t* base) {
+  std::cout << "broken_bond web: device shutdown lr " << std::hex << static_cast<uint32_t>(ctx.lr)
+            << " object " << ctx.r3.u32 << " slot " << WebDeviceSlot() << std::dec << std::endl;
+  sub_821C2260(ctx, base);
+  std::cout << "broken_bond web: device shutdown done slot " << std::hex << WebDeviceSlot()
+            << std::dec << std::endl;
 }
 
 // Boots the recompiled guest in this page and presents on #canvas.
@@ -87,6 +148,11 @@ int main(int argc, char** argv) {
   if (status != X_STATUS_SUCCESS) {
     std::cout << "broken_bond web: failed to load default.xex " << std::hex << status << "\n";
     return 1;
+  }
+
+  if (auto* dispatcher = runtime.function_dispatcher()) {
+    dispatcher->SetFunction(0x821C1190, WebDeviceSetup);
+    dispatcher->SetFunction(0x821C2260, WebDeviceShutdown);
   }
 
   auto main_thread = runtime.PrepareModuleLaunch();
