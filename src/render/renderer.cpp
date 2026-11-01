@@ -76,9 +76,9 @@ REXCVAR_DEFINE_INT32(native_interpolate_dump, 0, "Game",
                      "With native_interpolate, save this many pairs of a real frame and its in-between frame, one "
                      "pair every 900 frames, as logs/interp-N-{real,mid}.rgba (half size, BGRA)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
-REXCVAR_DEFINE_INT32(native_frames_in_flight, 1, "Game",
-                     "With renderer=native, frames the GPU may still be drawing while the next is recorded: 1 waits "
-                     "for each frame, 2 lets the CPU record the next one meanwhile")
+REXCVAR_DEFINE_INT32(native_frames_in_flight, 2, "Game",
+                     "With renderer=native, frames the GPU may still be drawing while the next is recorded: 2 lets "
+                     "the CPU record the next one meanwhile, 1 waits for each frame")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_INT32(native_msaa, 4, "Game",
                      "With renderer=native, the most samples a multisampled guest surface gets on the "
