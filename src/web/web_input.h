@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 
 namespace broken_bond::web {
 
@@ -46,5 +47,16 @@ static_assert(offsetof(WebInputBlock, canvas_width) == 4240);
 
 // The block the page maps. Safe to call before main.
 WebInputBlock& InputBlock();
+
+}  // namespace broken_bond::web
+
+namespace rex::input {
+class InputDriver;
+}
+
+namespace broken_bond::web {
+
+// Keyboard and gamepad, on the same binds as the PC build.
+std::unique_ptr<::rex::input::InputDriver> CreateWebPadDriver();
 
 }  // namespace broken_bond::web

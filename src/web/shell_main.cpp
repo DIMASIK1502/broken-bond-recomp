@@ -5,14 +5,22 @@
 #include "web/web_input.h"
 #include "web/web_picture.h"
 
+#include <atomic>
+#include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <iostream>
+#include <thread>
 
 #include <emscripten.h>
 
 #include <rex/audio/audio_driver.h>
+#include <rex/audio/conversion.h>
+#include <rex/audio/downmix.h>
 #include <rex/audio/nop/nop_audio_system.h>
+#include <rex/thread.h>
 #include <rex/cvar.h>
+#include <rex/input/input_driver.h>
 #include <rex/input/input_system.h>
 #include <rex/kernel/init.h>
 #include <rex/logging.h>
@@ -86,24 +94,85 @@ extern "C" void sub_821CBB60(PPCContext& ctx, uint8_t* base) {
   WebLogGuest("step BB60", ctx, base, __imp__sub_821CBB60);
 }
 
-// The nop backend refuses every client, and the guest treats that status as a
-// failed device. This driver accepts the client and drops the frames.
-class SilentAudioDriver final : public rex::audio::AudioDriver {
+// The guest renders 256 samples of 5.1, big-endian, and will not produce the
+// next buffer until the previous one has been taken. Dropping the buffer
+// without that signal stalls the story on the loading screen. This plays the
+// fold through the page's ring and signals at the same rate as the samples.
+class WebAudioDriver final : public rex::audio::AudioDriver {
  public:
-  using AudioDriver::AudioDriver;
-  void SubmitFrame(uint32_t) override {}
+  WebAudioDriver(rex::memory::Memory* memory, rex::thread::Semaphore* semaphore)
+      : AudioDriver(memory), semaphore_(semaphore) {
+    pacer_ = std::thread([this] { Pace(); });
+  }
+
+  ~WebAudioDriver() override {
+    stop_.store(true, std::memory_order_release);
+    if (pacer_.joinable()) pacer_.join();
+  }
+
+  void SubmitFrame(uint32_t samples_ptr) override {
+    constexpr uint32_t kChannelSamples = 256;
+    const auto* input = memory_->TranslateVirtual<const float*>(samples_ptr);
+    if (input != nullptr) {
+      float stereo[kChannelSamples * 2];
+      rex::audio::conversion::sequential_6_BE_to_interleaved_2_LE(
+          stereo, input, kChannelSamples, rex::audio::GetStereoFold(), rex::audio::GetOutputGain());
+      Write(stereo, kChannelSamples);
+      if (!logged_) {
+        logged_ = true;
+        std::cout << "web audio: playing\n";
+      }
+    }
+    queued_.fetch_add(1, std::memory_order_release);
+  }
+
+ private:
+  void Write(const float* interleaved, uint32_t frames) {
+    broken_bond::web::WebAudioRing& ring = broken_bond::web::AudioRing();
+    std::atomic_ref<uint32_t> write(ring.write_frame);
+    std::atomic_ref<uint32_t> read(ring.read_frame);
+    const uint32_t start = write.load(std::memory_order_relaxed);
+    const uint32_t used = start - read.load(std::memory_order_acquire);
+    if (used >= ring.capacity_frames || frames > ring.capacity_frames - used) return;
+    for (uint32_t i = 0; i < frames; ++i) {
+      const uint32_t index = (start + i) % ring.capacity_frames;
+      ring.samples[index * 2] = interleaved[i * 2];
+      ring.samples[index * 2 + 1] = interleaved[i * 2 + 1];
+    }
+    write.store(start + frames, std::memory_order_release);
+  }
+
+  void Pace() {
+    using clock = std::chrono::steady_clock;
+    auto next = clock::now();
+    constexpr auto kFrame = std::chrono::microseconds(256 * 1000000 / 48000);
+    while (!stop_.load(std::memory_order_acquire)) {
+      next += kFrame;
+      std::this_thread::sleep_until(next);
+      if (queued_.load(std::memory_order_acquire) == 0 || semaphore_ == nullptr) continue;
+      queued_.fetch_sub(1, std::memory_order_acq_rel);
+      semaphore_->Release(1, nullptr);
+    }
+  }
+
+  rex::thread::Semaphore* semaphore_ = nullptr;
+  std::thread pacer_;
+  std::atomic<bool> stop_{false};
+  std::atomic<uint32_t> queued_{0};
+  bool logged_ = false;
 };
 
-class SilentAudioSystem final : public rex::audio::nop::NopAudioSystem {
+class WebAudioSystem final : public rex::audio::nop::NopAudioSystem {
  public:
   using NopAudioSystem::NopAudioSystem;
 
   static std::unique_ptr<rex::audio::AudioSystem> Create(rex::runtime::FunctionDispatcher* dispatcher) {
-    return std::make_unique<SilentAudioSystem>(dispatcher);
+    return std::make_unique<WebAudioSystem>(dispatcher);
   }
 
-  rex::X_STATUS CreateDriver(size_t, rex::thread::Semaphore*, rex::audio::AudioDriver** out_driver) override {
-    *out_driver = new SilentAudioDriver(memory());
+  rex::X_STATUS CreateDriver(size_t, rex::thread::Semaphore* semaphore,
+                             rex::audio::AudioDriver** out_driver) override {
+    *out_driver = new WebAudioDriver(memory(), semaphore);
     return X_STATUS_SUCCESS;
   }
 
@@ -158,8 +227,14 @@ int main(int argc, char** argv) {
   rex::RuntimeConfig config;
   config.gpu_plugin = "host";
   config.graphics = rex::system::LoadGpuPlugin("host", "any");
-  config.audio_factory = REX_AUDIO_BACKEND(SilentAudioSystem);
-  config.input_factory = REX_INPUT_BACKEND(rex::input::CreateDefaultInputSystem);
+  config.audio_factory = REX_AUDIO_BACKEND(WebAudioSystem);
+  config.input_factory = [](bool tool_mode) -> std::unique_ptr<rex::system::IInputSystem> {
+    auto input = rex::input::CreateDefaultInputSystem(tool_mode);
+    auto pad = broken_bond::web::CreateWebPadDriver();
+    pad->Setup();
+    input->AddDriver(std::move(pad));
+    return input;
+  };
   config.kernel_init = rex::kernel::InitializeKernel;
 
   X_STATUS status = runtime.Setup(PPCImageConfig, std::move(config));

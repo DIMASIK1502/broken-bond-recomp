@@ -31,6 +31,7 @@ add_executable(broken_bond
     src/web/shell_main.cpp
     src/web/web_files.cpp
     src/web/web_input.cpp
+    src/web/web_pad.cpp
     src/web/web_audio.cpp
     src/web/web_picture.cpp
     src/web/web_draw.cpp

@@ -135,7 +135,7 @@ index 1764dd9..40c9ea5 100644
          inline RenderBufferReference at(uint64_t offset) const {
              return RenderBufferReference(this, offset);
 diff --git a/plume_webgpu.cpp b/plume_webgpu.cpp
-index 1268982..fa90845 100644
+index 1268982..bf4b83b 100644
 --- a/plume_webgpu.cpp
 +++ b/plume_webgpu.cpp
 @@ -87,7 +87,7 @@ EM_JS(void, plume_webgpu_hold_canvas_size, (const char *selector), {
@@ -173,7 +173,30 @@ index 1268982..fa90845 100644
              appendKey(key, 'v', uint64_t(layoutEntry.visibility));
  
              // What the entry binds, for the device's bind group cache: a texture without a view binds its default one, or
-@@ -3052,12 +3064,20 @@ namespace plume {
+@@ -1642,9 +1654,8 @@ namespace plume {
+         canvasSource.selector = toStringView(selector);
+         WGPUSurfaceDescriptor surfaceDesc = WGPU_SURFACE_DESCRIPTOR_INIT;
+         surfaceDesc.nextInChain = &canvasSource.chain;
+-        WGPUInstance instance = wgpuCreateInstance(nullptr);
++        instance = wgpuCreateInstance(nullptr);
+         surface = wgpuInstanceCreateSurface(instance, &surfaceDesc);
+-        wgpuInstanceRelease(instance);
+         plume_webgpu_hold_canvas_size(selector.c_str());
+ 
+         // The canvas hands out a new texture every frame, so the swap chain's textures are proxies that acquireTexture()
+@@ -1703,6 +1714,11 @@ namespace plume {
+         if (surface != nullptr) {
+             wgpuSurfaceUnconfigure(surface);
+             wgpuSurfaceRelease(surface);
++            surface = nullptr;
++        }
++        if (instance != nullptr) {
++            wgpuInstanceRelease(instance);
++            instance = nullptr;
+         }
+     }
+ 
+@@ -3052,12 +3068,20 @@ namespace plume {
      }
  
      void WebGPUCommandList::resolveTextureRegion(const RenderTexture *dstTexture, uint32_t dstX, uint32_t dstY, const RenderTexture *srcTexture, const RenderRect *srcRect, RenderResolveMode resolveMode) {
@@ -198,7 +221,7 @@ index 1268982..fa90845 100644
      }
  
      void WebGPUCommandList::buildBottomLevelAS(const RenderAccelerationStructure *dstAccelerationStructure, RenderBufferReference scratchBuffer, const RenderBottomLevelASBuildInfo &buildInfo) {
-@@ -3318,7 +3338,9 @@ namespace plume {
+@@ -3318,7 +3342,9 @@ namespace plume {
  
      void WebGPUDevice::flushMappedBuffers() {
          for (WebGPUBuffer *buffer : mappedBuffers) {
@@ -210,7 +233,7 @@ index 1268982..fa90845 100644
      }
  
 diff --git a/plume_webgpu.h b/plume_webgpu.h
-index bf3ffa9..03df41f 100644
+index bf3ffa9..2ce2b2d 100644
 --- a/plume_webgpu.h
 +++ b/plume_webgpu.h
 @@ -183,6 +183,26 @@ namespace plume {
@@ -240,3 +263,14 @@ index bf3ffa9..03df41f 100644
  
          WebGPUBuffer(WebGPUDevice *device, WebGPUPool *pool, const RenderBufferDesc &desc);
          ~WebGPUBuffer() override;
+@@ -412,6 +432,10 @@ namespace plume {
+ 
+     struct WebGPUSwapChain : RenderSwapChain {
+         WebGPUCommandQueue *commandQueue = nullptr;
++        // The surface keeps this. Releasing it at creation makes later
++        // createRenderPipelineAsync fail: the device's instance is gone, and a
++        // frame of those draws is a cleared white target.
++        WGPUInstance instance = nullptr;
+         WGPUSurface surface = nullptr;
+         std::string selector;
+         RenderSwapChainDesc desc;

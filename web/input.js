@@ -246,8 +246,10 @@ export class WebInput {
       this.pushEvent(EVENT_TYPE.TEXT, codePoint, 0, 0);
     }
 
-    // Prevent default scrolling for game keys
-    if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space'].includes(e.code)) {
+    // Keep the browser from scrolling, changing focus, or activating a button.
+    if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space', 'Enter', 'Tab',
+         'KeyW', 'KeyA', 'KeyS', 'KeyD', 'KeyQ', 'KeyE', 'KeyX', 'KeyZ',
+         'Digit1', 'Digit3', 'KeyL', 'KeyP', 'KeyF', 'KeyK', 'Backspace'].includes(e.code)) {
       e.preventDefault();
     }
   }
