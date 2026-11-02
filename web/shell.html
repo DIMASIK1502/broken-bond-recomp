@@ -73,9 +73,14 @@
     if (state.fpsTime === 0) state.fpsTime = now;
     const elapsed = now - state.fpsTime;
     if (elapsed < 500) return;
-    const waiting = state.shadersWaiting || 0;
-    const shaders = waiting ? `, shaders ${waiting}` : '';
-    document.getElementById('fps').textContent = `${(state.frames * 1000 / elapsed).toFixed(0)} fps, ${state.lastDraws || 0} draws${shaders}`;
+    const p = state.pipeline || {};
+    const waiting = p.queue || state.shadersWaiting || 0;
+    const fps = (state.frames * 1000 / elapsed).toFixed(0);
+    const drawCount = state.lastDraws || 0;
+    const compile = ((p.compileMs || 0) / 1000).toFixed(1);
+    const slots = p.slots ? `x${p.slots}` : '';
+    const pipelines = p.pso ? `, pso ${p.pso}, queue ${waiting}${slots}, compile ${compile}s, hit ${p.hits || 0}, skip ${p.skip || 0}` : (waiting ? `, shaders ${waiting}` : '');
+    document.getElementById('fps').textContent = `${fps} fps, ${drawCount} draws${pipelines}`;
     state.frames = 0;
     state.fpsTime = now;
   };

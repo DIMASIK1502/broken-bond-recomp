@@ -35,6 +35,7 @@ add_executable(broken_bond
     src/web/web_audio.cpp
     src/web/web_picture.cpp
     src/web/web_draw.cpp
+    src/web/pipeline_manifest.cpp
     src/web/ui_stub.cpp
     src/render/renderer.cpp
     src/render/interpolation.cpp

@@ -49,6 +49,7 @@ extern "C" __declspec(dllimport) short __stdcall GetAsyncKeyState(int key);
 #include <emscripten.h>
 #include <emscripten/threading.h>
 #include <plume_device_thread.h>
+#include "web/pipeline_manifest.h"
 #endif
 #include "host/shadow_draw.h"
 
@@ -3022,7 +3023,123 @@ fn PSMain(in: VsOut) -> @location(0) vec4f {
       commands->clearDepthStencil(true, true, std::clamp(op.z, 0.0f, 1.0f), 0, &op.clear_region, 1);
     }
   }
+
+#if defined(__EMSCRIPTEN__)
+  std::unordered_map<uint64_t, uint32_t> web_scene_draws;
+  uint32_t web_save_frames = 0;
+  void PrewarmPipelines();
+  void FinishWebScene();
+#endif
 };
+
+#if defined(__EMSCRIPTEN__)
+void Renderer::State::PrewarmPipelines() {
+  // A few per present. Each one hops to the browser thread to create the
+  // object; the compile itself stays queued and starts after the submit.
+  const uint64_t hot = broken_bond::web::Manifest().hot_scene();
+  for (int made = 0; made < 32; ++made) {
+    broken_bond::web::PipelineRecord* record = broken_bond::web::Manifest().Next(hot);
+    if (record == nullptr) return;
+    record->built = true;
+    plume::RenderShader* vs = Shader(record->vs);
+    plume::RenderShader* ps = nullptr;
+    if (record->ps_present == 0) {
+      if (!depth_only_ps) {
+        const char depth_only[] = "@fragment\nfn main() -> @location(0) vec4<f32> { return vec4<f32>(0.0); }\n";
+        depth_only_ps = device->createShader(depth_only, sizeof(depth_only) - 1, "main", plume::RenderShaderFormat::WGSL);
+      }
+      ps = depth_only_ps.get();
+    } else {
+      ps = Shader(record->ps);
+    }
+    if (vs == nullptr || ps == nullptr || record->element_count > 16 || record->slot_count > 16) {
+      record->built = false;
+      record->failed = true;
+      continue;
+    }
+    std::array<plume::RenderInputElement, 16> elements{};
+    std::array<plume::RenderInputSlot, 16> slots{};
+    for (uint32_t i = 0; i < record->slot_count; ++i) slots[i] = plume::RenderInputSlot(i, record->strides[i]);
+    for (const broken_bond::web::PipelineElement& element : record->elements) {
+      if (element.used == 0 || element.index >= 16) continue;
+      elements[element.index] = plume::RenderInputElement(
+          UsageSemantic(element.usage), element.usage_index, element.location,
+          static_cast<plume::RenderFormat>(element.format), element.slot, element.offset);
+    }
+    plume::RenderGraphicsPipelineDesc desc;
+    desc.pipelineLayout = layout.get();
+    desc.vertexShader = vs;
+    desc.pixelShader = ps;
+    desc.primitiveTopology = static_cast<plume::RenderPrimitiveTopology>(record->topology);
+    desc.cullMode = static_cast<plume::RenderCullMode>(record->cull);
+    desc.frontFace = static_cast<plume::RenderFrontFace>(record->front);
+    desc.depthClipEnabled = true;
+    desc.depthEnabled = record->depth_enabled != 0;
+    desc.depthWriteEnabled = record->depth_write != 0;
+    desc.depthFunction = static_cast<plume::RenderComparisonFunction>(record->depth_function);
+    desc.depthBias = record->depth_bias;
+    desc.slopeScaledDepthBias = std::bit_cast<float>(record->slope_bits);
+    desc.stencilEnabled = record->stencil_enabled != 0;
+    desc.stencilReference = record->stencil_ref;
+    desc.stencilReadMask = record->stencil_read;
+    desc.stencilWriteMask = record->stencil_write;
+    desc.stencilFrontFace.passOp = static_cast<plume::RenderStencilOp>(record->front_pass);
+    desc.stencilFrontFace.failOp = static_cast<plume::RenderStencilOp>(record->front_fail);
+    desc.stencilFrontFace.depthFailOp = static_cast<plume::RenderStencilOp>(record->front_depth_fail);
+    desc.stencilFrontFace.compareFunction = static_cast<plume::RenderComparisonFunction>(record->front_compare);
+    desc.stencilBackFace.passOp = static_cast<plume::RenderStencilOp>(record->back_pass);
+    desc.stencilBackFace.failOp = static_cast<plume::RenderStencilOp>(record->back_fail);
+    desc.stencilBackFace.depthFailOp = static_cast<plume::RenderStencilOp>(record->back_depth_fail);
+    desc.stencilBackFace.compareFunction = static_cast<plume::RenderComparisonFunction>(record->back_compare);
+    desc.depthTargetFormat = kDepthFormat;
+    desc.multisampling = plume::RenderMultisampling(static_cast<plume::RenderSampleCounts>(record->samples));
+    desc.renderTargetCount = 1;
+    desc.renderTargetFormat[0] = kColorFormat;
+    plume::RenderBlendDesc& blend = desc.renderTargetBlend[0];
+    blend.blendEnabled = record->blend_enabled != 0;
+    blend.renderTargetWriteMask = uint8_t(record->write_mask);
+    blend.srcBlend = static_cast<plume::RenderBlend>(record->src_blend);
+    blend.dstBlend = static_cast<plume::RenderBlend>(record->dst_blend);
+    blend.blendOp = static_cast<plume::RenderBlendOperation>(record->blend_op);
+    blend.srcBlendAlpha = static_cast<plume::RenderBlend>(record->src_blend_alpha);
+    blend.dstBlendAlpha = static_cast<plume::RenderBlend>(record->dst_blend_alpha);
+    blend.blendOpAlpha = static_cast<plume::RenderBlendOperation>(record->blend_op_alpha);
+    desc.inputSlots = slots.data();
+    desc.inputSlotsCount = record->slot_count;
+    desc.inputElements = elements.data();
+    desc.inputElementsCount = record->element_count;
+    const plume::RenderSpecConstant spec_constant(0, record->spec);
+    desc.specConstants = &spec_constant;
+    desc.specConstantsCount = 1;
+    desc.buildInBackground = true;
+    bool on_screen = record->tier == 0;
+    if (!on_screen && hot != 0) {
+      for (uint32_t i = 0; i < record->scene_count && i < 4; ++i) on_screen = on_screen || record->scenes[i] == hot;
+    }
+    desc.backgroundPriority = on_screen ? 1 : 2;
+    auto created = device->createGraphicsPipeline(desc);
+    if (!created) {
+      record->built = false;
+      record->failed = true;
+      continue;
+    }
+    pipelines.emplace(record->key, std::move(created));
+  }
+}
+
+void Renderer::State::FinishWebScene() {
+  uint64_t best = 0;
+  uint32_t best_n = 0;
+  for (const auto& [scene, draws] : web_scene_draws) {
+    if (draws > best_n) {
+      best = scene;
+      best_n = draws;
+    }
+  }
+  web_scene_draws.clear();
+  broken_bond::web::Manifest().FinishFrame(best, frame_draws);
+}
+#endif
 
 Renderer::Renderer() : state_(std::make_unique<State>()) {}
 
@@ -3030,6 +3147,9 @@ Renderer::~Renderer() {
   State& s = *state_;
   if (s.queue && s.fence && s.fence_pending[s.frame_slot]) s.queue->waitForCommandFence(s.fence.get());
   if (s.queue && s.fence_other && s.fence_pending[s.frame_slot ^ 1]) s.queue->waitForCommandFence(s.fence_other.get());
+#if defined(__EMSCRIPTEN__)
+  broken_bond::web::Manifest().Save();
+#endif
 }
 
 const std::string& Renderer::device_name() const { return state_->device_name; }
@@ -3137,6 +3257,12 @@ bool Renderer::Open(void* native_window, std::string& reason) {
     return false;
   }
   host::ShadowKeepShaderKeys();
+#if defined(__EMSCRIPTEN__)
+  // The last visit wrote every pipeline it drew. Build the menu's before the
+  // guest reaches it, and the rest as the logos play.
+  broken_bond::web::Manifest().Load();
+  s.PrewarmPipelines();
+#endif
   return true;
 }
 
@@ -3539,10 +3665,22 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
   XXH3_64bits_update(&key_state, &vs_key, 8);
   XXH3_64bits_update(&key_state, &ps_key, 8);
   const uint64_t pipeline_key = XXH3_64bits_digest(&key_state);
+#if defined(__EMSCRIPTEN__)
+  const uint32_t surface_info = Reg(base, device, 0x2000);
+  const uint32_t color_info = Reg(base, device, 0x2001);
+  const uint64_t web_scene = (uint64_t(surface_info & 0x3FFF) << 32) | uint64_t(color_info & 0x000F0FFF) |
+                             (uint64_t(target_samples) << 48);
+  s.web_scene_draws[web_scene] += 1;
+  broken_bond::web::PipelineRecord* remembered = nullptr;
+#endif
 
   plume::RenderPipeline* pipeline = nullptr;
   if (auto found = s.pipelines.find(pipeline_key); found != s.pipelines.end()) {
     pipeline = found->second.get();
+#if defined(__EMSCRIPTEN__)
+    broken_bond::web::Manifest().Touch(pipeline_key, web_scene);
+    pipeline->preferBackgroundBuild();
+#endif
   } else {
     plume::RenderGraphicsPipelineDesc desc;
     desc.pipelineLayout = s.layout.get();
@@ -3600,7 +3738,64 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
     // Compiling on the draw holds the frame for as long as the shader takes, and a
     // scene is hundreds of them. The draw is skipped until the background build
     // finishes, so the load keeps moving and the piece appears on a later frame.
+    // Priority 0 is this draw. A pipeline only remembered from an earlier visit
+    // is already queued behind it and jumps this queue when the draw asks again.
     desc.buildInBackground = true;
+    desc.backgroundPriority = 0;
+    broken_bond::web::PipelineRecord traced;
+    traced.key = pipeline_key;
+    traced.vs = vs_key;
+    traced.ps = ps_key;
+    traced.scenes[0] = web_scene;
+    traced.scene_count = web_scene != 0 ? 1u : 0u;
+    traced.spec = spec;
+    traced.topology = uint32_t(desc.primitiveTopology);
+    traced.samples = target_samples;
+    traced.depth_enabled = desc.depthEnabled ? 1u : 0u;
+    traced.depth_write = desc.depthWriteEnabled ? 1u : 0u;
+    traced.depth_function = uint32_t(desc.depthFunction);
+    traced.stencil_enabled = desc.stencilEnabled ? 1u : 0u;
+    traced.stencil_ref = desc.stencilReference;
+    traced.stencil_read = desc.stencilReadMask;
+    traced.stencil_write = desc.stencilWriteMask;
+    traced.front_pass = uint32_t(desc.stencilFrontFace.passOp);
+    traced.front_fail = uint32_t(desc.stencilFrontFace.failOp);
+    traced.front_depth_fail = uint32_t(desc.stencilFrontFace.depthFailOp);
+    traced.front_compare = uint32_t(desc.stencilFrontFace.compareFunction);
+    traced.back_pass = uint32_t(desc.stencilBackFace.passOp);
+    traced.back_fail = uint32_t(desc.stencilBackFace.failOp);
+    traced.back_depth_fail = uint32_t(desc.stencilBackFace.depthFailOp);
+    traced.back_compare = uint32_t(desc.stencilBackFace.compareFunction);
+    traced.cull = uint32_t(desc.cullMode);
+    traced.front = uint32_t(desc.frontFace);
+    traced.blend_enabled = blend.blendEnabled ? 1u : 0u;
+    traced.write_mask = blend.renderTargetWriteMask;
+    traced.src_blend = uint32_t(blend.srcBlend);
+    traced.dst_blend = uint32_t(blend.dstBlend);
+    traced.blend_op = uint32_t(blend.blendOp);
+    traced.src_blend_alpha = uint32_t(blend.srcBlendAlpha);
+    traced.dst_blend_alpha = uint32_t(blend.dstBlendAlpha);
+    traced.blend_op_alpha = uint32_t(blend.blendOpAlpha);
+    traced.depth_bias = desc.depthBias;
+    traced.slope_bits = std::bit_cast<uint32_t>(desc.slopeScaledDepthBias);
+    traced.ps_present = ps_object != 0 ? 1u : 0u;
+    traced.element_count = element_count;
+    traced.slot_count = slot_count;
+    traced.elements.resize(element_count);
+    for (uint32_t i = 0; i < element_count; ++i) {
+      broken_bond::web::PipelineElement& dst = traced.elements[i];
+      dst.index = i;
+      dst.used = elements[i].semanticName != nullptr ? 1u : 0u;
+      dst.location = elements[i].location;
+      dst.format = uint32_t(elements[i].format);
+      dst.slot = elements[i].slotIndex;
+      dst.offset = elements[i].alignedByteOffset;
+      dst.usage = elems[i].usage;
+      dst.usage_index = elems[i].usage_index;
+    }
+    traced.strides.resize(slot_count);
+    for (uint32_t i = 0; i < slot_count; ++i) traced.strides[i] = slots[i].stride;
+    remembered = broken_bond::web::Manifest().Note(std::move(traced));
 #endif
     const auto t0 = std::chrono::steady_clock::now();
     auto created = s.device->createGraphicsPipeline(desc);
@@ -3610,6 +3805,9 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
       return;
     }
     pipeline = s.pipelines.emplace(pipeline_key, std::move(created)).first->second.get();
+#if defined(__EMSCRIPTEN__)
+    if (remembered != nullptr) remembered->built = true;
+#endif
   }
 
   // Constants: guest floats are big-endian dwords.
@@ -4177,6 +4375,9 @@ void Renderer::Present(uint32_t frontbuffer, const uint8_t* base) {
   ScopedMs timer(s.ms_present);
   s.BeginFrame();
   s.UploadDefaults();
+#if defined(__EMSCRIPTEN__)
+  s.PrewarmPipelines();
+#endif
   // Swap shows a texture: the last resolve into it when there was one, else
   // whatever the target holds.
   if (s.current) s.ResolveMsaa(*s.current->color);
@@ -4387,8 +4588,25 @@ void Renderer::Present(uint32_t frontbuffer, const uint8_t* base) {
   }
   ++s.presents;
 #if defined(__EMSCRIPTEN__)
-  MAIN_THREAD_ASYNC_EM_ASM({ if (window.brokenBond && window.brokenBond.noteFrame) window.brokenBond.noteFrame($0); },
-                           s.frame_draws);
+  s.FinishWebScene();
+  if (++s.web_save_frames >= 45) {
+    s.web_save_frames = 0;
+    broken_bond::web::Manifest().Save();
+  }
+  {
+    const broken_bond::web::PipelineManifest& manifest = broken_bond::web::Manifest();
+    MAIN_THREAD_ASYNC_EM_ASM(
+        {
+          const b = window.brokenBond;
+          if (!b) return;
+          const p = b.pipeline || (b.pipeline = {});
+          p.pso = $1;
+          p.pending = $2;
+          p.menu = $3;
+          if (b.noteFrame) b.noteFrame($0);
+        },
+        s.frame_draws, manifest.unique(), manifest.pending(), manifest.menu_count());
+  }
   s.frame_draws = 0;
 #endif
 #if defined(_WIN32)
