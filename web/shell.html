@@ -73,7 +73,9 @@
     if (state.fpsTime === 0) state.fpsTime = now;
     const elapsed = now - state.fpsTime;
     if (elapsed < 500) return;
-    document.getElementById('fps').textContent = `${(state.frames * 1000 / elapsed).toFixed(0)} fps, ${state.lastDraws || 0} draws`;
+    const waiting = state.shadersWaiting || 0;
+    const shaders = waiting ? `, shaders ${waiting}` : '';
+    document.getElementById('fps').textContent = `${(state.frames * 1000 / elapsed).toFixed(0)} fps, ${state.lastDraws || 0} draws${shaders}`;
     state.frames = 0;
     state.fpsTime = now;
   };

@@ -1,5 +1,5 @@
 diff --git a/plume_device_thread.cpp b/plume_device_thread.cpp
-index 3b226b3..e92a5f0 100644
+index 3b226b3..da61daa 100644
 --- a/plume_device_thread.cpp
 +++ b/plume_device_thread.cpp
 @@ -284,6 +284,8 @@ namespace plume {
@@ -45,7 +45,24 @@ index 3b226b3..e92a5f0 100644
              RenderBuffer *buffer = inner;
              const bool ranged = (writtenRange != nullptr);
              const RenderRange range = ranged ? *writtenRange : RenderRange();
-@@ -716,6 +737,12 @@ namespace plume {
+@@ -562,16 +583,6 @@ namespace plume {
+         bool isReady() override {
+             return runSync(thread, [&]() { return inner->isReady(); });
+         }
+-
+-        // A pipeline the backend builds asynchronously (WebGPU's) is finished while the device thread is back in its
+-        // event loop, so this thread polls isReady() between calls rather than holding the device thread. The builds
+-        // take hundreds of milliseconds, so it polls rarely. On the device thread itself there is nothing to wait for.
+-        void waitUntilReady() {
+-            const std::thread::id caller = std::this_thread::get_id();
+-            while (!runSync(thread, [&]() { return (std::this_thread::get_id() == caller) || inner->isReady(); })) {
+-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+-            }
+-        }
+     };
+ 
+     struct DTPipelineLayout : RenderPipelineLayout {
+@@ -716,6 +727,12 @@ namespace plume {
          }
      };
  
@@ -58,7 +75,7 @@ index 3b226b3..e92a5f0 100644
      struct DTDescriptorSet : RenderDescriptorSet {
          DeviceThread *thread = nullptr;
          RenderDescriptorSet *inner = nullptr;
-@@ -736,9 +763,14 @@ namespace plume {
+@@ -736,9 +753,14 @@ namespace plume {
              const DTTexture *wrapper = static_cast<const DTTexture *>(texture);
              std::shared_ptr<DTTextureSlot> slot = ((wrapper != nullptr) && !wrapper->isMade()) ? wrapper->slot : nullptr;
              RenderTexture *innerTexture = (slot == nullptr) ? unwrap(texture) : nullptr;
@@ -75,7 +92,7 @@ index 3b226b3..e92a5f0 100644
          }
  
          void setSampler(uint32_t descriptorIndex, const RenderSampler *sampler) override {
-@@ -773,6 +805,9 @@ namespace plume {
+@@ -773,6 +795,9 @@ namespace plume {
  
          DTCommandList(DeviceThread *thread, std::unique_ptr<RenderCommandList> inner) : thread(thread), inner(inner.release()) { }
          ~DTCommandList() override {
@@ -85,7 +102,7 @@ index 3b226b3..e92a5f0 100644
              setCommandListOpen(openSerial, false);
              destroyAsync(thread, inner);
          }
-@@ -841,9 +876,13 @@ namespace plume {
+@@ -841,9 +866,13 @@ namespace plume {
              readbacks.clear();
              computeLayout = nullptr;
              graphicsLayout = nullptr;
@@ -99,7 +116,7 @@ index 3b226b3..e92a5f0 100644
              recorded = std::move(recording);
              recording.reset();
              recordedReadbacks = std::move(readbacks);
-@@ -1035,6 +1074,15 @@ namespace plume {
+@@ -1035,6 +1064,15 @@ namespace plume {
          }
      };
  
@@ -115,6 +132,22 @@ index 3b226b3..e92a5f0 100644
      // DTSwapChain
  
      struct DTSwapChain : RenderSwapChain {
+@@ -1500,12 +1538,9 @@ namespace plume {
+             unwrapped.vertexShader = unwrap(desc.vertexShader);
+             unwrapped.geometryShader = unwrap(desc.geometryShader);
+             unwrapped.pixelShader = unwrap(desc.pixelShader);
+-            std::unique_ptr<RenderPipeline> pipeline = create<DTPipeline, RenderPipeline>([&]() { return inner->createGraphicsPipeline(unwrapped); });
+-            if (pipeline != nullptr) {
+-                static_cast<DTPipeline *>(pipeline.get())->waitUntilReady();
+-            }
+-
+-            return pipeline;
++            // A background build stays unfinished here. Waiting for it holds the guest inside the draw
++            // that presents, so a scene load is the sum of every new shader. The draw skips until it is ready.
++            return create<DTPipeline, RenderPipeline>([&]() { return inner->createGraphicsPipeline(unwrapped); });
+         }
+ 
+         std::unique_ptr<RenderPipeline> createRaytracingPipeline(const RenderRaytracingPipelineDesc &desc, const RenderPipeline *previousPipeline) override {
 diff --git a/plume_render_interface.h b/plume_render_interface.h
 index 1764dd9..40c9ea5 100644
 --- a/plume_render_interface.h
@@ -135,7 +168,7 @@ index 1764dd9..40c9ea5 100644
          inline RenderBufferReference at(uint64_t offset) const {
              return RenderBufferReference(this, offset);
 diff --git a/plume_webgpu.cpp b/plume_webgpu.cpp
-index 1268982..bf4b83b 100644
+index 1268982..b06edf2 100644
 --- a/plume_webgpu.cpp
 +++ b/plume_webgpu.cpp
 @@ -87,7 +87,7 @@ EM_JS(void, plume_webgpu_hold_canvas_size, (const char *selector), {
@@ -173,7 +206,130 @@ index 1268982..bf4b83b 100644
              appendKey(key, 'v', uint64_t(layoutEntry.visibility));
  
              // What the entry binds, for the device's bind group cache: a texture without a view binds its default one, or
-@@ -1642,9 +1654,8 @@ namespace plume {
+@@ -1311,13 +1323,16 @@ namespace plume {
+             }
+ 
+             for (WGPUPipelineLayout layout : pipelineLayout->resolvedLayouts) {
+-                build(layout, true);
++                device->enqueueBackgroundBuild(builds, layout);
+             }
+         }
+     }
+ 
+     WebGPUGraphicsPipeline::~WebGPUGraphicsPipeline() {
+         builds->pipeline = nullptr;
++        if (device != nullptr) {
++            device->dropBackgroundBuilds(builds.get());
++        }
+         for (auto &it : pipelines) {
+             wgpuRenderPipelineRelease(it.second);
+         }
+@@ -1330,13 +1345,21 @@ namespace plume {
+ 
+         WGPUPipelineLayout layout = static_cast<WGPUPipelineLayout>(userdata2);
+         builds->pending.erase(layout);
+-        if ((status != WGPUCreatePipelineAsyncStatus_Success) && (status != WGPUCreatePipelineAsyncStatus_CallbackCancelled)) {
+-            fprintf(stderr, "plume WebGPU: a pipeline built in the background failed: %.*s\n", int(message.length), message.data);
++        WebGPUDevice *device = builds->device;
++        if (device != nullptr) {
++            device->backgroundBuildsInFlight.fetch_sub(1, std::memory_order_relaxed);
++        }
++        if (status != WGPUCreatePipelineAsyncStatus_Success) {
++            builds->failed.insert(layout);
++            if (status != WGPUCreatePipelineAsyncStatus_CallbackCancelled) {
++                fprintf(stderr, "plume WebGPU: a pipeline built in the background failed: %.*s\n", int(message.length), message.data);
++            }
+         }
+ 
+-        // The builds that waited for this one's shaders: the browser has them compiled now.
+-        if (status != WGPUCreatePipelineAsyncStatus_CallbackCancelled) {
+-            auto &sharedShaderBuilds = builds->device->sharedShaderBuilds;
++        // The builds that waited for this one's shaders: the browser has them compiled now. They are queued,
++        // not compiled here. Compiling them in this callback ran on the thread that submits the frame.
++        if ((device != nullptr) && (status != WGPUCreatePipelineAsyncStatus_CallbackCancelled)) {
++            auto &sharedShaderBuilds = device->sharedShaderBuilds;
+             auto sharedIt = sharedShaderBuilds.find({ builds->shadersKey, layout });
+             if (sharedIt != sharedShaderBuilds.end()) {
+                 auto deferred = std::move(sharedIt->second.deferred);
+@@ -1347,27 +1370,26 @@ namespace plume {
+                         continue;
+                     }
+ 
+-                    WebGPUGraphicsPipeline *waitingPipeline = waitingBuilds->pipeline;
+                     waitingBuilds->pending.erase(waiting.second);
+-                    if ((waitingPipeline != nullptr) && (waitingPipeline->pipelines.find(waiting.second) == waitingPipeline->pipelines.end())) {
+-                        waitingPipeline->build(waiting.second, true, false);
++                    if (waitingBuilds->device != nullptr) {
++                        waitingBuilds->device->enqueueBackgroundBuild(waitingBuilds, waiting.second);
+                     }
+                 }
+             }
+         }
+ 
+-        if (result == nullptr) {
+-            return;
+-        }
+-
+         // Gone, or built in place by a draw that couldn't wait.
+         WebGPUGraphicsPipeline *pipeline = builds->pipeline;
+-        if ((pipeline == nullptr) || (pipeline->pipelines.find(layout) != pipeline->pipelines.end())) {
++        if ((result != nullptr) && (pipeline != nullptr) && (pipeline->pipelines.find(layout) == pipeline->pipelines.end())) {
++            pipeline->pipelines[layout] = result;
++        }
++        else if (result != nullptr) {
+             wgpuRenderPipelineRelease(result);
+-            return;
+         }
+ 
+-        pipeline->pipelines[layout] = result;
++        if (device != nullptr) {
++            device->scheduleBackgroundPump();
++        }
+     }
+ 
+     bool WebGPUGraphicsPipeline::isReady() {
+@@ -1380,6 +1402,17 @@ namespace plume {
+             return it->second;
+         }
+ 
++        // Not built on the draw. The compile is queued and started after this frame is submitted; doing it
++        // here held the frame on screen for as long as the shader took. The draw is skipped until it is ready.
++        if (desc.buildInBackground) {
++            if ((builds->failed.find(layout) != builds->failed.end()) || (builds->pending.find(layout) != builds->pending.end())) {
++                return nullptr;
++            }
++
++            device->enqueueBackgroundBuild(builds, layout);
++            return nullptr;
++        }
++
+         return build(layout, false);
+     }
+ 
+@@ -1395,6 +1428,12 @@ namespace plume {
+                 return nullptr;
+             }
+ 
++            // A handful at once. More than that, started from the draw, held the frame and could lose the device.
++            if (device->backgroundBuildsInFlight.load(std::memory_order_relaxed) >= WebGPUDevice::kBackgroundBuildsAtOnce) {
++                return nullptr;
++            }
++
++            device->backgroundBuildsInFlight.fetch_add(1, std::memory_order_relaxed);
+             device->sharedShaderBuilds[{ builds->shadersKey, layout }];
+         }
+ 
+@@ -1509,6 +1548,9 @@ namespace plume {
+             callbackInfo.userdata1 = new std::shared_ptr<WebGPURenderPipelineBuilds>(builds);
+             callbackInfo.userdata2 = layout;
+             builds->pending.insert(layout);
++            if (!deferIfShared) {
++                device->backgroundBuildsInFlight.fetch_add(1, std::memory_order_relaxed);
++            }
+             wgpuDeviceCreateRenderPipelineAsync(device->device, &pipelineDesc, callbackInfo);
+             return nullptr;
+         }
+@@ -1642,9 +1684,8 @@ namespace plume {
          canvasSource.selector = toStringView(selector);
          WGPUSurfaceDescriptor surfaceDesc = WGPU_SURFACE_DESCRIPTOR_INIT;
          surfaceDesc.nextInChain = &canvasSource.chain;
@@ -184,7 +340,7 @@ index 1268982..bf4b83b 100644
          plume_webgpu_hold_canvas_size(selector.c_str());
  
          // The canvas hands out a new texture every frame, so the swap chain's textures are proxies that acquireTexture()
-@@ -1703,6 +1714,11 @@ namespace plume {
+@@ -1703,6 +1744,11 @@ namespace plume {
          if (surface != nullptr) {
              wgpuSurfaceUnconfigure(surface);
              wgpuSurfaceRelease(surface);
@@ -196,7 +352,32 @@ index 1268982..bf4b83b 100644
          }
      }
  
-@@ -3052,12 +3068,20 @@ namespace plume {
+@@ -2368,8 +2414,8 @@ namespace plume {
+ 
+                     // A pipeline that is ready at once and drawn with now is built in place by this draw (get()).
+                     const bool drawnNow = drawWith && (builds->pipeline == pipeline) && !builds->pipeline->desc.buildInBackground;
+-                    if (!drawnNow) {
+-                        builds->pipeline->build(pipelineLayout, true);
++                    if (!drawnNow && (builds->device != nullptr)) {
++                        builds->device->enqueueBackgroundBuild(builds, pipelineLayout);
+                     }
+                 }
+             }
+@@ -2618,7 +2664,12 @@ namespace plume {
+         }
+ 
+         const WebGPUGraphicsPipeline *graphicsPipeline = static_cast<const WebGPUGraphicsPipeline *>(pipeline);
+-        setPassPipeline(const_cast<WebGPUGraphicsPipeline *>(graphicsPipeline)->get(layout));
++        WGPURenderPipeline ready = const_cast<WebGPUGraphicsPipeline *>(graphicsPipeline)->get(layout);
++        if (ready == nullptr) {
++            return false;
++        }
++
++        setPassPipeline(ready);
+         if (graphicsPipeline->desc.stencilEnabled && (!pass.stencilReferenceSet || (pass.stencilReference != graphicsPipeline->desc.stencilReference))) {
+             wgpuRenderPassEncoderSetStencilReference(renderPass, graphicsPipeline->desc.stencilReference);
+             pass.stencilReference = graphicsPipeline->desc.stencilReference;
+@@ -3052,12 +3103,20 @@ namespace plume {
      }
  
      void WebGPUCommandList::resolveTextureRegion(const RenderTexture *dstTexture, uint32_t dstX, uint32_t dstY, const RenderTexture *srcTexture, const RenderRect *srcRect, RenderResolveMode resolveMode) {
@@ -221,7 +402,126 @@ index 1268982..bf4b83b 100644
      }
  
      void WebGPUCommandList::buildBottomLevelAS(const RenderAccelerationStructure *dstAccelerationStructure, RenderBufferReference scratchBuffer, const RenderBottomLevelASBuildInfo &buildInfo) {
-@@ -3318,7 +3342,9 @@ namespace plume {
+@@ -3165,6 +3224,118 @@ namespace plume {
+ 
+     // WebGPUDevice
+ 
++    void WebGPUDevice::enqueueBackgroundBuild(const std::shared_ptr<WebGPURenderPipelineBuilds> &builds, WGPUPipelineLayout layout) {
++        if ((builds == nullptr) || (builds->pipeline == nullptr) || (layout == nullptr)) {
++            return;
++        }
++        if ((builds->failed.find(layout) != builds->failed.end()) || (builds->pending.find(layout) != builds->pending.end())) {
++            return;
++        }
++        if (builds->pipeline->pipelines.find(layout) != builds->pipeline->pipelines.end()) {
++            return;
++        }
++        if (!backgroundQueued.insert({ builds.get(), layout }).second) {
++            return;
++        }
++
++        backgroundQueue.push_back({ builds, layout });
++        static bool logged = false;
++        if (!logged) {
++            logged = true;
++            fprintf(stderr, "plume WebGPU: shaders compile %d at a time, after the frame is submitted\n", kBackgroundBuildsAtOnce);
++        }
++        scheduleBackgroundPump();
++    }
++
++    void WebGPUDevice::scheduleBackgroundPump() {
++        if (backgroundPumpScheduled) {
++            return;
++        }
++
++        backgroundPumpScheduled = true;
++        emscripten_async_call([](void *arg) {
++            static_cast<WebGPUDevice *>(arg)->pumpBackgroundBuilds();
++        }, this, 0);
++    }
++
++    void WebGPUDevice::pumpBackgroundBuilds() {
++        backgroundPumpScheduled = false;
++
++        auto noteWaiting = [&]() {
++            const int32_t inFlight = std::max<int32_t>(0, backgroundBuildsInFlight.load(std::memory_order_relaxed));
++            const int32_t waiting = int32_t(backgroundQueue.size()) + inFlight;
++            EM_ASM({ if (window.brokenBond) window.brokenBond.shadersWaiting = $0; }, waiting);
++        };
++
++        // Fill the free slots. A shader that finishes inside this call must not pull the rest of the queue
++        // with it, so a turn starts at most kBackgroundBuildsAtOnce compiles.
++        int started = 0;
++        int steps = 0;
++        while (!backgroundQueue.empty() && (started < kBackgroundBuildsAtOnce) &&
++               (backgroundBuildsInFlight.load(std::memory_order_relaxed) < kBackgroundBuildsAtOnce) && (steps < 64)) {
++            steps++;
++            BackgroundBuildRequest request = backgroundQueue.front();
++            backgroundQueue.erase(backgroundQueue.begin());
++            std::shared_ptr<WebGPURenderPipelineBuilds> builds = request.builds.lock();
++            if (builds != nullptr) {
++                backgroundQueued.erase({ builds.get(), request.layout });
++            }
++            if ((builds == nullptr) || (builds->pipeline == nullptr)) {
++                continue;
++            }
++            if ((builds->failed.find(request.layout) != builds->failed.end()) || (builds->pending.find(request.layout) != builds->pending.end())) {
++                continue;
++            }
++            if (builds->pipeline->pipelines.find(request.layout) != builds->pipeline->pipelines.end()) {
++                continue;
++            }
++
++            const int32_t inFlightBefore = backgroundBuildsInFlight.load(std::memory_order_relaxed);
++            builds->pipeline->build(request.layout, true);
++            const bool tookSlot = backgroundBuildsInFlight.load(std::memory_order_relaxed) > inFlightBefore;
++            const bool accepted = tookSlot || (builds->pending.find(request.layout) != builds->pending.end()) ||
++                (builds->pipeline->pipelines.find(request.layout) != builds->pipeline->pipelines.end());
++            if (tookSlot) {
++                started++;
++            }
++            if (!accepted && (builds->failed.find(request.layout) == builds->failed.end())) {
++                backgroundQueued.insert({ builds.get(), request.layout });
++                backgroundQueue.insert(backgroundQueue.begin(), BackgroundBuildRequest{ builds, request.layout });
++                backgroundPumpScheduled = true;
++                emscripten_async_call([](void *arg) {
++                    static_cast<WebGPUDevice *>(arg)->pumpBackgroundBuilds();
++                }, this, 16);
++                break;
++            }
++        }
++        if (!backgroundQueue.empty() && (backgroundBuildsInFlight.load(std::memory_order_relaxed) < kBackgroundBuildsAtOnce) &&
++            !backgroundPumpScheduled) {
++            scheduleBackgroundPump();
++        }
++
++        noteWaiting();
++    }
++
++    void WebGPUDevice::dropBackgroundBuilds(WebGPURenderPipelineBuilds *builds) {
++        for (auto queued = backgroundQueue.begin(); queued != backgroundQueue.end(); ) {
++            const std::shared_ptr<WebGPURenderPipelineBuilds> locked = queued->builds.lock();
++            if ((locked == nullptr) || (locked.get() == builds)) {
++                queued = backgroundQueue.erase(queued);
++            }
++            else {
++                ++queued;
++            }
++        }
++        for (auto queued = backgroundQueued.begin(); queued != backgroundQueued.end(); ) {
++            if (queued->first == builds) {
++                queued = backgroundQueued.erase(queued);
++            }
++            else {
++                ++queued;
++            }
++        }
++    }
++
+     WebGPUDevice::WebGPUDevice(WebGPUInterface *renderInterface) {
+         assert(renderInterface != nullptr);
+ 
+@@ -3318,7 +3489,9 @@ namespace plume {
  
      void WebGPUDevice::flushMappedBuffers() {
          for (WebGPUBuffer *buffer : mappedBuffers) {
@@ -233,10 +533,25 @@ index 1268982..bf4b83b 100644
      }
  
 diff --git a/plume_webgpu.h b/plume_webgpu.h
-index bf3ffa9..2ce2b2d 100644
+index bf3ffa9..c04987d 100644
 --- a/plume_webgpu.h
 +++ b/plume_webgpu.h
-@@ -183,6 +183,26 @@ namespace plume {
+@@ -26,9 +26,11 @@
+ // - Building a pipeline holds up the browser's GPU process (a large WGSL shader can take seconds), so a graphics
+ //   pipeline created with buildInBackground is built with createRenderPipelineAsync for the WebGPU layouts draws
+ //   with its plume layout have resolved to, and isReady() is false until every build has called back. Created before
+-//   any draw resolved that layout, it waits for the first one to. Behind plume_device_thread.h, createGraphicsPipeline()
+-//   waits for isReady() on the calling thread, which draws with another pipeline meanwhile. A draw with a layout the
+-//   pipeline wasn't built for (a new binding stage changes them all) builds it in place, as any other pipeline is.
++//   any draw resolved that layout, it waits for the first one to. createGraphicsPipeline() does not wait, and neither
++//   does the draw: a draw before the build has called back is skipped, and the compile itself is queued to start on a
++//   later turn, after this frame's commands have been submitted. Eight compiles run at once. One at a time left a
++//   scene unfinished for as long as its whole queue; starting the queue inside the draw held the frame on screen.
++//   A draw with a layout the pipeline wasn't built for (a new binding stage changes them all) is queued the same way.
+ // - Buffer mapping is asynchronous. An UPLOAD buffer keeps a CPU copy: map() returns it and unmap() writes it to the
+ //   GPU, and a buffer left mapped is written in full on every executeCommandLists(), since a persistently mapped
+ //   D3D12-style upload buffer never says what changed. A READBACK buffer that a submitted command list copied into
+@@ -183,6 +185,26 @@ namespace plume {
          std::unique_ptr<uint8_t[]> shadow;
          std::shared_ptr<WebGPUReadback> readback;
          bool mapped = false;
@@ -263,7 +578,15 @@ index bf3ffa9..2ce2b2d 100644
  
          WebGPUBuffer(WebGPUDevice *device, WebGPUPool *pool, const RenderBufferDesc &desc);
          ~WebGPUBuffer() override;
-@@ -412,6 +432,10 @@ namespace plume {
+@@ -330,6 +352,7 @@ namespace plume {
+         WebGPUDevice *device = nullptr;
+         WebGPUGraphicsPipeline *pipeline = nullptr;
+         std::set<WGPUPipelineLayout> pending;
++        std::set<WGPUPipelineLayout> failed;
+         bool waitingForLayout = false;
+         std::string shadersKey;
+     };
+@@ -412,6 +435,10 @@ namespace plume {
  
      struct WebGPUSwapChain : RenderSwapChain {
          WebGPUCommandQueue *commandQueue = nullptr;
@@ -274,3 +597,25 @@ index bf3ffa9..2ce2b2d 100644
          WGPUSurface surface = nullptr;
          std::string selector;
          RenderSwapChainDesc desc;
+@@ -686,6 +713,21 @@ namespace plume {
+         WGPUShaderModule clearShader = nullptr;
+         std::unordered_map<std::string, WGPURenderPipeline> clearPipelines;
+         std::map<std::pair<std::string, WGPUPipelineLayout>, WebGPUSharedShaderBuilds> sharedShaderBuilds;
++        // Cold createRenderPipelineAsync calls still running. A scene's first frame wants hundreds; starting
++        // them inside the draw holds that frame, and starting them all at once loses the device.
++        static constexpr int32_t kBackgroundBuildsAtOnce = 8;
++        std::atomic<int32_t> backgroundBuildsInFlight = 0;
++        struct BackgroundBuildRequest {
++            std::weak_ptr<WebGPURenderPipelineBuilds> builds;
++            WGPUPipelineLayout layout = nullptr;
++        };
++        std::vector<BackgroundBuildRequest> backgroundQueue;
++        std::set<std::pair<WebGPURenderPipelineBuilds *, WGPUPipelineLayout>> backgroundQueued;
++        bool backgroundPumpScheduled = false;
++        void enqueueBackgroundBuild(const std::shared_ptr<WebGPURenderPipelineBuilds> &builds, WGPUPipelineLayout layout);
++        void scheduleBackgroundPump();
++        void pumpBackgroundBuilds();
++        void dropBackgroundBuilds(WebGPURenderPipelineBuilds *builds);
+         double lastPollTime = 0.0;
+         bool workDoneAfterSubmit = false;
+         // Set from the page's main thread once the device is lost and another is in its place (isLost()). Never freed:

@@ -143,15 +143,59 @@ class WebAudioDriver final : public rex::audio::AudioDriver {
   }
 
   void Pace() {
+    // The page plays at its own clock. Sleeping one 256-sample frame (5 ms) and
+    // waking late feeds the guest slower than playback, and the worklet fills
+    // each gap with silence: the rasp. Follow the frames the worklet has
+    // actually read. When it isn't running yet, free the guest on a timer that
+    // does not catch up, or the story sits on the loading screen.
     using clock = std::chrono::steady_clock;
-    auto next = clock::now();
+    broken_bond::web::WebAudioRing& ring = broken_bond::web::AudioRing();
+    std::atomic_ref<uint32_t> read(ring.read_frame);
+    std::atomic_ref<uint32_t> heart(ring.heartbeat);
+    uint32_t paced = read.load(std::memory_order_acquire);
+    uint32_t leftover = 0;
+    uint32_t last_heart = heart.load(std::memory_order_acquire);
+    auto last_heart_time = clock::now();
+    auto next_free = last_heart_time;
+    bool playing = false;
     constexpr auto kFrame = std::chrono::microseconds(256 * 1000000 / 48000);
     while (!stop_.load(std::memory_order_acquire)) {
-      next += kFrame;
-      std::this_thread::sleep_until(next);
-      if (queued_.load(std::memory_order_acquire) == 0 || semaphore_ == nullptr) continue;
-      queued_.fetch_sub(1, std::memory_order_acq_rel);
-      semaphore_->Release(1, nullptr);
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+      if (semaphore_ == nullptr) continue;
+      const auto now = clock::now();
+      const uint32_t heart_now = heart.load(std::memory_order_acquire);
+      if (heart_now != last_heart) {
+        last_heart = heart_now;
+        last_heart_time = now;
+      }
+      const bool page_playing = now - last_heart_time < std::chrono::milliseconds(50);
+      if (page_playing) {
+        if (!playing) {
+          playing = true;
+          paced = read.load(std::memory_order_acquire);
+          leftover = 0;
+        }
+        const uint32_t read_now = read.load(std::memory_order_acquire);
+        leftover += read_now - paced;
+        paced = read_now;
+        while (leftover >= 256 && queued_.load(std::memory_order_acquire) > 0) {
+          leftover -= 256;
+          queued_.fetch_sub(1, std::memory_order_acq_rel);
+          semaphore_->Release(1, nullptr);
+        }
+      } else {
+        if (playing) {
+          playing = false;
+          next_free = now + kFrame;
+          paced = read.load(std::memory_order_acquire);
+          leftover = 0;
+        }
+        if (now >= next_free && queued_.load(std::memory_order_acquire) > 0) {
+          next_free = now + kFrame;
+          queued_.fetch_sub(1, std::memory_order_acq_rel);
+          semaphore_->Release(1, nullptr);
+        }
+      }
     }
   }
 

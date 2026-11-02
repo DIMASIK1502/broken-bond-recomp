@@ -3596,6 +3596,12 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
     const plume::RenderSpecConstant spec_constant(0, spec);
     desc.specConstants = &spec_constant;
     desc.specConstantsCount = 1;
+#if defined(__EMSCRIPTEN__)
+    // Compiling on the draw holds the frame for as long as the shader takes, and a
+    // scene is hundreds of them. The draw is skipped until the background build
+    // finishes, so the load keeps moving and the piece appears on a later frame.
+    desc.buildInBackground = true;
+#endif
     const auto t0 = std::chrono::steady_clock::now();
     auto created = s.device->createGraphicsPipeline(desc);
     s.ms_pipeline += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
