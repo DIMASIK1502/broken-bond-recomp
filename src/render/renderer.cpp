@@ -141,11 +141,13 @@ constexpr plume::RenderFormat kColorFormat = plume::RenderFormat::B8G8R8A8_UNORM
 constexpr plume::RenderFormat kDepthFormat = plume::RenderFormat::D32_FLOAT_S8_UINT;
 // What a guest depth resolve becomes on the host: the depth value itself.
 constexpr plume::RenderFormat kDepthCopyFormat = plume::RenderFormat::R32_FLOAT;
-// Interpolation queues two presents per guest frame. With four images two
-// can wait for the display while the next frame acquires two more, so the
-// guest thread (whose logic steps once per frame) never waits for a vblank.
+// Interpolation queues two presents per guest frame. With two more images
+// per frame in flight than the display holds, the next frame acquires its
+// two while the earlier ones wait for the display, so the guest thread
+// (whose logic steps once per frame) never waits for a vblank.
 constexpr uint32_t kSwapChainBuffers = 2;
-constexpr uint32_t kInterpolationSwapChainBuffers = 4;
+constexpr uint32_t kInterpolationSwapChainBuffersPerFrame = 2;
+constexpr uint32_t kInterpolationSwapChainBuffersExtra = 2;
 constexpr uint64_t kUploadBytes = 256ull << 20;
 constexpr uint32_t kTexture2DCount = 8192;
 constexpr uint32_t kTexture3DCount = 64;
@@ -1880,10 +1882,17 @@ struct Renderer::State {
   Texture held;
   // The real frame's present pass is a submit of its own: Plume gives a
   // submit one wait stage, so it waits on one swap chain image only.
-  std::unique_ptr<plume::RenderCommandSemaphore> acquire_second;
-  std::unique_ptr<plume::RenderCommandList> commands_second;
-  std::unique_ptr<plume::RenderCommandFence> fence_second;
-  bool second_pending = false;
+  // One set per frame slot: with two frames in flight the other slot's
+  // second present may still be on the GPU.
+  std::array<std::unique_ptr<plume::RenderCommandSemaphore>, 2> acquire_second;
+  std::array<std::unique_ptr<plume::RenderCommandList>, 2> commands_second;
+  std::array<std::unique_ptr<plume::RenderCommandFence>, 2> fence_second;
+  std::array<bool, 2> second_pending{};
+  void WaitSecond(uint32_t slot) {
+    if (!second_pending[slot]) return;
+    queue->waitForCommandFence(fence_second[slot].get());
+    second_pending[slot] = false;
+  }
   uint64_t interp_frames = 0;
   // native_interpolate_debug: one replayed frame and its real frame read
   // back to logs/interp-{real,replay}.rgba after the frame's fence.
@@ -2199,11 +2208,13 @@ struct Renderer::State {
       Skip("interp: no frontbuffer");
       return false;
     }
-    if (!acquire_second) {
-      acquire_second = device->createCommandSemaphore();
-      commands_second = queue->createCommandList();
-      fence_second = device->createCommandFence();
+    if (!acquire_second[frame_slot]) {
+      acquire_second[frame_slot] = device->createCommandSemaphore();
+      commands_second[frame_slot] = queue->createCommandList();
+      fence_second[frame_slot] = device->createCommandFence();
     }
+    // This slot's last second present (two frames ago) is done with its list.
+    WaitSecond(frame_slot);
     uint64_t constants_mid = 0, constants_real = 0;
     if (!Upload(16 + 256 * 4, 256, constants_mid) || !Upload(16 + 256 * 4, 256, constants_real)) {
       Skip("interp: upload ring full");
@@ -2232,7 +2243,7 @@ struct Renderer::State {
       Skip("interp: no swap chain image");
       return false;
     }
-    const bool second = swap_chain->acquireTexture(acquire_second.get(), &real_image);
+    const bool second = swap_chain->acquireTexture(acquire_second[frame_slot].get(), &real_image);
     // Keep frame N.
     plume::RenderTextureBarrier to_copy[] = {
         plume::RenderTextureBarrier(front.texture.get(), plume::RenderTextureLayout::COPY_SOURCE),
@@ -2306,18 +2317,19 @@ struct Renderer::State {
     swap_chain->present(mid_image, &signal, 1);
     if (second) {
       // The held frame was written above; a later submit on the queue sees it.
-      std::swap(commands, commands_second);
+      std::swap(commands, commands_second[frame_slot]);
       commands->begin();
       DrawPresentPass(real_image, replayed && show_replay ? front.index : held.index,
                       constants_real);
       commands->end();
-      std::swap(commands, commands_second);
-      const plume::RenderCommandList* second_list = commands_second.get();
-      plume::RenderCommandSemaphore* second_wait = acquire_second.get();
+      std::swap(commands, commands_second[frame_slot]);
+      const plume::RenderCommandList* second_list = commands_second[frame_slot].get();
+      plume::RenderCommandSemaphore* second_wait = acquire_second[frame_slot].get();
       plume::RenderCommandSemaphore* second_signal = release[real_image].get();
-      queue->executeCommandLists(&second_list, 1, &second_wait, 1, &second_signal, 1, fence_second.get());
+      queue->executeCommandLists(&second_list, 1, &second_wait, 1, &second_signal, 1,
+                                 fence_second[frame_slot].get());
       swap_chain->present(real_image, &second_signal, 1);
-      second_pending = true;
+      second_pending[frame_slot] = true;
     }
     return true;
   }
@@ -2499,6 +2511,10 @@ Renderer::~Renderer() {
   State& s = *state_;
   if (s.queue && s.fence && s.fence_pending[s.frame_slot]) s.queue->waitForCommandFence(s.fence.get());
   if (s.queue && s.fence_other && s.fence_pending[s.frame_slot ^ 1]) s.queue->waitForCommandFence(s.fence_other.get());
+  if (s.queue) {
+    s.WaitSecond(0);
+    s.WaitSecond(1);
+  }
 }
 
 const std::string& Renderer::device_name() const { return state_->device_name; }
@@ -2525,10 +2541,7 @@ bool Renderer::Open(void* native_window, std::string& reason) {
   s.fence = s.device->createCommandFence();
   s.commands = s.queue->createCommandList();
   s.acquire = s.device->createCommandSemaphore();
-  // Interpolation submits twice a frame and keeps one frame in flight.
-  s.frames_in_flight = REXCVAR_GET(native_interpolate)
-                           ? 1u
-                           : uint32_t(std::clamp<int32_t>(REXCVAR_GET(native_frames_in_flight), 1, 2));
+  s.frames_in_flight = uint32_t(std::clamp<int32_t>(REXCVAR_GET(native_frames_in_flight), 1, 2));
   if (s.frames_in_flight == 2) {
     s.fence_other = s.device->createCommandFence();
     s.commands_other = s.queue->createCommandList();
@@ -2536,7 +2549,9 @@ bool Renderer::Open(void* native_window, std::string& reason) {
   }
   s.swap_chain = s.queue->createSwapChain(plume::RenderSwapChainDesc(
       static_cast<plume::RenderWindow>(native_window), kColorFormat,
-      REXCVAR_GET(native_interpolate) ? kInterpolationSwapChainBuffers : kSwapChainBuffers));
+      REXCVAR_GET(native_interpolate)
+          ? kInterpolationSwapChainBuffersPerFrame * s.frames_in_flight + kInterpolationSwapChainBuffersExtra
+          : kSwapChainBuffers));
   if (!s.swap_chain || !s.swap_chain->resize()) {
     reason = "no swapchain on the game window";
     return false;
@@ -3750,9 +3765,10 @@ void Renderer::Present(uint32_t frontbuffer, const uint8_t* base) {
   }
   s.fence_pending[s.frame_slot] = true;
   const auto t_submit = std::chrono::steady_clock::now();
-  // A frame whose results are read back here (dumps, interpolation) is
-  // waited for whatever the frames in flight.
-  const bool overlap = s.frames_in_flight == 2 && !s.Dumping() && !s.debug_pending && !shown;
+  // A frame whose results are read back here (dumps, interpolation debug
+  // pictures) is waited for whatever the frames in flight. An interpolated
+  // frame keeps what it blends with in CPU copies, so it overlaps too.
+  const bool overlap = s.frames_in_flight == 2 && !s.Dumping() && !s.debug_pending;
   if (overlap) {
     // Record the next frame in the other slot once its last frame is done;
     // this one keeps drawing meanwhile.
@@ -3773,9 +3789,9 @@ void Renderer::Present(uint32_t frontbuffer, const uint8_t* base) {
       s.fence_pending[s.frame_slot ^ 1] = false;
     }
   }
-  if (s.second_pending) {
-    s.queue->waitForCommandFence(s.fence_second.get());
-    s.second_pending = false;
+  if (!overlap) {
+    s.WaitSecond(0);
+    s.WaitSecond(1);
   }
   if (REXCVAR_GET(native_interpolate)) s.SnapshotFrame();
   if (s.debug_pending) {
@@ -3859,6 +3875,8 @@ void Renderer::Present(uint32_t frontbuffer, const uint8_t* base) {
       s.queue->waitForCommandFence(s.fence_other.get());
       s.fence_pending[s.frame_slot ^ 1] = false;
     }
+    s.WaitSecond(0);
+    s.WaitSecond(1);
     if (s.swap_chain->resize()) {
       while (s.release.size() < s.swap_chain->getTextureCount()) {
         s.release.push_back(s.device->createCommandSemaphore());
