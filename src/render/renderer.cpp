@@ -64,9 +64,10 @@ REXCVAR_DEFINE_BOOL(native_interpolate, false, "Game",
                     "With renderer=native, draw an in-between frame when the game steps at 30 Hz "
                     "(shows 60 FPS one step late)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
-REXCVAR_DEFINE_STRING(native_interpolate_blend, "vs,ps,bones", "Game",
-                      "With native_interpolate, what the in-between frame blends: comma-separated vs (vertex "
-                      "constants), ps (pixel constants), bones. Left-out parts use the real frame's")
+REXCVAR_DEFINE_STRING(native_interpolate_blend, "motion,bones", "Game",
+                      "With native_interpolate, what the in-between frame blends: comma-separated motion (the "
+                      "vertex shader's matrices and skin bones), vs (all vertex constants), ps (pixel constants), "
+                      "bones (bone textures). Left-out parts use the real frame's")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(native_interpolate_debug, false, "Game",
                     "With native_interpolate, show the in-between frame in place of the real one too (to compare a "
@@ -1895,10 +1896,10 @@ struct Renderer::State {
   static constexpr size_t kVsFloats = gfx::kVertexShaderConstantsBytes / 4;
   static constexpr size_t kPsFloats = gfx::kPixelShaderConstantsBytes / 4;
   // native_interpolate_blend, read once.
-  bool blend_vs = true, blend_ps = true, blend_bones = true;
+  bool blend_motion = true, blend_vs = false, blend_ps = false, blend_bones = true;
   bool blend_read = false;
   uint64_t guarded = 0;  // paired draws whose transform jumped, for the cut rule
-  uint64_t snapped = 0;  // constants that jumped and kept this frame's value
+  uint64_t snapped = 0;  // constants (motion: matrices) that jumped and kept this frame's value
   struct DrawOp;  // the frame journal's, below
   struct PrevBones {
     uint32_t fetch_slot;  // which of the draw's fetch slots
@@ -1993,6 +1994,7 @@ struct Renderer::State {
     }
     if (!blend_read) {
       const std::string parts = REXCVAR_GET(native_interpolate_blend);
+      blend_motion = parts.find("motion") != std::string::npos;
       blend_vs = parts.find("vs") != std::string::npos;
       blend_ps = parts.find("ps") != std::string::npos;
       blend_bones = parts.find("bones") != std::string::npos;
@@ -2091,6 +2093,13 @@ struct Renderer::State {
             float lerped[kVsFloats];
             snapped += interp::LerpFloatsSnap(prev.vs_constants.data() + size_t(pair) * kVsFloats, VsCpu(mid),
                                               lerped, kVsFloats, 0.5f, 0.5f);
+            std::memcpy(upload_cpu + blended, lerped, sizeof(lerped));
+            mid.vs_constants = blended;
+            blended += kVsFloats * 4;
+          } else if (blend_motion) {
+            float lerped[kVsFloats];
+            snapped += interp::LerpMotion(prev.vs_constants.data() + size_t(pair) * kVsFloats, VsCpu(mid), lerped,
+                                          kVsFloats, mid.skinned, 0.5f, 1.0f);
             std::memcpy(upload_cpu + blended, lerped, sizeof(lerped));
             mid.vs_constants = blended;
             blended += kVsFloats * 4;
@@ -2336,6 +2345,7 @@ struct Renderer::State {
     uint64_t key_no_textures = 0;  // shaders, index range, count
     uint64_t key_shaders = 0;      // shaders and count
     uint32_t count = 0;
+    bool skinned = false;  // the vertex shader has g_aSkinMatrices
   };
   struct ClearOp {
     Target* target = nullptr;
@@ -3272,6 +3282,8 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
                                          draw.start, draw.count, nullptr, 0);
     op.key_shaders = interp::DrawKey(vs_key, ps_key, nullptr, 0, 0, 0, draw.count, nullptr, 0);
     op.count = draw.count;
+    op.skinned = vs_cache_entry != s.entries.end() &&
+                 (vs_cache_entry->second->specConstantsMask & SPEC_CONSTANT_SKIN_MATRICES) != 0;
   }
   s.ExecuteDraw(op);
   s.Record(op);

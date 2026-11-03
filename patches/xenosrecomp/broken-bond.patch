@@ -1,19 +1,22 @@
 diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
-index 1c74034..2a33400 100644
+index 1c74034..6866e73 100644
 --- a/XenosRecomp/shader_common.h
 +++ b/XenosRecomp/shader_common.h
-@@ -3,6 +3,9 @@
+@@ -3,6 +3,12 @@
  
  #define SPEC_CONSTANT_R11G11B10_NORMAL  (1 << 0)
  #define SPEC_CONSTANT_ALPHA_TEST        (1 << 1)
 +// Not a specialization constant: marks vertex shaders whose fetches read
 +// the fetch table by a computed index (see vfetchIndexed).
 +#define SPEC_CONSTANT_INDEXED_FETCH     (1 << 8)
++// Not a specialization constant either: marks vertex shaders that skin by
++// g_aSkinMatrices in c42-c137 (32 bones, three rows each).
++#define SPEC_CONSTANT_SKIN_MATRICES     (1 << 9)
  
  #ifdef UNLEASHED_RECOMP
      #define SPEC_CONSTANT_BICUBIC_GI_FILTER (1 << 2)
 diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
-index 698a418..b746b05 100644
+index 698a418..d93411e 100644
 --- a/XenosRecomp/shader_recompiler.cpp
 +++ b/XenosRecomp/shader_recompiler.cpp
 @@ -74,7 +74,9 @@ struct DeclUsageLocation
@@ -260,7 +263,21 @@ index 698a418..b746b05 100644
  void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_view& include)
  {
      const auto shaderContainer = reinterpret_cast<const ShaderContainer*>(shaderData);
-@@ -1171,15 +1319,6 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1127,6 +1275,13 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+ 
+         const char* constantName = reinterpret_cast<const char*>(constantTableData + constantInfo->name);
+ 
++        if (!isPixelShader && constantInfo->registerSet == RegisterSet::Float4 &&
++            strcmp(constantName, "g_aSkinMatrices") == 0 && constantInfo->registerIndex == 42 &&
++            constantInfo->registerCount == 96)
++        {
++            specConstantsMask |= SPEC_CONSTANT_SKIN_MATRICES;
++        }
++
+     #ifdef UNLEASHED_RECOMP
+         if (!isPixelShader)
+         {
+@@ -1171,15 +1326,6 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
  
          case RegisterSet::Sampler:
          {
@@ -276,7 +293,7 @@ index 698a418..b746b05 100644
              samplers.emplace(constantInfo->registerIndex, constantName);
              break;
          }
-@@ -1220,27 +1359,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1220,27 +1366,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
  
      out += "cbuffer SharedConstants : register(b2, space4)\n";
      out += "{\n";
@@ -305,7 +322,7 @@ index 698a418..b746b05 100644
      out += "\tDEFINE_SHARED_CONSTANTS();\n";
      out += "};\n\n";
  
-@@ -1263,6 +1382,15 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1263,6 +1389,15 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
  
      const auto shader = reinterpret_cast<const Shader*>(shaderData + shaderContainer->shaderOffset);
  
@@ -321,7 +338,7 @@ index 698a418..b746b05 100644
      out += "#ifndef __spirv__\n";
  
      if (isPixelShader)
-@@ -1322,6 +1450,12 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1322,6 +1457,12 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
              }
          #endif
  
@@ -334,7 +351,7 @@ index 698a418..b746b05 100644
              out += '\t';
  
              for (auto& usageLocation : USAGE_LOCATIONS)
-@@ -1347,6 +1481,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1347,6 +1488,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
          }
      #endif
  
@@ -344,7 +361,7 @@ index 698a418..b746b05 100644
          out += "\tout float4 oPos : SV_Position";
  
          for (auto& [usage, usageIndex] : INTERPOLATORS)
-@@ -1466,6 +1603,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1466,6 +1610,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
              {
                  out += "float4((iPos.xy - 0.5) * float2(iFace ? 1.0 : -1.0, 1.0), 0.0, 0.0);\n";
              }
@@ -355,7 +372,7 @@ index 698a418..b746b05 100644
          #ifdef UNLEASHED_RECOMP
              else if (!isPixelShader && hasIndexCount && i == 0)
              {
-@@ -1804,7 +1945,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1804,7 +1952,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                      out += '{';
  
                      indent();

@@ -31,6 +31,9 @@
 // vertex shader whose fetches take a computed index. Such a shader has no
 // vertex inputs and reads the fetch table (kSharedFetchTableOffset).
 #define SPEC_CONSTANT_INDEXED_FETCH     (1 << 8)
+// Not a specialization constant either: a vertex shader that skins by
+// g_aSkinMatrices in c42-c137 (frame interpolation blends those).
+#define SPEC_CONSTANT_SKIN_MATRICES     (1 << 9)
 
 // Descriptor kinds; index = kind * 32 + fetch slot.
 #define DESCRIPTOR_KIND_TEXTURE1D   0

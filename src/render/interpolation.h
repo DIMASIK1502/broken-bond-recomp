@@ -39,6 +39,15 @@ void LerpFloats(const float* prev, const float* cur, float* out, size_t count, f
 // halfway value is wrong. Returns how many values took cur that way.
 size_t LerpFloatsSnap(const float* prev, const float* cur, float* out, size_t count, float t, float jump);
 
+// Blends only the vertex constants that move things, each matrix whole:
+// c0-c3 g_mWorldViewProj, c4-c6 g_mWorldView, c8-c11 g_mInvTransWorld,
+// c12-c14 g_mWorld, c21 g_vViewerPosition and, when `skinned`, the 32 bones
+// of g_aSkinMatrices in c42-c137. Every vertex shader of the game keeps them
+// there. Other constants (UV scrolls, wind, switches) take cur, and so does a
+// matrix that Jumped by `jump`. `floats` is the size of all three arrays.
+// Returns how many matrices took cur that way.
+size_t LerpMotion(const float* prev, const float* cur, float* out, size_t floats, bool skinned, float t, float jump);
+
 // The same for IEEE half floats.
 void LerpHalfs(const uint16_t* prev, const uint16_t* cur, uint16_t* out, size_t count, float t);
 

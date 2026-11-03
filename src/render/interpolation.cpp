@@ -142,6 +142,29 @@ size_t LerpFloatsSnap(const float* prev, const float* cur, float* out, size_t co
   return snapped;
 }
 
+size_t LerpMotion(const float* prev, const float* cur, float* out, size_t floats, bool skinned, float t, float jump) {
+  std::copy(cur, cur + floats, out);
+  size_t snapped = 0;
+  auto block = [&](size_t first, size_t count) {
+    const size_t begin = first * 4, size = count * 4;
+    if (begin + size > floats) return;
+    if (Jumped(prev + begin, cur + begin, size, jump)) {
+      ++snapped;
+      return;
+    }
+    LerpFloats(prev + begin, cur + begin, out + begin, size, t);
+  };
+  block(0, 4);
+  block(4, 3);
+  block(8, 4);
+  block(12, 3);
+  block(21, 1);
+  if (skinned) {
+    for (size_t bone = 0; bone < 32; ++bone) block(42 + bone * 3, 3);
+  }
+  return snapped;
+}
+
 void LerpHalfs(const uint16_t* prev, const uint16_t* cur, uint16_t* out, size_t count, float t) {
   for (size_t i = 0; i < count; ++i) {
     const float a = HalfToFloat(prev[i]);
