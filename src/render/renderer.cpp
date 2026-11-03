@@ -17,6 +17,7 @@
 #include <xxhash.h>
 
 #include <fmt/format.h>
+#include <fmt/ranges.h>
 #include <rex/cvar.h>
 #include <plume_render_interface.h>
 #include <rex/graphics/pipeline/texture/util.h>
@@ -1900,6 +1901,7 @@ struct Renderer::State {
   bool blend_read = false;
   uint64_t guarded = 0;  // paired draws whose transform jumped, for the cut rule
   uint64_t snapped = 0;  // constants (motion: matrices) that jumped and kept this frame's value
+  uint64_t snapped_by_kind[interp::kMotionKinds] = {};
   struct DrawOp;  // the frame journal's, below
   struct PrevBones {
     uint32_t fetch_slot;  // which of the draw's fetch slots
@@ -1936,7 +1938,7 @@ struct Renderer::State {
   float last_match = 0.0f;
   // Pairing report for the 5 s log: summed shares and frames, and a sample
   // of one frame's unpaired draws.
-  double match_sum = 0, match_no_textures_sum = 0, match_shaders_sum = 0;
+  double match_sum = 0, match_no_textures_sum = 0, match_shaders_sum = 0, match_strict_sum = 0;
   uint32_t match_frames = 0;
   std::string unpaired_sample;
 
@@ -2016,6 +2018,7 @@ struct Renderer::State {
       const std::vector<int32_t> ma = interp::MatchDraws(prev.keys_no_textures, a);
       const std::vector<int32_t> mb = interp::MatchDraws(prev.keys_shaders, b);
       match_sum += last_match;
+      match_strict_sum += interp::MatchedShare(interp::MatchDraws(prev.keys_strict, keys_strict));
       match_no_textures_sum += interp::MatchedShare(ma);
       match_shaders_sum += interp::MatchedShare(mb);
       ++match_frames;
@@ -2035,17 +2038,17 @@ struct Renderer::State {
       Skip("interp: few matches");
       return false;
     }
-    // A cut: many paired draws' first four vertex constants (their
-    // transform) moved far in one step. Walking in the village moves about
-    // 10 % of pairs that far; a camera cut moves most of them.
+    // A cut: most paired draws' g_mWorldViewProj moved by more than 0.6 of
+    // a row in one step. A sharp camera turn moves rows by less than that.
     size_t pairs = 0, jumps = 0;
     for (size_t i = 0; i < match.size(); ++i) {
-      if (match[i] < 0) continue;
+      if (match[i] < 0 || !(draw_ops[i].motion & interp::kWorldViewProj)) continue;
       ++pairs;
-      jumps += interp::Jumped(prev.vs_constants.data() + size_t(match[i]) * kVsFloats, VsCpu(draw_ops[i]), 16, 0.5f);
+      jumps += interp::RowsMoved(prev.vs_constants.data() + size_t(match[i]) * kVsFloats, VsCpu(draw_ops[i]), 4,
+                                 0.6f);
     }
     guarded += jumps;
-    if (jumps * 4 > pairs) {
+    if (pairs > 0 && jumps * 2 > pairs) {
       Skip("interp: camera jump");
       return false;
     }
@@ -2099,7 +2102,7 @@ struct Renderer::State {
           } else if (blend_motion) {
             float lerped[kVsFloats];
             snapped += interp::LerpMotion(prev.vs_constants.data() + size_t(pair) * kVsFloats, VsCpu(mid), lerped,
-                                          kVsFloats, mid.motion, 0.5f, 0.6f);
+                                          kVsFloats, mid.motion, 0.5f, 0.6f, snapped_by_kind);
             std::memcpy(upload_cpu + blended, lerped, sizeof(lerped));
             mid.vs_constants = blended;
             blended += kVsFloats * 4;
@@ -3282,9 +3285,16 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
                                          draw.start, draw.count, nullptr, 0);
     op.key_shaders = interp::DrawKey(vs_key, ps_key, nullptr, 0, 0, 0, draw.count, nullptr, 0);
     op.count = draw.count;
-    op.motion = vs_cache_entry != s.entries.end()
-                    ? (vs_cache_entry->second->specConstantsMask >> SPEC_CONSTANT_MOTION_SHIFT) & 0x3F
-                    : 0;
+    if (vs_cache_entry != s.entries.end()) {
+      op.motion = (vs_cache_entry->second->specConstantsMask >> SPEC_CONSTANT_MOTION_SHIFT) &
+                  ((1u << SPEC_CONSTANT_MOTION_BITS) - 1);
+    }
+    if (op.motion & interp::kWorld) {
+      // An object's own world matrix names it: copies of one mesh (trees,
+      // fences) pair with themselves even when the camera changes which of
+      // them are drawn. A moved object misses here and pairs by order.
+      op.key_strict = interp::MixFloats(op.key_no_textures, s.VsCpu(op) + 12 * 4, 12);
+    }
   }
   s.ExecuteDraw(op);
   s.Record(op);
@@ -3893,8 +3903,14 @@ std::string Renderer::TakeStats() {
     out += fmt::format(" journal={} interp={} match={:.2f} match_notex={:.2f} match_shaders={:.2f} bones={} jumped={} snapped={}",
                        s.journal_last, s.interp_frames, s.match_sum / frames, s.match_no_textures_sum / frames,
                        s.match_shaders_sum / frames, s.bones_blended, s.guarded, s.snapped);
+    // Snapped matrices by kind (wvp wv itw world eye skin shadow0 shadow1)
+    // and the share of draws paired by their strict key (world matrix).
+    out += fmt::format(" snapped_kinds={} match_strict={:.2f}", fmt::join(s.snapped_by_kind, "/"),
+                       s.match_strict_sum / frames);
     s.guarded = 0;
     s.snapped = 0;
+    std::fill(std::begin(s.snapped_by_kind), std::end(s.snapped_by_kind), 0);
+    s.match_strict_sum = 0;
     if (!s.unpaired_sample.empty()) out += " | unpaired " + s.unpaired_sample;
     if (!s.front_resolve.empty()) out += " | front resolve " + s.front_resolve;
     s.front_resolve.clear();

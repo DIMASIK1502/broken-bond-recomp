@@ -48,16 +48,41 @@ enum Motion : uint32_t {
   kInvTransWorld = 1 << 3,   // g_mInvTransWorld c8-c11
   kWorld = 1 << 4,           // g_mWorld c12-c14
   kViewerPosition = 1 << 5,  // g_vViewerPosition c21
+  // Cascade counts (0-4) in two 3-bit fields: g_mShadowTransform0 from c42,
+  // three rows each, then g_mShadowTransform1, two rows each.
+  kShadow0Shift = 6,
+  kShadow1Shift = 9,
 };
+
+// Kinds of matrix LerpMotion counts in `snapped_by_kind`.
+enum MotionKind : size_t {
+  kKindWorldViewProj,
+  kKindWorldView,
+  kKindInvTransWorld,
+  kKindWorld,
+  kKindViewerPosition,
+  kKindSkin,
+  kKindShadow0,
+  kKindShadow1,
+  kMotionKinds,
+};
+
+// True when one of `rows` float4 rows moved by more than `jump` times its
+// length (or holds a non-finite value). 2D matrices hold scales of 0.002,
+// so there is no absolute floor.
+bool RowsMoved(const float* prev, const float* cur, size_t rows, float jump);
+
+// Mixes `count` floats (bit patterns) into `key`.
+uint64_t MixFloats(uint64_t key, const float* values, size_t count);
 
 // Blends only the vertex constants that move things, each matrix whole: the
 // blocks named in `motion`. Other constants (UV scrolls, wind, switches, and
 // whatever a shader without these names keeps there) take cur, and so does
-// a matrix one of whose rows moved by more than `jump` times its length
-// (2D matrices hold scales of 0.002, so no absolute floor). `floats` is the
-// size of all three arrays. Returns how many matrices took cur that way.
+// a matrix whose RowsMoved by `jump`. `floats` is the size of all three
+// arrays. Returns how many matrices took cur that way, and adds them per
+// MotionKind to `snapped_by_kind` when given.
 size_t LerpMotion(const float* prev, const float* cur, float* out, size_t floats, uint32_t motion, float t,
-                  float jump);
+                  float jump, uint64_t* snapped_by_kind = nullptr);
 
 // The same for IEEE half floats.
 void LerpHalfs(const uint16_t* prev, const uint16_t* cur, uint16_t* out, size_t count, float t);

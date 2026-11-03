@@ -40,7 +40,12 @@
 #define SPEC_CONSTANT_INV_TRANS_WORLD   (1 << 12) // g_mInvTransWorld c8-c11
 #define SPEC_CONSTANT_WORLD             (1 << 13) // g_mWorld c12-c14
 #define SPEC_CONSTANT_VIEWER_POSITION   (1 << 14) // g_vViewerPosition c21
+// g_mShadowTransform0 from c42, three rows per cascade: cascades << 15 (0-4).
+#define SPEC_CONSTANT_SHADOW0_SHIFT     15
+// g_mShadowTransform1 right after it, two rows per cascade: cascades << 18.
+#define SPEC_CONSTANT_SHADOW1_SHIFT     18
 #define SPEC_CONSTANT_MOTION_SHIFT      9
+#define SPEC_CONSTANT_MOTION_BITS       12
 
 // Descriptor kinds; index = kind * 32 + fetch slot.
 #define DESCRIPTOR_KIND_TEXTURE1D   0

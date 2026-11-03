@@ -1,8 +1,8 @@
 diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
-index 1c74034..15058d9 100644
+index 1c74034..f5739af 100644
 --- a/XenosRecomp/shader_common.h
 +++ b/XenosRecomp/shader_common.h
-@@ -3,6 +3,17 @@
+@@ -3,6 +3,21 @@
  
  #define SPEC_CONSTANT_R11G11B10_NORMAL  (1 << 0)
  #define SPEC_CONSTANT_ALPHA_TEST        (1 << 1)
@@ -17,11 +17,15 @@ index 1c74034..15058d9 100644
 +#define SPEC_CONSTANT_INV_TRANS_WORLD   (1 << 12) // g_mInvTransWorld c8-c11
 +#define SPEC_CONSTANT_WORLD             (1 << 13) // g_mWorld c12-c14
 +#define SPEC_CONSTANT_VIEWER_POSITION   (1 << 14) // g_vViewerPosition c21
++// g_mShadowTransform0 from c42, three rows per cascade: cascades << 15 (0-4).
++#define SPEC_CONSTANT_SHADOW0_SHIFT     15
++// g_mShadowTransform1 right after it, two rows per cascade: cascades << 18.
++#define SPEC_CONSTANT_SHADOW1_SHIFT     18
  
  #ifdef UNLEASHED_RECOMP
      #define SPEC_CONSTANT_BICUBIC_GI_FILTER (1 << 2)
 diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
-index 698a418..5a15f79 100644
+index 698a418..bc1f450 100644
 --- a/XenosRecomp/shader_recompiler.cpp
 +++ b/XenosRecomp/shader_recompiler.cpp
 @@ -74,7 +74,9 @@ struct DeclUsageLocation
@@ -268,7 +272,7 @@ index 698a418..5a15f79 100644
  void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_view& include)
  {
      const auto shaderContainer = reinterpret_cast<const ShaderContainer*>(shaderData);
-@@ -1127,6 +1275,27 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1127,6 +1275,37 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
  
          const char* constantName = reinterpret_cast<const char*>(constantTableData + constantInfo->name);
  
@@ -283,6 +287,16 @@ index 698a418..5a15f79 100644
 +                { "g_mWorld", 12, 3, SPEC_CONSTANT_WORLD },
 +                { "g_vViewerPosition", 21, 1, SPEC_CONSTANT_VIEWER_POSITION },
 +            };
++            if (strcmp(constantName, "g_mShadowTransform0") == 0 && constantInfo->registerIndex == 42 &&
++                constantInfo->registerCount % 3 == 0 && constantInfo->registerCount <= 12)
++            {
++                specConstantsMask |= (constantInfo->registerCount / 3) << SPEC_CONSTANT_SHADOW0_SHIFT;
++            }
++            if (strcmp(constantName, "g_mShadowTransform1") == 0 && constantInfo->registerCount % 2 == 0 &&
++                constantInfo->registerCount <= 8)
++            {
++                specConstantsMask |= (constantInfo->registerCount / 2) << SPEC_CONSTANT_SHADOW1_SHIFT;
++            }
 +            for (const auto& motion : MOTION)
 +            {
 +                if (strcmp(constantName, motion.name) == 0 && constantInfo->registerIndex == motion.index &&
@@ -296,7 +310,7 @@ index 698a418..5a15f79 100644
      #ifdef UNLEASHED_RECOMP
          if (!isPixelShader)
          {
-@@ -1171,15 +1340,6 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1171,15 +1350,6 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
  
          case RegisterSet::Sampler:
          {
@@ -312,7 +326,7 @@ index 698a418..5a15f79 100644
              samplers.emplace(constantInfo->registerIndex, constantName);
              break;
          }
-@@ -1220,27 +1380,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1220,27 +1390,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
  
      out += "cbuffer SharedConstants : register(b2, space4)\n";
      out += "{\n";
@@ -341,7 +355,7 @@ index 698a418..5a15f79 100644
      out += "\tDEFINE_SHARED_CONSTANTS();\n";
      out += "};\n\n";
  
-@@ -1263,6 +1403,15 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1263,6 +1413,15 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
  
      const auto shader = reinterpret_cast<const Shader*>(shaderData + shaderContainer->shaderOffset);
  
@@ -357,7 +371,7 @@ index 698a418..5a15f79 100644
      out += "#ifndef __spirv__\n";
  
      if (isPixelShader)
-@@ -1322,6 +1471,12 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1322,6 +1481,12 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
              }
          #endif
  
@@ -370,7 +384,7 @@ index 698a418..5a15f79 100644
              out += '\t';
  
              for (auto& usageLocation : USAGE_LOCATIONS)
-@@ -1347,6 +1502,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1347,6 +1512,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
          }
      #endif
  
@@ -380,7 +394,7 @@ index 698a418..5a15f79 100644
          out += "\tout float4 oPos : SV_Position";
  
          for (auto& [usage, usageIndex] : INTERPOLATORS)
-@@ -1466,6 +1624,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1466,6 +1634,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
              {
                  out += "float4((iPos.xy - 0.5) * float2(iFace ? 1.0 : -1.0, 1.0), 0.0, 0.0);\n";
              }
@@ -391,7 +405,7 @@ index 698a418..5a15f79 100644
          #ifdef UNLEASHED_RECOMP
              else if (!isPixelShader && hasIndexCount && i == 0)
              {
-@@ -1804,7 +1966,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1804,7 +1976,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                      out += '{';
  
                      indent();

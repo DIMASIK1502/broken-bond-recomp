@@ -142,36 +142,54 @@ size_t LerpFloatsSnap(const float* prev, const float* cur, float* out, size_t co
   return snapped;
 }
 
+bool RowsMoved(const float* prev, const float* cur, size_t rows, float jump) {
+  for (size_t row = 0; row < rows * 4; row += 4) {
+    float moved = 0.0f, length_prev = 0.0f, length_cur = 0.0f;  // squared
+    for (size_t i = row; i < row + 4; ++i) {
+      if (!std::isfinite(prev[i]) || !std::isfinite(cur[i])) return true;
+      moved += (cur[i] - prev[i]) * (cur[i] - prev[i]);
+      length_prev += prev[i] * prev[i];
+      length_cur += cur[i] * cur[i];
+    }
+    if (moved > jump * jump * std::max(length_prev, length_cur)) return true;
+  }
+  return false;
+}
+
+uint64_t MixFloats(uint64_t key, const float* values, size_t count) {
+  for (size_t i = 0; i < count; ++i) {
+    uint32_t bits;
+    std::memcpy(&bits, &values[i], 4);
+    key = Mix(key, bits);
+  }
+  return key;
+}
+
 size_t LerpMotion(const float* prev, const float* cur, float* out, size_t floats, uint32_t motion, float t,
-                  float jump) {
+                  float jump, uint64_t* snapped_by_kind) {
   std::copy(cur, cur + floats, out);
   size_t snapped = 0;
-  auto block = [&](size_t first, size_t count) {
+  auto block = [&](size_t first, size_t count, MotionKind kind) {
     const size_t begin = first * 4, size = count * 4;
     if (begin + size > floats) return;
-    for (size_t row = begin; row < begin + size; row += 4) {
-      float moved = 0.0f, length_prev = 0.0f, length_cur = 0.0f;  // squared
-      for (size_t i = row; i < row + 4; ++i) {
-        if (!std::isfinite(prev[i]) || !std::isfinite(cur[i])) return;  // keeps cur
-        moved += (cur[i] - prev[i]) * (cur[i] - prev[i]);
-        length_prev += prev[i] * prev[i];
-        length_cur += cur[i] * cur[i];
-      }
-      if (moved > jump * jump * std::max(length_prev, length_cur)) {
-        ++snapped;
-        return;
-      }
+    if (RowsMoved(prev + begin, cur + begin, count, jump)) {
+      ++snapped;
+      if (snapped_by_kind) ++snapped_by_kind[kind];
+      return;
     }
     LerpFloats(prev + begin, cur + begin, out + begin, size, t);
   };
-  if (motion & kWorldViewProj) block(0, 4);
-  if (motion & kWorldView) block(4, 3);
-  if (motion & kInvTransWorld) block(8, 4);
-  if (motion & kWorld) block(12, 3);
-  if (motion & kViewerPosition) block(21, 1);
+  if (motion & kWorldViewProj) block(0, 4, kKindWorldViewProj);
+  if (motion & kWorldView) block(4, 3, kKindWorldView);
+  if (motion & kInvTransWorld) block(8, 4, kKindInvTransWorld);
+  if (motion & kWorld) block(12, 3, kKindWorld);
+  if (motion & kViewerPosition) block(21, 1, kKindViewerPosition);
   if (motion & kSkinMatrices) {
-    for (size_t bone = 0; bone < 32; ++bone) block(42 + bone * 3, 3);
+    for (size_t bone = 0; bone < 32; ++bone) block(42 + bone * 3, 3, kKindSkin);
   }
+  const size_t shadow0 = (motion >> kShadow0Shift) & 7, shadow1 = (motion >> kShadow1Shift) & 7;
+  for (size_t cascade = 0; cascade < shadow0; ++cascade) block(42 + cascade * 3, 3, kKindShadow0);
+  for (size_t cascade = 0; cascade < shadow1; ++cascade) block(42 + shadow0 * 3 + cascade * 2, 2, kKindShadow1);
   return snapped;
 }
 

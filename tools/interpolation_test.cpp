@@ -69,6 +69,27 @@ int main() {
     CHECK(std::fabs(scale_out[3] - 0.0027f) < 1e-6f);
   }
 
+  // Shadow cascades: g_mShadowTransform0 from c42, then g_mShadowTransform1.
+  {
+    std::vector<float> prev(256 * 4, 0.5f), cur(256 * 4, 0.25f), out(256 * 4);
+    const uint32_t shadows = (2u << interp::kShadow0Shift) | (1u << interp::kShadow1Shift);
+    uint64_t kinds[interp::kMotionKinds] = {};
+    CHECK(interp::LerpMotion(prev.data(), cur.data(), out.data(), out.size(), shadows, 0.5f, 0.6f, kinds) == 0);
+    CHECK(out[4 * 42] == 0.375f && out[4 * 47 + 3] == 0.375f);  // two cascades of three rows
+    CHECK(out[4 * 48] == 0.375f && out[4 * 49 + 3] == 0.375f);  // one of two rows
+    CHECK(out[4 * 50] == 0.25f && out[0] == 0.25f);
+    cur[4 * 49] = 9.0f;
+    CHECK(interp::LerpMotion(prev.data(), cur.data(), out.data(), out.size(), shadows, 0.5f, 0.6f, kinds) == 1);
+    CHECK(kinds[interp::kKindShadow1] == 1 && kinds[interp::kKindShadow0] == 0 && out[4 * 48] == 0.25f);
+  }
+
+  // Keys over floats: equal values, equal keys.
+  {
+    const float a[3] = {1.0f, 2.0f, 3.0f}, b[3] = {1.0f, 2.0f, 3.5f};
+    CHECK(interp::MixFloats(7, a, 3) == interp::MixFloats(7, a, 3));
+    CHECK(interp::MixFloats(7, a, 3) != interp::MixFloats(7, b, 3));
+  }
+
   // Pairs by key in order of appearance.
   const uint64_t A = 1, B = 2, C = 3;
   CHECK((interp::MatchDraws({A, B, A}, {A, A, C, B}) == std::vector<int32_t>{0, 2, -1, 1}));
