@@ -69,6 +69,22 @@ int main() {
     CHECK(std::fabs(scale_out[3] - 0.0027f) < 1e-6f);
   }
 
+  // A 3D view matrix of a house straight ahead: a sharp camera turn changes
+  // its near-zero x offset many times over, but not the matrix as a whole.
+  {
+    const float prev3d[16] = {1, 0, 0, 0.5f, 0, 1, 0, -2, 0, 0, 1, 40, 0, 0, 1, 40};
+    const float cur3d[16] = {0.95f, 0, 0.3f, 12.0f, 0, 1, 0, -2, -0.3f, 0, 0.95f, 38, -0.3f, 0, 0.95f, 38};
+    float out3d[16];
+    CHECK(!interp::MatrixMoved(prev3d, cur3d, 4, 0.6f));
+    CHECK(interp::LerpMotion(prev3d, cur3d, out3d, 16, interp::kWorldViewProj, 0.5f, 0.6f) == 0);
+    CHECK(out3d[3] == 6.25f);
+    // The same matrix jumping to another place is a cut.
+    const float far3d[16] = {1, 0, 0, 90, 0, 1, 0, -2, 0, 0, 1, -30, 0, 0, 1, -30};
+    CHECK(interp::MatrixMoved(prev3d, far3d, 4, 0.6f));
+    // A 3-row affine matrix is measured whole too.
+    CHECK(!interp::MatrixMoved(prev3d, cur3d, 3, 0.6f));
+  }
+
   // Shadow cascades: g_mShadowTransform0 from c42, then g_mShadowTransform1.
   {
     std::vector<float> prev(256 * 4, 0.5f), cur(256 * 4, 0.25f), out(256 * 4);

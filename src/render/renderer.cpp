@@ -2039,12 +2039,12 @@ struct Renderer::State {
       return false;
     }
     // A cut: most paired draws' g_mWorldViewProj moved by more than 0.6 of
-    // a row in one step. A sharp camera turn moves rows by less than that.
+    // its length in one step (MatrixMoved). A sharp turn moves it less.
     size_t pairs = 0, jumps = 0;
     for (size_t i = 0; i < match.size(); ++i) {
       if (match[i] < 0 || !(draw_ops[i].motion & interp::kWorldViewProj)) continue;
       ++pairs;
-      jumps += interp::RowsMoved(prev.vs_constants.data() + size_t(match[i]) * kVsFloats, VsCpu(draw_ops[i]), 4,
+      jumps += interp::MatrixMoved(prev.vs_constants.data() + size_t(match[i]) * kVsFloats, VsCpu(draw_ops[i]), 4,
                                  0.6f);
     }
     guarded += jumps;

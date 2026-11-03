@@ -142,18 +142,28 @@ size_t LerpFloatsSnap(const float* prev, const float* cur, float* out, size_t co
   return snapped;
 }
 
-bool RowsMoved(const float* prev, const float* cur, size_t rows, float jump) {
+bool MatrixMoved(const float* prev, const float* cur, size_t rows, float jump) {
+  for (size_t i = 0; i < rows * 4; ++i) {
+    if (!std::isfinite(prev[i]) || !std::isfinite(cur[i])) return true;
+  }
+  auto flat = [&](const float* m) {
+    const float* w = m + 12;
+    return std::fabs(w[0]) + std::fabs(w[1]) + std::fabs(w[2]) <= 1e-6f * std::fabs(w[3]);
+  };
+  const bool by_row = rows == 4 && flat(prev) && flat(cur);
+  float moved = 0.0f, length_prev = 0.0f, length_cur = 0.0f;  // squared
   for (size_t row = 0; row < rows * 4; row += 4) {
-    float moved = 0.0f, length_prev = 0.0f, length_cur = 0.0f;  // squared
     for (size_t i = row; i < row + 4; ++i) {
-      if (!std::isfinite(prev[i]) || !std::isfinite(cur[i])) return true;
       moved += (cur[i] - prev[i]) * (cur[i] - prev[i]);
       length_prev += prev[i] * prev[i];
       length_cur += cur[i] * cur[i];
     }
-    if (moved > jump * jump * std::max(length_prev, length_cur)) return true;
+    if (by_row) {
+      if (moved > jump * jump * std::max(length_prev, length_cur)) return true;
+      moved = length_prev = length_cur = 0.0f;
+    }
   }
-  return false;
+  return !by_row && moved > jump * jump * std::max(length_prev, length_cur);
 }
 
 uint64_t MixFloats(uint64_t key, const float* values, size_t count) {
@@ -172,7 +182,7 @@ size_t LerpMotion(const float* prev, const float* cur, float* out, size_t floats
   auto block = [&](size_t first, size_t count, MotionKind kind) {
     const size_t begin = first * 4, size = count * 4;
     if (begin + size > floats) return;
-    if (RowsMoved(prev + begin, cur + begin, count, jump)) {
+    if (MatrixMoved(prev + begin, cur + begin, count, jump)) {
       ++snapped;
       if (snapped_by_kind) ++snapped_by_kind[kind];
       return;

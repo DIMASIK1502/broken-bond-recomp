@@ -67,10 +67,14 @@ enum MotionKind : size_t {
   kMotionKinds,
 };
 
-// True when one of `rows` float4 rows moved by more than `jump` times its
-// length (or holds a non-finite value). 2D matrices hold scales of 0.002,
-// so there is no absolute floor.
-bool RowsMoved(const float* prev, const float* cur, size_t rows, float jump);
+// True when a matrix of `rows` float4 rows moved by more than `jump` times
+// its length (or holds a non-finite value). A 3D matrix is measured whole:
+// a row of an object straight ahead is almost all a near-zero offset that
+// any camera turn changes many times over, while the whole matrix also
+// holds the object's distance. A 4-row matrix without perspective (last row
+// 0, 0, 0, w: the 2D videos and menus, scales of 0.002) is measured row by
+// row against each row's own length, with no absolute floor.
+bool MatrixMoved(const float* prev, const float* cur, size_t rows, float jump);
 
 // Mixes `count` floats (bit patterns) into `key`.
 uint64_t MixFloats(uint64_t key, const float* values, size_t count);
@@ -78,7 +82,7 @@ uint64_t MixFloats(uint64_t key, const float* values, size_t count);
 // Blends only the vertex constants that move things, each matrix whole: the
 // blocks named in `motion`. Other constants (UV scrolls, wind, switches, and
 // whatever a shader without these names keeps there) take cur, and so does
-// a matrix whose RowsMoved by `jump`. `floats` is the size of all three
+// a matrix that MatrixMoved by `jump`. `floats` is the size of all three
 // arrays. Returns how many matrices took cur that way, and adds them per
 // MotionKind to `snapped_by_kind` when given.
 size_t LerpMotion(const float* prev, const float* cur, float* out, size_t floats, uint32_t motion, float t,
