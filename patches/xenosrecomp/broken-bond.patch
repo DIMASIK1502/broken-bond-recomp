@@ -1,5 +1,19 @@
+diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
+index 1c74034..2a33400 100644
+--- a/XenosRecomp/shader_common.h
++++ b/XenosRecomp/shader_common.h
+@@ -3,6 +3,9 @@
+ 
+ #define SPEC_CONSTANT_R11G11B10_NORMAL  (1 << 0)
+ #define SPEC_CONSTANT_ALPHA_TEST        (1 << 1)
++// Not a specialization constant: marks vertex shaders whose fetches read
++// the fetch table by a computed index (see vfetchIndexed).
++#define SPEC_CONSTANT_INDEXED_FETCH     (1 << 8)
+ 
+ #ifdef UNLEASHED_RECOMP
+     #define SPEC_CONSTANT_BICUBIC_GI_FILTER (1 << 2)
 diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
-index 698a418..94669d6 100644
+index 698a418..b746b05 100644
 --- a/XenosRecomp/shader_recompiler.cpp
 +++ b/XenosRecomp/shader_recompiler.cpp
 @@ -74,7 +74,9 @@ struct DeclUsageLocation
@@ -49,7 +63,52 @@ index 698a418..94669d6 100644
  static FetchDestinationSwizzle getDestSwizzle(uint32_t dstSwizzle, uint32_t index)
  {
      return FetchDestinationSwizzle((dstSwizzle >> (index * 3)) & 0x7);
-@@ -225,7 +219,8 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+@@ -179,6 +173,44 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+     auto findResult = vertexElements.find(address);
+     assert(findResult != vertexElements.end());
+ 
++    if (indexedFetch)
++    {
++        // Broken Bond: the index is whatever register the shader computed
++        // (instanced particles fetch the mesh by vertex % n and the
++        // instance by vertex / n). The table holds decoded float4s.
++        uint32_t location = 0;
++        for (auto& usageLocation : USAGE_LOCATIONS)
++        {
++            if (usageLocation.usage == findResult->second.usage && usageLocation.usageIndex == findResult->second.usageIndex)
++            {
++                location = usageLocation.location;
++                break;
++            }
++        }
++
++        if (findResult->second.usage == DeclUsage::TexCoord)
++            print("tfetchTexcoord(g_SwappedTexcoords, ");
++
++        print("vfetchIndexed({}, r{}.{}, {})", location, uint32_t(instr.srcRegister), SWIZZLES[instr.srcSwizzle],
++            instr.isIndexRounded ? "true" : "false");
++
++        if (findResult->second.usage == DeclUsage::TexCoord)
++            print(", {})", uint32_t(findResult->second.usageIndex));
++
++        out += '.';
++        printDstSwizzle(instr.dstSwizzle, true);
++        out += ";\n";
++        printDstSwizzle01(instr.dstRegister, instr.dstSwizzle);
++
++        if (instr.isPredicated)
++        {
++            --indentation;
++            indent();
++            out += "}\n";
++        }
++        return;
++    }
++
+     switch (findResult->second.usage)
+     {
+     case DeclUsage::Normal:
+@@ -225,7 +257,8 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
  
  void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicubic)
  {
@@ -59,7 +118,7 @@ index 698a418..94669d6 100644
          return;
  
      if (instr.isPredicated)
-@@ -246,6 +241,31 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
+@@ -246,6 +279,31 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
                  out += SWIZZLES[((instr.srcSwizzle >> (i * 2))) & 0x3];
          };
  
@@ -91,7 +150,7 @@ index 698a418..94669d6 100644
      std::string constName;
      const char* constNamePtr = nullptr;
  #ifdef UNLEASHED_RECOMP
-@@ -331,11 +351,19 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
+@@ -331,11 +389,19 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
          out += "Bicubic";
  #endif
  
@@ -112,7 +171,96 @@ index 698a418..94669d6 100644
      case TextureDimension::Texture2D:
          print(", float2({}, {})", instr.offsetX * 0.5f, instr.offsetY * 0.5f);
          break;
-@@ -1171,15 +1199,6 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1098,6 +1164,88 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+     }
+ }
+ 
++// True when some vertex fetch takes its index from anything but r0.x, the
++// vertex index Xenos loads there. Such shaders compute the index themselves.
++static bool hasComputedFetchIndex(const be<uint32_t>* code, uint32_t size)
++{
++    union
++    {
++        ControlFlowInstruction controlFlow[2];
++        struct
++        {
++            uint32_t code0;
++            uint32_t code1;
++            uint32_t code2;
++            uint32_t code3;
++        };
++    };
++
++    uint32_t instrSize = size;
++    for (uint32_t cf = 0; cf * 12 < instrSize; cf++)
++    {
++        auto controlFlowCode = code + cf * 3;
++        code0 = controlFlowCode[0];
++        code1 = controlFlowCode[1] & 0xFFFF;
++        code2 = (controlFlowCode[1] >> 16) | (controlFlowCode[2] << 16);
++        code3 = controlFlowCode[2] >> 16;
++
++        for (auto& cfInstr : controlFlow)
++        {
++            uint32_t address = 0, count = 0, sequence = 0;
++            switch (cfInstr.opcode)
++            {
++            case ControlFlowOpcode::Exec:
++            case ControlFlowOpcode::ExecEnd:
++                address = cfInstr.exec.address;
++                count = cfInstr.exec.count;
++                sequence = cfInstr.exec.sequence;
++                break;
++            case ControlFlowOpcode::CondExec:
++            case ControlFlowOpcode::CondExecEnd:
++            case ControlFlowOpcode::CondExecPredClean:
++            case ControlFlowOpcode::CondExecPredCleanEnd:
++                address = cfInstr.condExec.address;
++                count = cfInstr.condExec.count;
++                sequence = cfInstr.condExec.sequence;
++                break;
++            case ControlFlowOpcode::CondExecPred:
++            case ControlFlowOpcode::CondExecPredEnd:
++                address = cfInstr.condExecPred.address;
++                count = cfInstr.condExecPred.count;
++                sequence = cfInstr.condExecPred.sequence;
++                break;
++            default:
++                break;
++            }
++
++            if (address == 0)
++                continue;
++
++            instrSize = std::min<uint32_t>(instrSize, address * 12);
++            for (uint32_t i = 0; i < count; i++, sequence >>= 2)
++            {
++                if ((sequence & 0x1) == 0)
++                    continue;
++
++                union
++                {
++                    VertexFetchInstruction vertexFetch;
++                    uint32_t words[3];
++                };
++                words[0] = code[(address + i) * 3];
++                words[1] = code[(address + i) * 3 + 1];
++                words[2] = code[(address + i) * 3 + 2];
++                if (vertexFetch.opcode == FetchOpcode::VertexFetch &&
++                    (vertexFetch.srcRegister != 0 || vertexFetch.srcSwizzle != 0))
++                {
++                    return true;
++                }
++            }
++        }
++    }
++    return false;
++}
++
+ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_view& include)
+ {
+     const auto shaderContainer = reinterpret_cast<const ShaderContainer*>(shaderData);
+@@ -1171,15 +1319,6 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
  
          case RegisterSet::Sampler:
          {
@@ -128,7 +276,7 @@ index 698a418..94669d6 100644
              samplers.emplace(constantInfo->registerIndex, constantName);
              break;
          }
-@@ -1220,27 +1239,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1220,27 +1359,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
  
      out += "cbuffer SharedConstants : register(b2, space4)\n";
      out += "{\n";
@@ -157,7 +305,57 @@ index 698a418..94669d6 100644
      out += "\tDEFINE_SHARED_CONSTANTS();\n";
      out += "};\n\n";
  
-@@ -1804,7 +1803,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1263,6 +1382,15 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+ 
+     const auto shader = reinterpret_cast<const Shader*>(shaderData + shaderContainer->shaderOffset);
+ 
++    if (!isPixelShader && std::getenv("BROKEN_BOND_WGSL") == nullptr)
++    {
++        indexedFetch = hasComputedFetchIndex(
++            reinterpret_cast<const be<uint32_t>*>(shaderData + shaderContainer->virtualSize + shader->physicalOffset),
++            shader->size);
++        if (indexedFetch)
++            specConstantsMask |= SPEC_CONSTANT_INDEXED_FETCH;
++    }
++
+     out += "#ifndef __spirv__\n";
+ 
+     if (isPixelShader)
+@@ -1322,6 +1450,12 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+             }
+         #endif
+ 
++            if (indexedFetch)
++            {
++                vertexElements.emplace(uint32_t(vertexElement.address), vertexElement);
++                continue;
++            }
++
+             out += '\t';
+ 
+             for (auto& usageLocation : USAGE_LOCATIONS)
+@@ -1347,6 +1481,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+         }
+     #endif
+ 
++        if (indexedFetch)
++            out += "\tin uint iVertexId : SV_VertexID,\n";
++
+         out += "\tout float4 oPos : SV_Position";
+ 
+         for (auto& [usage, usageIndex] : INTERPOLATORS)
+@@ -1466,6 +1603,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+             {
+                 out += "float4((iPos.xy - 0.5) * float2(iFace ? 1.0 : -1.0, 1.0), 0.0, 0.0);\n";
+             }
++            else if (!isPixelShader && indexedFetch && i == 0)
++            {
++                out += "float4(float(iVertexId + g_FetchVertexBase), 0.0, 0.0, 0.0);\n";
++            }
+         #ifdef UNLEASHED_RECOMP
+             else if (!isPixelShader && hasIndexCount && i == 0)
+             {
+@@ -1804,7 +1945,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                      out += '{';
  
                      indent();
@@ -166,3 +364,15 @@ index 698a418..94669d6 100644
  
                      indent();
                      out += "}";
+diff --git a/XenosRecomp/shader_recompiler.h b/XenosRecomp/shader_recompiler.h
+index b2e317d..72780f1 100644
+--- a/XenosRecomp/shader_recompiler.h
++++ b/XenosRecomp/shader_recompiler.h
+@@ -33,6 +33,7 @@ struct ShaderRecompiler : StringBuffer
+     std::unordered_map<uint32_t, const char*> samplers;
+     std::unordered_map<uint32_t, uint32_t> ifEndLabels;
+     uint32_t specConstantsMask = 0;
++    bool indexedFetch = false;
+ 
+ #ifdef UNLEASHED_RECOMP
+     bool hasMtxProjection = false;

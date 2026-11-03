@@ -1340,6 +1340,7 @@ struct Renderer::State {
   std::unordered_map<uint64_t, CachedIndices> index_cache;
   uint64_t index_hits = 0, index_misses = 0;
   uint64_t stream_hits = 0, stream_misses = 0;
+  uint64_t indexed_fetch_draws = 0;
   std::chrono::steady_clock::time_point lap_start;
   void Lap(size_t section) {
     const auto now = std::chrono::steady_clock::now();
@@ -2584,6 +2585,11 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
     s.Skip("debug: title composite");
     return;
   }
+  // The vertex shader computes its fetch indices (instanced particles): no
+  // vertex inputs, each stream is decoded whole into the fetch table.
+  const auto vs_cache_entry = s.entries.find(vs_key);
+  const bool indexed_fetch = vs_cache_entry != s.entries.end() &&
+                             (vs_cache_entry->second->specConstantsMask & SPEC_CONSTANT_INDEXED_FETCH) != 0;
 
   s.Lap(7);
   // Topology. Quad lists become triangle lists through the index list.
@@ -2738,6 +2744,9 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
   std::array<plume::RenderInputSlot, 16> slots;
   std::array<plume::RenderVertexBufferView, 16> views;
   uint32_t slot_count = 0;
+  // Per vertex location: ring offset and element count of the decoded stream.
+  std::array<uint64_t, 16> fetch_ring{};
+  std::array<uint32_t, 16> fetch_count{};
 
   XXH3_state_t key_state;
   XXH3_64bits_reset(&key_state);
@@ -2755,6 +2764,35 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
     vf.dword_0 = Be32(base, fetch);
     vf.dword_1 = Be32(base, fetch + 4);
     const uint32_t stride = uint32_t(*At(base, device + kDeviceStrides + stream)) * 4;
+    if (indexed_fetch) {
+      // Everything the fetch constant covers, since the shader may read any
+      // element of it.
+      const uint32_t count = stride ? std::min<uint32_t>(uint32_t(vf.size) * 4 / stride, 1u << 16) : 0;
+      if (count == 0) continue;
+      std::vector<uint8_t>& raw = s.stream_raw;
+      raw.resize(size_t(count) * stride);
+      std::memcpy(raw.data(), At(base, PhysicalView(vf.address * 4)), raw.size());
+      SwapDwords(raw.data(), raw.size(), uint32_t(vf.endian));
+      for (uint32_t i = 0; i < element_count; ++i) {
+        const Element& e = elems[i];
+        if (e.stream != stream || e.offset + e.in_size > stride) continue;
+        uint64_t ring = 0;
+        if (!s.Upload(size_t(count) * 16, 16, ring)) {
+          s.Skip("upload ring full");
+          return;
+        }
+        // XenosRecomp reads BLENDINDICES as integers whatever the format says.
+        ElementSource source = e.source;
+        if (e.usage == uint32_t(DeclUsage::kBlendIndices)) source.is_integer = true;
+        for (uint32_t v = 0; v < count; ++v) {
+          ConvertElement(raw.data() + size_t(v) * stride + e.offset, s.upload_cpu + ring + size_t(v) * 16, e.in_size,
+                         ElementConvert::kFloat4, source, uint32_t(vf.endian));
+        }
+        fetch_ring[e.location] = ring;
+        fetch_count[e.location] = count;
+      }
+      continue;
+    }
     const uint64_t begin = uint64_t(first) * stride;
     const uint64_t bytes = uint64_t(vertex_count) * stride;
     if (stride == 0 || begin + bytes > uint64_t(vf.size) * 4) {
@@ -2868,6 +2906,10 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
     ++slot_count;
   }
   s.ms_stream += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_stream).count();
+  if (indexed_fetch) {
+    ++s.indexed_fetch_draws;
+    XXH3_64bits_update(&key_state, "indexed fetch", 13);
+  }
 
   s.Lap(1);
   // Render state.
@@ -2997,7 +3039,7 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
     desc.inputSlots = slots.data();
     desc.inputSlotsCount = slot_count;
     desc.inputElements = elements.data();
-    desc.inputElementsCount = element_count;
+    desc.inputElementsCount = indexed_fetch ? 0 : element_count;
     const plume::RenderSpecConstant spec_constant(0, spec);
     desc.specConstants = &spec_constant;
     desc.specConstantsCount = 1;
@@ -3075,6 +3117,25 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
   std::memcpy(shared_cpu + gfx::kSharedAlphaThresholdOffset, &alpha_ref, 4);
   const uint32_t alpha_func = color_control & 7;
   std::memcpy(shared_cpu + gfx::kSharedAlphaFuncOffset, &alpha_func, 4);
+  if (indexed_fetch) {
+    uint64_t table = 0;
+    if (!s.Upload(gfx::kFetchTableBytes, 16, table)) {
+      s.Skip("upload ring full");
+      return;
+    }
+    uint8_t* out = s.upload_cpu + table;
+    std::memset(out, 0, gfx::kFetchTableBytes);
+    // Host vertex indices start at `first`; the shader adds it back.
+    std::memcpy(out, &first, 4);
+    for (uint32_t location = 0; location < 16; ++location) {
+      if (fetch_count[location] == 0) continue;
+      const uint64_t address = s.upload_gpu + fetch_ring[location];
+      std::memcpy(out + 16 + 16 * location, &address, 8);
+      std::memcpy(out + 16 + 16 * location + 8, &fetch_count[location], 4);
+    }
+    const uint64_t address = s.upload_gpu + table;
+    std::memcpy(shared_cpu + gfx::kSharedFetchTableOffset, &address, 8);
+  }
   std::memcpy(s.upload_cpu + shared, shared_cpu, sizeof(shared_cpu));
   if (REXCVAR_GET(native_interpolate)) {
     s.frame_shared.resize((size_t(cpu_index) + 1) * gfx::kSharedConstantsBytes);
@@ -3812,6 +3873,8 @@ std::string Renderer::TakeStats() {
                      s.stream_misses, s.stream_cache.size(), s.msaa_resolves, s.depth_resolves);
   s.msaa_resolves = 0;
   s.depth_resolves = 0;
+  out += fmt::format(" indexed_fetch={}", s.indexed_fetch_draws);
+  s.indexed_fetch_draws = 0;
   if (REXCVAR_GET(native_interpolate)) {
     const double frames = std::max<uint32_t>(s.match_frames, 1);
     out += fmt::format(" journal={} interp={} match={:.2f} match_notex={:.2f} match_shaders={:.2f} bones={} jumped={} snapped={}",

@@ -27,6 +27,10 @@
 
 #define SPEC_CONSTANT_R11G11B10_NORMAL  (1 << 0)
 #define SPEC_CONSTANT_ALPHA_TEST        (1 << 1)
+// Not a specialization constant: XenosRecomp sets it in the cache entry of a
+// vertex shader whose fetches take a computed index. Such a shader has no
+// vertex inputs and reads the fetch table (kSharedFetchTableOffset).
+#define SPEC_CONSTANT_INDEXED_FETCH     (1 << 8)
 
 // Descriptor kinds; index = kind * 32 + fetch slot.
 #define DESCRIPTOR_KIND_TEXTURE1D   0
@@ -50,6 +54,12 @@ inline constexpr uint32_t kSharedHalfPixelOffsetOffset = kDescriptorIndexBytes +
 inline constexpr uint32_t kSharedAlphaThresholdOffset = kDescriptorIndexBytes + 16;
 // RB_COLORCONTROL alpha function: 0 never ... 7 always, as D3DCMP_* minus one.
 inline constexpr uint32_t kSharedAlphaFuncOffset = kDescriptorIndexBytes + 20;
+// GPU address of the fetch table, for SPEC_CONSTANT_INDEXED_FETCH shaders:
+// uint vertex_base (added to the host vertex index to give the guest one),
+// three pad words, then per vertex location {uint64 address, uint count,
+// uint pad} of `count` decoded float4s.
+inline constexpr uint32_t kSharedFetchTableOffset = kDescriptorIndexBytes + 24;
+inline constexpr uint32_t kFetchTableBytes = 16 + 16 * 16;
 inline constexpr uint32_t kSharedConstantsBytes = kDescriptorIndexBytes + 32;
 
 inline constexpr uint32_t kVertexShaderConstantsBytes = 256 * 16;
@@ -110,6 +120,21 @@ struct PushConstants
 #define g_HalfPixelOffset          vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 648)
 #define g_AlphaThreshold           vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 656)
 #define g_AlphaFunc                vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 660)
+#define g_FetchTable               vk::RawBufferLoad<uint64_t>(g_PushConstants.SharedConstants + 664, 8)
+#define g_FetchVertexBase          vk::RawBufferLoad<uint>(g_FetchTable)
+
+// Vertex fetch by a computed index: element `index` of the decoded stream
+// bound to `location`, clamped to the stream. Xenos truncates the index
+// unless the fetch asks for rounding.
+float4 vfetchIndexed(uint location, float index, bool rounded)
+{
+    uint64_t entry = g_FetchTable + 16 + location * 16;
+    uint count = vk::RawBufferLoad<uint>(entry + 8);
+    if (count == 0)
+        return float4(0.0, 0.0, 0.0, 1.0);
+    float i = clamp(floor(rounded ? index + 0.5 : index), 0.0, float(count - 1));
+    return vk::RawBufferLoad<float4>(vk::RawBufferLoad<uint64_t>(entry, 8) + uint(i) * 16, 16);
+}
 
 [[vk::constant_id(0)]] const uint g_SpecConstants = 0;
 
@@ -130,6 +155,13 @@ struct PushConstants
     uint g_AlphaFunc : packoffset(c41.y);
 
 uint g_SpecConstants();
+
+// The fetch table is SPIR-V only.
+#define g_FetchVertexBase 0u
+float4 vfetchIndexed(uint location, float index, bool rounded)
+{
+    return float4(0.0, 0.0, 0.0, 1.0);
+}
 
 #endif
 
