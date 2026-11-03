@@ -2099,7 +2099,7 @@ struct Renderer::State {
           } else if (blend_motion) {
             float lerped[kVsFloats];
             snapped += interp::LerpMotion(prev.vs_constants.data() + size_t(pair) * kVsFloats, VsCpu(mid), lerped,
-                                          kVsFloats, mid.skinned, 0.5f, 1.0f);
+                                          kVsFloats, mid.motion, 0.5f, 0.6f);
             std::memcpy(upload_cpu + blended, lerped, sizeof(lerped));
             mid.vs_constants = blended;
             blended += kVsFloats * 4;
@@ -2345,7 +2345,7 @@ struct Renderer::State {
     uint64_t key_no_textures = 0;  // shaders, index range, count
     uint64_t key_shaders = 0;      // shaders and count
     uint32_t count = 0;
-    bool skinned = false;  // the vertex shader has g_aSkinMatrices
+    uint32_t motion = 0;  // interp::Motion blocks the vertex shader's constant table names
   };
   struct ClearOp {
     Target* target = nullptr;
@@ -3282,8 +3282,9 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
                                          draw.start, draw.count, nullptr, 0);
     op.key_shaders = interp::DrawKey(vs_key, ps_key, nullptr, 0, 0, 0, draw.count, nullptr, 0);
     op.count = draw.count;
-    op.skinned = vs_cache_entry != s.entries.end() &&
-                 (vs_cache_entry->second->specConstantsMask & SPEC_CONSTANT_SKIN_MATRICES) != 0;
+    op.motion = vs_cache_entry != s.entries.end()
+                    ? (vs_cache_entry->second->specConstantsMask >> SPEC_CONSTANT_MOTION_SHIFT) & 0x3F
+                    : 0;
   }
   s.ExecuteDraw(op);
   s.Record(op);

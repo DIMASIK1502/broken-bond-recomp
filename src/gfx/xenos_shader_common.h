@@ -31,9 +31,16 @@
 // vertex shader whose fetches take a computed index. Such a shader has no
 // vertex inputs and reads the fetch table (kSharedFetchTableOffset).
 #define SPEC_CONSTANT_INDEXED_FETCH     (1 << 8)
-// Not a specialization constant either: a vertex shader that skins by
-// g_aSkinMatrices in c42-c137 (frame interpolation blends those).
-#define SPEC_CONSTANT_SKIN_MATRICES     (1 << 9)
+// Not specialization constants either: a vertex shader whose constant table
+// names these registers (frame interpolation blends them). Bits 9-14 in
+// this order are interp::LerpMotion's `motion` mask.
+#define SPEC_CONSTANT_SKIN_MATRICES     (1 << 9)  // g_aSkinMatrices c42-c137
+#define SPEC_CONSTANT_WORLD_VIEW_PROJ   (1 << 10) // g_mWorldViewProj c0-c3
+#define SPEC_CONSTANT_WORLD_VIEW        (1 << 11) // g_mWorldView c4-c6
+#define SPEC_CONSTANT_INV_TRANS_WORLD   (1 << 12) // g_mInvTransWorld c8-c11
+#define SPEC_CONSTANT_WORLD             (1 << 13) // g_mWorld c12-c14
+#define SPEC_CONSTANT_VIEWER_POSITION   (1 << 14) // g_vViewerPosition c21
+#define SPEC_CONSTANT_MOTION_SHIFT      9
 
 // Descriptor kinds; index = kind * 32 + fetch slot.
 #define DESCRIPTOR_KIND_TEXTURE1D   0

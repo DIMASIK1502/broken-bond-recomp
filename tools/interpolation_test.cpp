@@ -32,21 +32,41 @@ uint64_t Key(uint64_t vs, uint32_t stream, uint32_t index_start, uint32_t textur
 int main() {
   const float nan = std::numeric_limits<float>::quiet_NaN();
 
-  // Only the motion registers blend, each matrix whole.
+  // Only the named motion registers blend, each matrix whole.
   {
-    std::vector<float> prev(256 * 4, 0.0f), cur(256 * 4, 0.0f), out(256 * 4);
-    for (size_t i = 0; i < cur.size(); ++i) cur[i] = 0.25f;
-    CHECK(interp::LerpMotion(prev.data(), cur.data(), out.data(), out.size(), false, 0.5f, 1.0f) == 0);
-    CHECK(out[0] == 0.125f && out[15] == 0.125f);           // c0-c3
-    CHECK(out[4 * 7] == 0.25f);                             // c7: not motion
-    CHECK(out[4 * 14 + 3] == 0.125f && out[4 * 16] == 0.25f);  // c14 / c16
-    CHECK(out[4 * 21] == 0.125f && out[4 * 42] == 0.25f);   // c21 / bones off
-    CHECK(interp::LerpMotion(prev.data(), cur.data(), out.data(), out.size(), true, 0.5f, 1.0f) == 0);
-    CHECK(out[4 * 42] == 0.125f && out[4 * 137 + 3] == 0.125f && out[4 * 138] == 0.25f);
+    std::vector<float> prev(256 * 4, 0.5f), cur(256 * 4, 0.25f), out(256 * 4);
+    const uint32_t all = interp::kWorldViewProj | interp::kWorldView | interp::kInvTransWorld | interp::kWorld |
+                         interp::kViewerPosition;
+    CHECK(interp::LerpMotion(prev.data(), cur.data(), out.data(), out.size(), all, 0.5f, 0.6f) == 0);
+    CHECK(out[0] == 0.375f && out[15] == 0.375f);              // c0-c3
+    CHECK(out[4 * 7] == 0.25f);                                // c7: not motion
+    CHECK(out[4 * 14 + 3] == 0.375f && out[4 * 16] == 0.25f);  // c14 / c16
+    CHECK(out[4 * 21] == 0.375f && out[4 * 42] == 0.25f);      // c21 / no bones
+    CHECK(interp::LerpMotion(prev.data(), cur.data(), out.data(), out.size(), all | interp::kSkinMatrices, 0.5f,
+                             0.6f) == 0);
+    CHECK(out[4 * 42] == 0.375f && out[4 * 137 + 3] == 0.375f && out[4 * 138] == 0.25f);
+    // A shader that names no motion registers keeps everything.
+    CHECK(interp::LerpMotion(prev.data(), cur.data(), out.data(), out.size(), 0, 0.5f, 0.6f) == 0);
+    CHECK(out[0] == 0.25f && out[4 * 21] == 0.25f);
+    // Only g_mWorldViewProj named: g_mWorld keeps cur.
+    CHECK(interp::LerpMotion(prev.data(), cur.data(), out.data(), out.size(), interp::kWorldViewProj, 0.5f, 0.6f) ==
+          0);
+    CHECK(out[0] == 0.375f && out[4 * 12] == 0.25f);
     // One element of g_mWorld jumps: the whole matrix takes cur.
     cur[4 * 13 + 1] = 5.0f;
-    CHECK(interp::LerpMotion(prev.data(), cur.data(), out.data(), out.size(), false, 0.5f, 1.0f) == 1);
-    CHECK(out[4 * 12] == 0.25f && out[4 * 13 + 1] == 5.0f && out[0] == 0.125f);
+    CHECK(interp::LerpMotion(prev.data(), cur.data(), out.data(), out.size(), all, 0.5f, 0.6f) == 1);
+    CHECK(out[4 * 12] == 0.25f && out[4 * 13 + 1] == 5.0f && out[0] == 0.375f);
+    // A 2D matrix whose small scale changes several times over is a cut.
+    const float scale_prev[16] = {0, 0, 0, 0.003f, 0, 0, 0, 0.075f, 0, 0, 1, 0, 0, 0, 0, 1};
+    float scale_cur[16] = {0, 0, 0, 0.0004f, 0, 0, 0, 0.0f, 0, 0, 1, 0, 0, 0, 0, 1};
+    float scale_out[16];
+    CHECK(interp::LerpMotion(scale_prev, scale_cur, scale_out, 16, interp::kWorldViewProj, 0.5f, 0.6f) == 1);
+    CHECK(scale_out[3] == 0.0004f);
+    // The same rows moving by a fifth of themselves blend.
+    scale_cur[3] = 0.0024f;
+    scale_cur[7] = 0.06f;
+    CHECK(interp::LerpMotion(scale_prev, scale_cur, scale_out, 16, interp::kWorldViewProj, 0.5f, 0.6f) == 0);
+    CHECK(std::fabs(scale_out[3] - 0.0027f) < 1e-6f);
   }
 
   // Pairs by key in order of appearance.

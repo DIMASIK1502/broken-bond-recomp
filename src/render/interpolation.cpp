@@ -142,24 +142,34 @@ size_t LerpFloatsSnap(const float* prev, const float* cur, float* out, size_t co
   return snapped;
 }
 
-size_t LerpMotion(const float* prev, const float* cur, float* out, size_t floats, bool skinned, float t, float jump) {
+size_t LerpMotion(const float* prev, const float* cur, float* out, size_t floats, uint32_t motion, float t,
+                  float jump) {
   std::copy(cur, cur + floats, out);
   size_t snapped = 0;
   auto block = [&](size_t first, size_t count) {
     const size_t begin = first * 4, size = count * 4;
     if (begin + size > floats) return;
-    if (Jumped(prev + begin, cur + begin, size, jump)) {
-      ++snapped;
-      return;
+    for (size_t row = begin; row < begin + size; row += 4) {
+      float moved = 0.0f, length_prev = 0.0f, length_cur = 0.0f;  // squared
+      for (size_t i = row; i < row + 4; ++i) {
+        if (!std::isfinite(prev[i]) || !std::isfinite(cur[i])) return;  // keeps cur
+        moved += (cur[i] - prev[i]) * (cur[i] - prev[i]);
+        length_prev += prev[i] * prev[i];
+        length_cur += cur[i] * cur[i];
+      }
+      if (moved > jump * jump * std::max(length_prev, length_cur)) {
+        ++snapped;
+        return;
+      }
     }
     LerpFloats(prev + begin, cur + begin, out + begin, size, t);
   };
-  block(0, 4);
-  block(4, 3);
-  block(8, 4);
-  block(12, 3);
-  block(21, 1);
-  if (skinned) {
+  if (motion & kWorldViewProj) block(0, 4);
+  if (motion & kWorldView) block(4, 3);
+  if (motion & kInvTransWorld) block(8, 4);
+  if (motion & kWorld) block(12, 3);
+  if (motion & kViewerPosition) block(21, 1);
+  if (motion & kSkinMatrices) {
     for (size_t bone = 0; bone < 32; ++bone) block(42 + bone * 3, 3);
   }
   return snapped;
