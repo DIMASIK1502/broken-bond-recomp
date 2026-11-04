@@ -131,6 +131,22 @@ index 50638d6..e0ba16f 100644
  
  namespace rex {
  namespace ui {
+diff --git a/src/audio/sdl/sdl_audio_driver.cpp b/src/audio/sdl/sdl_audio_driver.cpp
+index 20a2cd8..36cd710 100644
+--- a/src/audio/sdl/sdl_audio_driver.cpp
++++ b/src/audio/sdl/sdl_audio_driver.cpp
+@@ -75,7 +75,10 @@ bool SDLAudioDriver::Initialize() {
+ 
+   // A 1-channel device gets the stereo fold too, then SDL collapses to mono.
+   // Handing it a 6ch stream instead would use SDL's own downmix.
+-  if (obtained_spec.channels <= 2) {
++  // Android reports its default output as 6 channels and then plays only the
++  // front pair of a 5.1 stream, which drops the centre (voices, hits) and the
++  // rears. Phones are stereo, so they always get the fold.
++  if (obtained_spec.channels <= 2 || REX_PLATFORM_ANDROID) {
+     SDL_DestroyAudioStream(sdl_stream_);
+     sdl_stream_ = nullptr;
+     desired_spec.channels = 2;
 diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
 index 1ddafd0..42207ef 100644
 --- a/src/core/CMakeLists.txt
