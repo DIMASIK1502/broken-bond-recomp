@@ -34,7 +34,7 @@ index 8426798..d7d477e 100644
  
  }  // namespace rex::audio
 diff --git a/src/audio/xma_context.cpp b/src/audio/xma_context.cpp
-index 11b83be..bc485f3 100644
+index 11b83be..616eb55 100644
 --- a/src/audio/xma_context.cpp
 +++ b/src/audio/xma_context.cpp
 @@ -10,6 +10,7 @@
@@ -79,7 +79,7 @@ index 11b83be..bc485f3 100644
  }
  
  void XmaContext::Disable() {
-@@ -525,9 +544,94 @@ bool XmaContext::DecodePacket(AVCodecContext* av_context, const AVPacket* av_pac
+@@ -525,9 +544,101 @@ bool XmaContext::DecodePacket(AVCodecContext* av_context, const AVPacket* av_pac
    return true;
  }
  
@@ -162,8 +162,15 @@ index 11b83be..bc485f3 100644
 +    const uint64_t now_ms = XmaNowMs();
 +    if (now_ms - split_since_ms_ >= kSplitNudgeAfterMs &&
 +        (split_nudge_ms_ == 0 || now_ms - split_nudge_ms_ >= kSplitNudgeIntervalMs)) {
-+      REXAPU_WARN("XmaContext {}: split hold silence nudge after {} ms (size={} rel={})", id(),
-+                  now_ms - split_since_ms_, split_frame_size_, split_relative_offset_);
++      // A finished one-shot the title never frees stays held for minutes;
++      // only the first nudge of a hold is worth a warning.
++      if (split_nudge_ms_ == 0) {
++        REXAPU_WARN("XmaContext {}: split hold silence nudge after {} ms (size={} rel={})", id(),
++                    now_ms - split_since_ms_, split_frame_size_, split_relative_offset_);
++      } else {
++        REXAPU_DEBUG("XmaContext {}: split hold silence nudge after {} ms", id(),
++                     now_ms - split_since_ms_);
++      }
 +      raw_frame_.fill(0);
 +      current_frame_remaining_subframes_ = 4 << data->is_stereo;
 +      split_nudge_ms_ = now_ms;
@@ -174,7 +181,7 @@ index 11b83be..bc485f3 100644
    if (!data->IsAnyInputBufferValid()) {
      return;
    }
-@@ -640,7 +744,15 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+@@ -640,7 +751,15 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
        const uint8_t* next_packet =
            GetNextPacket(data, next_packet_index, current_input_packet_count);
        if (!next_packet) {

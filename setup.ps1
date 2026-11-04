@@ -75,6 +75,17 @@ if ($LASTEXITCODE -ne 0) {
     if ($LASTEXITCODE -ne 0) { throw "XenosRecomp patch failed" }
 }
 
+# Broken Bond changes to Plume: Vulkan 1.2 core features without extension
+# names (the Android emulator lists none of them).
+$plumeDir = Join-Path $root "thirdparty\plume"
+$plumePatch = Join-Path $root "patches\plume\broken-bond.patch"
+git -C $plumeDir apply --reverse --check --ignore-whitespace $plumePatch 2>&1 | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "Applying patches\plume\broken-bond.patch ..."
+    git -C $plumeDir apply --ignore-whitespace $plumePatch
+    if ($LASTEXITCODE -ne 0) { throw "Plume patch failed" }
+}
+
 $applySdkPatches = Join-Path $root "patches\apply_sdk_patches.ps1"
 if (Test-Path $applySdkPatches) {
     Write-Host "Applying local SDK patches ..."

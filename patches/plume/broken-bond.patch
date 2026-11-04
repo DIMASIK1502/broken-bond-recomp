@@ -1,0 +1,39 @@
+diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
+index 4fdc4bf..cedb5b4 100644
+--- a/plume_vulkan.cpp
++++ b/plume_vulkan.cpp
+@@ -3860,17 +3860,22 @@ namespace plume {
+         // Store properties.
+         vkGetPhysicalDeviceProperties(physicalDevice, &physicalDeviceProperties);
+ 
+-        // Check for supported features.
++        // Check for supported features. Descriptor indexing, scalar block
++        // layout and buffer device address are core in Vulkan 1.2, and some
++        // 1.2+ drivers (the Android emulator's gfxstream) do not list them
++        // as extensions; the instance asks for 1.2, so the feature structs
++        // are valid there without the extension names.
++        const bool vulkan12Core = physicalDeviceProperties.apiVersion >= VK_API_VERSION_1_2;
+         void *featuresChain = nullptr;
+         VkPhysicalDeviceDescriptorIndexingFeatures indexingFeatures = {};
+-        const bool descriptorIndexingFound = supportedOptionalExtensions.find(VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME) != supportedOptionalExtensions.end();
++        const bool descriptorIndexingFound = vulkan12Core || supportedOptionalExtensions.find(VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME) != supportedOptionalExtensions.end();
+         if (descriptorIndexingFound) {
+             indexingFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES;
+             featuresChain = &indexingFeatures;
+         }
+ 
+         VkPhysicalDeviceScalarBlockLayoutFeatures layoutFeatures = {};
+-        const bool scalarBlockLayoutFound = supportedOptionalExtensions.find(VK_EXT_SCALAR_BLOCK_LAYOUT_EXTENSION_NAME) != supportedOptionalExtensions.end();
++        const bool scalarBlockLayoutFound = vulkan12Core || supportedOptionalExtensions.find(VK_EXT_SCALAR_BLOCK_LAYOUT_EXTENSION_NAME) != supportedOptionalExtensions.end();
+         if (scalarBlockLayoutFound) {
+             layoutFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES;
+             layoutFeatures.pNext = featuresChain;
+@@ -3899,7 +3904,7 @@ namespace plume {
+         }
+ 
+         VkPhysicalDeviceBufferDeviceAddressFeatures bufferDeviceAddressFeatures = {};
+-        const bool bufferDeviceAddressFound = supportedOptionalExtensions.find(VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME) != supportedOptionalExtensions.end();
++        const bool bufferDeviceAddressFound = vulkan12Core || supportedOptionalExtensions.find(VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME) != supportedOptionalExtensions.end();
+         if (bufferDeviceAddressFound) {
+             bufferDeviceAddressFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
+             bufferDeviceAddressFeatures.pNext = featuresChain;
