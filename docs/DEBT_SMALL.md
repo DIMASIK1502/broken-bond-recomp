@@ -9,7 +9,7 @@
 - `NvOptimusEnablement` и `AmdPowerXpressRequestHighPerformance` экспортирует
   `rexglue-sdk` (`graphics_system.cpp`). Отдельный экспорт в title не нужен.
 - ROV (`render_target_path_d3d12=rov`) — наш фикс чёрного боя, не их.
-- XMA drained EOS — наш фикс JP-озвучки.
+- XMA split-frame hold (`patches/sdk/rexglue-sdk-v0.10.0.patch`) — наш фикс JP-озвучки.
 - Захват клавиш в лаунчере по нажатию.
 - Пресеты разрешения 1×–5× с подсказкой под монитор.
 

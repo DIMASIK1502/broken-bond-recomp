@@ -893,3 +893,17 @@ Z = 12, it returns the previous 4 slices. For every block it stayed at or
 below that block's address, and for every tile it stayed at or below the
 lowest address in the tile. This is still not `src/gfx/`.
 
+
+## JP coffin hang came back (SDK re-clone)
+
+`thirdparty/rexglue-sdk` was re-cloned at the public `v0.10.0` tag on
+2026-10-26. `rexglue-sdk-v0.10.0.patch` did not apply to it (it sat on the old
+starve-EOS layer) and was optional, so `setup.ps1` skipped it. The build ran
+stock XMA: the spanning last frame set `error_status=4` and the Hokage-coffin
+line hung on Japanese again (`D:\native.log`, 2026-11-04: present 30 Hz,
+music on, no XMA lines).
+
+The split-frame hold is ported onto stock `v0.10.0` without the starve layer
+and the patch is now required. A nudge waits until a running silence frame is
+played before stitching. Title run: one nudge per held one-shot sound, no
+flood.
