@@ -138,6 +138,13 @@ namespace xenos = rex::graphics::xenos;
 using broken_bond::gfx::DeclUsage;
 
 constexpr plume::RenderFormat kColorFormat = plume::RenderFormat::B8G8R8A8_UNORM;
+// Only the present pass writes the swap chain. Android surfaces offer RGBA8
+// (BGRA8 rarely), so there the swap chain differs from the targets.
+#if defined(__ANDROID__)
+constexpr plume::RenderFormat kSwapChainFormat = plume::RenderFormat::R8G8B8A8_UNORM;
+#else
+constexpr plume::RenderFormat kSwapChainFormat = kColorFormat;
+#endif
 constexpr plume::RenderFormat kDepthFormat = plume::RenderFormat::D32_FLOAT_S8_UINT;
 // What a guest depth resolve becomes on the host: the depth value itself.
 constexpr plume::RenderFormat kDepthCopyFormat = plume::RenderFormat::R32_FLOAT;
@@ -974,7 +981,7 @@ struct Renderer::State {
     desc.primitiveTopology = plume::RenderPrimitiveTopology::TRIANGLE_LIST;
     desc.cullMode = plume::RenderCullMode::NONE;
     desc.renderTargetCount = 1;
-    desc.renderTargetFormat[0] = kColorFormat;
+    desc.renderTargetFormat[0] = kSwapChainFormat;
     desc.renderTargetBlend[0] = plume::RenderBlendDesc::Copy();
     present_pipeline = device->createGraphicsPipeline(desc);
   }
@@ -2522,6 +2529,10 @@ const std::string& Renderer::device_name() const { return state_->device_name; }
 bool Renderer::Open(void* native_window, std::string& reason) {
   State& s = *state_;
   s.render_interface = plume::CreateVulkanInterface();
+  if (!native_window) {
+    reason = "the game window has no native handle yet";
+    return false;
+  }
   if (!s.render_interface) {
     reason = "no Vulkan interface";
     return false;
@@ -2551,7 +2562,7 @@ bool Renderer::Open(void* native_window, std::string& reason) {
     s.acquire_other = s.device->createCommandSemaphore();
   }
   s.swap_chain = s.queue->createSwapChain(plume::RenderSwapChainDesc(
-      static_cast<plume::RenderWindow>(native_window), kColorFormat,
+      static_cast<plume::RenderWindow>(native_window), kSwapChainFormat,
       REXCVAR_GET(native_interpolate)
           ? kInterpolationSwapChainBuffersPerFrame * s.frames_in_flight + kInterpolationSwapChainBuffersExtra
           : kSwapChainBuffers));
