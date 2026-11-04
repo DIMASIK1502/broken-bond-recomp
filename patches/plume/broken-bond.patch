@@ -1,5 +1,5 @@
 diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
-index 4fdc4bf..cedb5b4 100644
+index 4fdc4bf..8ecc556 100644
 --- a/plume_vulkan.cpp
 +++ b/plume_vulkan.cpp
 @@ -3860,17 +3860,22 @@ namespace plume {
@@ -37,3 +37,30 @@ index 4fdc4bf..cedb5b4 100644
          if (bufferDeviceAddressFound) {
              bufferDeviceAddressFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
              bufferDeviceAddressFeatures.pNext = featuresChain;
+@@ -4092,6 +4097,14 @@ namespace plume {
+             }
+         }
+ 
++        // A Vulkan 1.1 device (Adreno 6xx's stock driver) has buffer device
++        // address only as VK_KHR_buffer_device_address: the core name
++        // resolves to nothing there, so calls go through the KHR entry.
++        if (!vulkan12Core && bufferDeviceAddressSupported) {
++            vkGetBufferDeviceAddress = reinterpret_cast<PFN_vkGetBufferDeviceAddress>(
++                vkGetDeviceProcAddr(vk, "vkGetBufferDeviceAddressKHR"));
++        }
++
+         VmaVulkanFunctions vmaFunctions = {};
+         vmaFunctions.vkGetInstanceProcAddr = vkGetInstanceProcAddr;
+         vmaFunctions.vkGetDeviceProcAddr = vkGetDeviceProcAddr;
+@@ -4119,7 +4132,10 @@ namespace plume {
+         allocatorInfo.device = vk;
+         allocatorInfo.pVulkanFunctions = &vmaFunctions;
+         allocatorInfo.instance = renderInterface->instance;
+-        allocatorInfo.vulkanApiVersion = renderInterface->appInfo.apiVersion;
++        // VMA must not assume a newer API than the device has (1.1 drivers
++        // lack the 1.2 entry points it would load).
++        allocatorInfo.vulkanApiVersion = std::min(renderInterface->appInfo.apiVersion,
++            VK_MAKE_API_VERSION(0, VK_API_VERSION_MAJOR(physicalDeviceProperties.apiVersion), VK_API_VERSION_MINOR(physicalDeviceProperties.apiVersion), 0));
+ 
+         res = vmaCreateAllocator(&allocatorInfo, &allocator);
+         if (res != VK_SUCCESS) {
