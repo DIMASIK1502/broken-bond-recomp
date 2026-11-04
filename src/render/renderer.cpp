@@ -1433,16 +1433,20 @@ struct Renderer::State {
       const bool boundless = i != 4;
       set_descs[i] = plume::RenderDescriptorSetDesc(&ranges[i], 1, boundless,
                                                     boundless ? ranges[i].count : 0);
+      std::fprintf(stderr, "native open: descriptor set %u (%u)\n", i, ranges[i].count);
       sets[i] = device->createDescriptorSet(set_descs[i]);
       if (!sets[i]) return false;
     }
+    std::fputs("native open: pipeline layout object\n", stderr);
     const plume::RenderPushConstantRange push(0, 0, 0, 24,
                                               plume::RenderShaderStageFlag::VERTEX |
                                                   plume::RenderShaderStageFlag::PIXEL);
     plume::RenderPipelineLayoutDesc desc(&push, 1, set_descs, 6, false, true);
     layout = device->createPipelineLayout(desc);
     if (layout) {
+      std::fputs("native open: present pipeline\n", stderr);
       CreatePresentPipeline();
+      std::fputs("native open: depth resolve pipeline\n", stderr);
       CreateDepthResolvePipeline();
     }
     return layout != nullptr;
