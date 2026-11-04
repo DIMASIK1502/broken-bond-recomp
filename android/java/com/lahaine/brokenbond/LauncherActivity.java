@@ -4,6 +4,7 @@ import android.app.Activity;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
 import android.provider.DocumentsContract;
@@ -20,17 +21,32 @@ import android.widget.Spinner;
 import android.widget.TextView;
 
 import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
+
+import org.json.JSONObject;
 
 // First screen: all-files access, then the folder that holds default.xex.
 // The game reads that folder in place; nothing is copied.
 public class LauncherActivity extends Activity {
     private static final int PICK_FOLDER = 1;
+    private static final int PICK_DRIVER = 2;
     static final String PREFS = "launcher";
     private static final String KEY_GAME_DIR = "game_dir";
     // Renderer settings, passed to the game as cvars by GameActivity.
     static final String KEY_SCALE = "native_resolution_scale";
     static final String KEY_MSAA = "native_msaa";
     static final String KEY_INTERPOLATE = "native_interpolate";
+    // A custom Vulkan driver (AdrenoTools package, e.g. Turnip): the .so path
+    // inside the private folder, and a name to show.
+    static final String KEY_DRIVER = "vulkan_driver";
+    static final String KEY_DRIVER_NAME = "vulkan_driver_name";
     static final String DEFAULT_SCALE = "1";
     static final String DEFAULT_MSAA = "2";
 
@@ -44,6 +60,7 @@ public class LauncherActivity extends Activity {
     private Button access;
     private Button pick;
     private Button play;
+    private TextView driver;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -94,6 +111,34 @@ public class LauncherActivity extends Activity {
         interpolate.setOnCheckedChangeListener(
                 (button, checked) -> prefs().edit().putBoolean(KEY_INTERPOLATE, checked).apply());
         layout.addView(interpolate);
+
+        // libadrenotools is arm64 only (Snapdragon phones).
+        if (Build.SUPPORTED_ABIS.length > 0 && Build.SUPPORTED_ABIS[0].startsWith("arm64")) {
+            TextView driverTitle = new TextView(this);
+            driverTitle.setText("Драйвер Vulkan");
+            driverTitle.setTextSize(18);
+            driverTitle.setPadding(0, pad, 0, 0);
+            layout.addView(driverTitle);
+            driver = new TextView(this);
+            layout.addView(driver);
+            Button pickDriver = new Button(this);
+            pickDriver.setText("Выбрать драйвер (.zip, AdrenoTools / Turnip)");
+            pickDriver.setOnClickListener(v -> {
+                Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                intent.addCategory(Intent.CATEGORY_OPENABLE);
+                intent.setType("*/*");
+                startActivityForResult(intent, PICK_DRIVER);
+            });
+            layout.addView(pickDriver);
+            Button systemDriver = new Button(this);
+            systemDriver.setText("Системный драйвер");
+            systemDriver.setOnClickListener(v -> {
+                deleteTree(driverDir());
+                prefs().edit().remove(KEY_DRIVER).remove(KEY_DRIVER_NAME).apply();
+                refresh();
+            });
+            layout.addView(systemDriver);
+        }
 
         ScrollView scroll = new ScrollView(this);
         scroll.addView(layout);
@@ -152,6 +197,10 @@ public class LauncherActivity extends Activity {
         access.setVisibility(granted ? Button.GONE : Button.VISIBLE);
         pick.setEnabled(granted);
         play.setEnabled(granted && hasGame(dir));
+        if (driver != null) {
+            String name = prefs().getString(KEY_DRIVER_NAME, "");
+            driver.setText(name.isEmpty() ? "Сейчас: системный" : "Сейчас: " + name);
+        }
         if (!granted) {
             status.setText("Нужен доступ ко всем файлам, чтобы читать папку с игрой.");
         } else if (dir.isEmpty()) {
@@ -166,12 +215,76 @@ public class LauncherActivity extends Activity {
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == PICK_DRIVER && resultCode == RESULT_OK && data != null) {
+            installDriver(data.getData());
+            refresh();
+            return;
+        }
         if (requestCode != PICK_FOLDER || resultCode != RESULT_OK || data == null) return;
         String dir = treeUriToPath(data.getData());
         if (dir != null) {
             getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString(KEY_GAME_DIR, dir).apply();
         }
         refresh();
+    }
+
+    // The driver lives in the private files folder: the linker refuses .so
+    // files on shared storage.
+    private File driverDir() {
+        return new File(getFilesDir(), "driver");
+    }
+
+    private static void deleteTree(File file) {
+        File[] children = file.listFiles();
+        if (children != null) {
+            for (File child : children) deleteTree(child);
+        }
+        file.delete();
+    }
+
+    // Unpacks an AdrenoTools driver zip. meta.json names the library
+    // ("libraryName") and its version; without it the first .so is taken.
+    private void installDriver(Uri uri) {
+        File dir = driverDir();
+        deleteTree(dir);
+        dir.mkdirs();
+        String library = null;
+        try (InputStream in = getContentResolver().openInputStream(uri);
+             ZipInputStream zip = new ZipInputStream(in)) {
+            byte[] buffer = new byte[1 << 16];
+            for (ZipEntry entry; (entry = zip.getNextEntry()) != null; ) {
+                File out = new File(dir, entry.getName());
+                if (!out.getCanonicalPath().startsWith(dir.getCanonicalPath() + File.separator)) continue;
+                if (entry.isDirectory()) {
+                    out.mkdirs();
+                    continue;
+                }
+                out.getParentFile().mkdirs();
+                try (OutputStream os = new FileOutputStream(out)) {
+                    for (int n; (n = zip.read(buffer)) > 0; ) os.write(buffer, 0, n);
+                }
+                if (library == null && out.getName().endsWith(".so")) library = out.getName();
+            }
+            String name = library;
+            File meta = new File(dir, "meta.json");
+            if (meta.isFile()) {
+                JSONObject json = new JSONObject(
+                        new String(Files.readAllBytes(meta.toPath()), StandardCharsets.UTF_8));
+                library = json.optString("libraryName", library);
+                name = json.optString("name", library) + " " + json.optString("driverVersion", "");
+            }
+            if (library == null || !new File(dir, library).isFile()) {
+                throw new IOException("в архиве нет .so драйвера");
+            }
+            prefs().edit()
+                    .putString(KEY_DRIVER, new File(dir, library).getPath())
+                    .putString(KEY_DRIVER_NAME, name.trim())
+                    .apply();
+        } catch (Exception e) {
+            deleteTree(dir);
+            prefs().edit().remove(KEY_DRIVER).remove(KEY_DRIVER_NAME).apply();
+            status.setText("Драйвер не установлен: " + e.getMessage());
+        }
     }
 
     // A tree URI of the external storage provider names "<volume>:<path>".

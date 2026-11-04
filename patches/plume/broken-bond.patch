@@ -1,8 +1,8 @@
 diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
-index 4fdc4bf..6563068 100644
+index 4fdc4bf..2ac7ddc 100644
 --- a/plume_vulkan.cpp
 +++ b/plume_vulkan.cpp
-@@ -27,6 +27,14 @@
+@@ -27,7 +27,19 @@
  // TODO:
  // - Fix resource pools.
  
@@ -15,9 +15,14 @@ index 4fdc4bf..6563068 100644
 +#endif
 +
  namespace plume {
++    // A driver loaded by the app (Turnip through libadrenotools on Android)
++    // instead of the system libvulkan. Set before CreateVulkanInterface.
++    static PFN_vkGetInstanceProcAddr customGetInstanceProcAddr = nullptr;
++
      // Backend constants.
  
-@@ -1196,8 +1204,12 @@ namespace plume {
+     // Required buffer alignment for acceleration structures.
+@@ -1196,8 +1208,12 @@ namespace plume {
          thread_local std::vector<VkDescriptorBindingFlags> bindingFlags;
          VkDescriptorSetLayoutBindingFlagsCreateInfo flagsInfo = {};
          if (descriptorSetDesc.lastRangeIsBoundless && (descriptorSetDesc.descriptorRangesCount > 0)) {
@@ -31,7 +36,7 @@ index 4fdc4bf..6563068 100644
              bindingFlags[descriptorSetDesc.descriptorRangesCount - 1] = VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT | VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT;
  
              flagsInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO;
-@@ -3860,17 +3872,22 @@ namespace plume {
+@@ -3860,17 +3876,22 @@ namespace plume {
          // Store properties.
          vkGetPhysicalDeviceProperties(physicalDevice, &physicalDeviceProperties);
  
@@ -57,7 +62,7 @@ index 4fdc4bf..6563068 100644
          if (scalarBlockLayoutFound) {
              layoutFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES;
              layoutFeatures.pNext = featuresChain;
-@@ -3899,7 +3916,7 @@ namespace plume {
+@@ -3899,7 +3920,7 @@ namespace plume {
          }
  
          VkPhysicalDeviceBufferDeviceAddressFeatures bufferDeviceAddressFeatures = {};
@@ -66,7 +71,7 @@ index 4fdc4bf..6563068 100644
          if (bufferDeviceAddressFound) {
              bufferDeviceAddressFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
              bufferDeviceAddressFeatures.pNext = featuresChain;
-@@ -3930,6 +3947,7 @@ namespace plume {
+@@ -3930,6 +3951,7 @@ namespace plume {
          VkPhysicalDeviceFeatures2 deviceFeatures = {};
          deviceFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
          deviceFeatures.pNext = featuresChain;
@@ -74,7 +79,7 @@ index 4fdc4bf..6563068 100644
          vkGetPhysicalDeviceFeatures2(physicalDevice, &deviceFeatures);
  
          // Check for properties.
-@@ -4080,6 +4098,7 @@ namespace plume {
+@@ -4080,6 +4102,7 @@ namespace plume {
          createInfo.enabledExtensionCount = uint32_t(enabledExtensions.size());
          createInfo.pEnabledFeatures = &deviceFeatures.features;
  
@@ -82,7 +87,7 @@ index 4fdc4bf..6563068 100644
          VkResult res = vkCreateDevice(physicalDevice, &createInfo, nullptr, &vk);
          if (res != VK_SUCCESS) {
              fprintf(stderr, "vkCreateDevice failed with error code 0x%X.\n", res);
-@@ -4092,6 +4111,14 @@ namespace plume {
+@@ -4092,6 +4115,14 @@ namespace plume {
              }
          }
  
@@ -97,7 +102,7 @@ index 4fdc4bf..6563068 100644
          VmaVulkanFunctions vmaFunctions = {};
          vmaFunctions.vkGetInstanceProcAddr = vkGetInstanceProcAddr;
          vmaFunctions.vkGetDeviceProcAddr = vkGetDeviceProcAddr;
-@@ -4119,8 +4146,12 @@ namespace plume {
+@@ -4119,8 +4150,12 @@ namespace plume {
          allocatorInfo.device = vk;
          allocatorInfo.pVulkanFunctions = &vmaFunctions;
          allocatorInfo.instance = renderInterface->instance;
@@ -111,15 +116,23 @@ index 4fdc4bf..6563068 100644
          res = vmaCreateAllocator(&allocatorInfo, &allocator);
          if (res != VK_SUCCESS) {
              fprintf(stderr, "vmaCreateAllocator failed with error code 0x%X.\n", res);
-@@ -4495,6 +4526,7 @@ namespace plume {
+@@ -4495,7 +4530,14 @@ namespace plume {
  #else
      VulkanInterface::VulkanInterface() {
  #endif
+-        VkResult res = volkInitialize();
 +        PLUME_STEP("instance: volk");
-         VkResult res = volkInitialize();
++        VkResult res = VK_SUCCESS;
++        if (customGetInstanceProcAddr != nullptr) {
++            volkInitializeCustom(customGetInstanceProcAddr);
++        }
++        else {
++            res = volkInitialize();
++        }
          if (res != VK_SUCCESS) {
              fprintf(stderr, "volkInitialize failed with error code 0x%X.\n", res);
-@@ -4614,6 +4646,7 @@ namespace plume {
+             return;
+@@ -4614,6 +4656,7 @@ namespace plume {
          }
  #   endif
          
@@ -127,7 +140,7 @@ index 4fdc4bf..6563068 100644
          res = vkCreateInstance(&createInfo, nullptr, &instance);
          if (res != VK_SUCCESS) {
              fprintf(stderr, "vkCreateInstance failed with error code 0x%X.\n", res);
-@@ -4627,6 +4660,7 @@ namespace plume {
+@@ -4627,6 +4670,7 @@ namespace plume {
  
          // Fill device names.
          uint32_t deviceCount = 0;
@@ -135,3 +148,14 @@ index 4fdc4bf..6563068 100644
          vkEnumeratePhysicalDevices(instance, &deviceCount, nullptr);
          if (deviceCount > 0) {
              std::vector<VkPhysicalDevice> physicalDevices(deviceCount);
+@@ -4666,6 +4710,10 @@ namespace plume {
+         return instance != nullptr;
+     }
+ 
++    void SetVulkanGetInstanceProcAddr(void *getInstanceProcAddr) {
++        customGetInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(getInstanceProcAddr);
++    }
++
+     // Global creation function.
+ 
+ #if defined(PLUME_SDL2_VULKAN_ENABLED)

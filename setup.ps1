@@ -44,12 +44,17 @@ foreach ($link in $links) {
     if (Test-Path $target -PathType Leaf) { Copy-Item $target $linkPath -Force }
 }
 
-# Host renderer dependencies, both MIT. Pinned by commit; neither has release tags.
+# Host renderer dependencies (MIT, and BSD-2 for libadrenotools). Pinned by
+# commit; none has release tags.
 $hostDeps = @(
     @{ Name = "plume"; Url = "https://github.com/renderbag/plume.git";
        Commit = "0ce184b19270e49236afbb74052a6b267494b86b" },
     @{ Name = "xenosrecomp"; Url = "https://github.com/hedge-dev/XenosRecomp.git";
-       Commit = "990d03b28a27b50277ee5d8d942e1c5f873869d1" }
+       Commit = "990d03b28a27b50277ee5d8d942e1c5f873869d1" },
+    # Android arm64 only (BSD-2-Clause): loads a custom Vulkan driver such as
+    # Turnip into the app on Snapdragon phones.
+    @{ Name = "libadrenotools"; Url = "https://github.com/bylaws/libadrenotools.git";
+       Commit = "8fae8ce254dfc1344527e05301e43f37dea2df80" }
 )
 foreach ($dep in $hostDeps) {
     $depDir = Join-Path $root "thirdparty\$($dep.Name)"

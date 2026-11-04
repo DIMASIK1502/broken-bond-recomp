@@ -66,6 +66,9 @@ def main():
     # Native libraries, stripped. The unstripped ones stay in the build tree
     # for symbolizing tombstones.
     libs = [build / "libmain.so", build / "librexgpu-hostrd.so"]
+    # libadrenotools' hooks (arm64 builds only).
+    libs += [build / f"lib{hook}.so" for hook in ("main_hook", "file_redirect_hook", "gsl_alloc_hook", "hook_impl")
+             if (build / f"lib{hook}.so").is_file()]
     sdk_out = ROOT / "thirdparty/rexglue-sdk/out" / f"android-{args.abi}"
     libs += [sdk_out / "librexruntimerd.so", sdk_out / "libTracyClientrd.so"]
     strip = NDK / "toolchains/llvm/prebuilt/windows-x86_64/bin" / f"llvm-strip{EXE}"

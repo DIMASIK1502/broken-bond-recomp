@@ -1,6 +1,9 @@
 package com.lahaine.brokenbond;
 
 import java.io.File;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
 
 import android.content.SharedPreferences;
 
@@ -26,7 +29,7 @@ public class GameActivity extends SDLActivity {
         File logs = new File(user, "logs");
         logs.mkdirs();
         SharedPreferences prefs = getSharedPreferences(LauncherActivity.PREFS, MODE_PRIVATE);
-        return new String[] {
+        List<String> args = new ArrayList<>(Arrays.asList(
             "--game_data_root=" + (gameDir != null ? gameDir : ""),
             "--user_data_root=" + user.getPath(),
             "--gpu_plugin=host",
@@ -36,7 +39,14 @@ public class GameActivity extends SDLActivity {
             "--native_resolution_scale="
                     + prefs.getString(LauncherActivity.KEY_SCALE, LauncherActivity.DEFAULT_SCALE),
             "--native_msaa=" + prefs.getString(LauncherActivity.KEY_MSAA, LauncherActivity.DEFAULT_MSAA),
-            "--native_interpolate=" + prefs.getBoolean(LauncherActivity.KEY_INTERPOLATE, false),
-        };
+            "--native_interpolate=" + prefs.getBoolean(LauncherActivity.KEY_INTERPOLATE, false)));
+        // A custom Vulkan driver (Turnip) from the launcher, loaded by
+        // libadrenotools with its hooks from the native library folder.
+        String driver = prefs.getString(LauncherActivity.KEY_DRIVER, "");
+        if (!driver.isEmpty() && new File(driver).isFile()) {
+            args.add("--android_vulkan_driver=" + driver);
+            args.add("--android_native_lib_dir=" + getApplicationInfo().nativeLibraryDir);
+        }
+        return args.toArray(new String[0]);
     }
 }

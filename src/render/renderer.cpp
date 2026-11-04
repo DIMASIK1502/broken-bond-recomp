@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -45,8 +46,15 @@ extern "C" __declspec(dllimport) short __stdcall GetAsyncKeyState(int key);
 #include "present_vs.h"
 #include "host/shadow_draw.h"
 
+#if defined(BROKEN_BOND_HAS_ADRENOTOOLS)
+#include <dlfcn.h>
+
+#include <adrenotools/driver.h>
+#endif
+
 namespace plume {
 std::unique_ptr<RenderInterface> CreateVulkanInterface();
+void SetVulkanGetInstanceProcAddr(void* getInstanceProcAddr);
 }
 
 REXCVAR_DEFINE_INT32(native_dump_frame, 0, "Game",
@@ -56,6 +64,13 @@ REXCVAR_DEFINE_INT32(native_dump_frame, 0, "Game",
 REXCVAR_DEFINE_BOOL(native_decl_swizzle, true, "Game",
                     "With renderer=native, apply the vertex declaration swizzle (D3DCOLOR is zyxw) "
                     "while gathering streams")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_STRING(android_vulkan_driver, "", "Game",
+                      "Android arm64: a custom Vulkan driver (the .so of an AdrenoTools package such as Turnip, "
+                      "in the app's private folder) loaded through libadrenotools; empty uses the system driver")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_STRING(android_native_lib_dir, "", "Game",
+                      "Android: the app's native library folder, which holds libadrenotools' hook libraries")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_DOUBLE(native_resolution_scale, 0.0, "Game",
                       "With renderer=native, the internal resolution as a multiple of the game's 1280x720 "
@@ -2547,6 +2562,26 @@ bool Renderer::Open(void* native_window, std::string& reason) {
   // Each step goes to stderr unbuffered before it runs: a driver that
   // crashes the process (the phone) leaves the last one in stderr.txt.
   auto step = [](const char* what) { std::fprintf(stderr, "native open: %s\n", what); };
+#if defined(BROKEN_BOND_HAS_ADRENOTOOLS)
+  // Adreno 6xx's stock driver lacks shaderInt64 and BC textures; Turnip has
+  // both. libadrenotools loads it into this process from the private folder.
+  if (const std::string driver = REXCVAR_GET(android_vulkan_driver); !driver.empty()) {
+    step("custom vulkan driver");
+    const std::filesystem::path path(driver);
+    const std::string driver_dir = path.parent_path().string() + "/";
+    const std::string hook_dir = REXCVAR_GET(android_native_lib_dir) + "/";
+    void* vulkan = adrenotools_open_libvulkan(RTLD_NOW, ADRENOTOOLS_DRIVER_CUSTOM, nullptr, hook_dir.c_str(),
+                                              driver_dir.c_str(), path.filename().c_str(), nullptr, nullptr);
+    void* get_instance_proc_addr = vulkan ? dlsym(vulkan, "vkGetInstanceProcAddr") : nullptr;
+    if (get_instance_proc_addr) {
+      plume::SetVulkanGetInstanceProcAddr(get_instance_proc_addr);
+      REXLOG_INFO("native: custom Vulkan driver {}", driver);
+    } else {
+      REXLOG_ERROR("native: custom Vulkan driver {} did not load ({}); using the system one", driver,
+                   vulkan ? "no vkGetInstanceProcAddr" : "adrenotools_open_libvulkan failed");
+    }
+  }
+#endif
   step("vulkan interface");
   s.render_interface = plume::CreateVulkanInterface();
   if (!native_window) {

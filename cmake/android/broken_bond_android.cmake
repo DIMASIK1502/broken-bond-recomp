@@ -157,3 +157,16 @@ target_include_directories(rexgpu-host PRIVATE "${REXSDK_DIR}/thirdparty/renderd
 target_compile_options(rexgpu-host PRIVATE -Wno-unused-variable)
 target_link_libraries(rexgpu-host PRIVATE rex::runtime xxHash::xxhash)
 add_dependencies(main rexgpu-host)
+
+# libadrenotools (arm64 only): loads a custom Vulkan driver such as Turnip.
+# Its hook libraries are loaded by path from the APK's native library folder,
+# so they are built next to libmain.so for build_apk.py to pack.
+set(_adrenotools "${_root}/thirdparty/libadrenotools")
+if(ANDROID_ABI STREQUAL "arm64-v8a" AND EXISTS "${_adrenotools}/CMakeLists.txt")
+    add_subdirectory("${_adrenotools}" "${CMAKE_BINARY_DIR}/adrenotools" EXCLUDE_FROM_ALL)
+    set(_hooks main_hook file_redirect_hook gsl_alloc_hook hook_impl)
+    set_target_properties(${_hooks} PROPERTIES LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+    target_link_libraries(main PRIVATE adrenotools)
+    target_compile_definitions(main PRIVATE BROKEN_BOND_HAS_ADRENOTOOLS)
+    add_dependencies(main ${_hooks})
+endif()
