@@ -4,13 +4,16 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <filesystem>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <ranges>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -92,6 +95,10 @@ REXCVAR_DEFINE_BOOL(native_interpolate_debug, false, "Game",
 REXCVAR_DEFINE_INT32(native_interpolate_dump, 0, "Game",
                      "With native_interpolate, save this many pairs of a real frame and its in-between frame, one "
                      "pair every 900 frames, as logs/interp-N-{real,mid}.rgba (half size, BGRA)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(native_record_thread, false, "Game",
+                    "With renderer=native, record Vulkan commands on a second thread: the game thread keeps "
+                    "reading its memory and queues each draw's commands (a phone's fight frame is bound by them)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_INT32(native_frames_in_flight, 2, "Game",
                      "With renderer=native, frames the GPU may still be drawing while the next is recorded: 2 lets "
@@ -1142,10 +1149,11 @@ struct Renderer::State {
                    : plume::RenderTextureDesc::ColorTarget(image.width, image.height, kColorFormat, multisampling));
       image.msaa_samples = samples;
       image.msaa_newer = false;
-      commands->barriers(plume::RenderBarrierStage::GRAPHICS,
-                         plume::RenderTextureBarrier(image.msaa.get(), is_depth
-                                                                           ? plume::RenderTextureLayout::DEPTH_WRITE
-                                                                           : plume::RenderTextureLayout::COLOR_WRITE));
+      Rec([this, msaa = image.msaa.get(), is_depth] {
+        commands->barriers(plume::RenderBarrierStage::GRAPHICS,
+                           plume::RenderTextureBarrier(msaa, is_depth ? plume::RenderTextureLayout::DEPTH_WRITE
+                                                                      : plume::RenderTextureLayout::COLOR_WRITE));
+      });
       fresh = true;
     }
     return fresh;
@@ -1154,15 +1162,17 @@ struct Renderer::State {
   // Writes the multisampled twin's pixels into the single-sample texture.
   void ResolveMsaa(Image& image) {
     if (!image.msaa_newer || !image.msaa) return;
-    plume::RenderTextureBarrier to_resolve[] = {
-        plume::RenderTextureBarrier(image.msaa.get(), plume::RenderTextureLayout::RESOLVE_SOURCE),
-        plume::RenderTextureBarrier(image.texture.get(), plume::RenderTextureLayout::RESOLVE_DEST)};
-    commands->barriers(plume::RenderBarrierStage::COPY, to_resolve, 2);
-    commands->resolveTexture(image.texture.get(), image.msaa.get());
-    plume::RenderTextureBarrier back[] = {
-        plume::RenderTextureBarrier(image.msaa.get(), plume::RenderTextureLayout::COLOR_WRITE),
-        plume::RenderTextureBarrier(image.texture.get(), plume::RenderTextureLayout::COLOR_WRITE)};
-    commands->barriers(plume::RenderBarrierStage::GRAPHICS, back, 2);
+    Rec([this, msaa = image.msaa.get(), texture = image.texture.get()] {
+      plume::RenderTextureBarrier to_resolve[] = {
+          plume::RenderTextureBarrier(msaa, plume::RenderTextureLayout::RESOLVE_SOURCE),
+          plume::RenderTextureBarrier(texture, plume::RenderTextureLayout::RESOLVE_DEST)};
+      commands->barriers(plume::RenderBarrierStage::COPY, to_resolve, 2);
+      commands->resolveTexture(texture, msaa);
+      plume::RenderTextureBarrier back[] = {
+          plume::RenderTextureBarrier(msaa, plume::RenderTextureLayout::COLOR_WRITE),
+          plume::RenderTextureBarrier(texture, plume::RenderTextureLayout::COLOR_WRITE)};
+      commands->barriers(plume::RenderBarrierStage::GRAPHICS, back, 2);
+    });
     image.msaa_newer = false;
     ++msaa_resolves;
   }
@@ -1182,10 +1192,11 @@ struct Renderer::State {
     image.texture = device->createTexture(
         is_depth ? plume::RenderTextureDesc::DepthTarget(image.width, image.height, kDepthFormat)
                  : plume::RenderTextureDesc::ColorTarget(image.width, image.height, kColorFormat));
-    commands->barriers(plume::RenderBarrierStage::GRAPHICS,
-                       plume::RenderTextureBarrier(image.texture.get(), is_depth
-                                                                            ? plume::RenderTextureLayout::DEPTH_WRITE
-                                                                            : plume::RenderTextureLayout::COLOR_WRITE));
+    Rec([this, texture = image.texture.get(), is_depth] {
+      commands->barriers(plume::RenderBarrierStage::GRAPHICS,
+                         plume::RenderTextureBarrier(texture, is_depth ? plume::RenderTextureLayout::DEPTH_WRITE
+                                                                       : plume::RenderTextureLayout::COLOR_WRITE));
+    });
   }
 
   // Host samples for the surface the device's RB_SURFACE_INFO describes
@@ -1244,9 +1255,11 @@ struct Renderer::State {
       target.id = ++next_target_id;
       current = nullptr;
     }
-    if (UseTarget(target)) {
-      if (fresh_color) commands->clearColor(0, plume::RenderColor(0.0f, 0.0f, 0.0f, 1.0f));
-      if (fresh_depth) commands->clearDepthStencil(true, true, 1.0f, 0);
+    if (UseTarget(target) && (fresh_color || fresh_depth)) {
+      Rec([this, fresh_color, fresh_depth] {
+        if (fresh_color) commands->clearColor(0, plume::RenderColor(0.0f, 0.0f, 0.0f, 1.0f));
+        if (fresh_depth) commands->clearDepthStencil(true, true, 1.0f, 0);
+      });
     }
   }
 
@@ -1456,15 +1469,93 @@ struct Renderer::State {
     resolve_ops.clear();
     commands->begin();
     ForgetBound();
+    deferring = recorder.joinable();
     // Targets keep their contents across frames (the game draws before Swap
     // and resolves after it); a new command list only needs them rebound.
     current = nullptr;
   }
 
   void BindTarget() {
-    if (framebuffer) commands->setFramebuffer(framebuffer);
-    commands->setGraphicsPipelineLayout(layout.get());
-    for (uint32_t i = 0; i < kSetCount; ++i) commands->setGraphicsDescriptorSet(sets[i].get(), i);
+    Rec([this, fb = framebuffer] {
+      if (fb) commands->setFramebuffer(fb);
+      commands->setGraphicsPipelineLayout(layout.get());
+      for (uint32_t i = 0; i < kSetCount; ++i) commands->setGraphicsDescriptorSet(sets[i].get(), i);
+    });
+  }
+
+  // Command recording thread (native_record_thread). During a frame the game
+  // thread keeps all bookkeeping (targets, textures, the upload ring,
+  // descriptors) and queues each run of command list calls with the values
+  // it needs; the thread records them in order, so the command list is the
+  // same as when recorded directly. Present drains the queue and records
+  // directly. Turnip's per-draw recording took a quarter of a phone's game
+  // thread in fights.
+  std::thread recorder;
+  std::mutex record_mutex;
+  std::condition_variable record_wake;
+  std::condition_variable record_idle;
+  std::vector<std::function<void()>> record_queue;
+  bool record_busy = false;    // the thread is running a batch
+  bool record_waiting = false;  // the thread sleeps on record_wake
+  bool record_quit = false;
+  bool deferring = false;  // Rec queues instead of running
+
+  void Rec(std::function<void()> fn) {
+    if (!deferring) {
+      fn();
+      return;
+    }
+    // A sleeping thread is woken once a batch has gathered: it records
+    // faster than draws are prepared, and a wake per draw costs the game
+    // thread more than the recording it hands over.
+    constexpr size_t kRecordBatch = 64;
+    bool wake = false;
+    {
+      std::lock_guard<std::mutex> lock(record_mutex);
+      record_queue.push_back(std::move(fn));
+      wake = record_waiting && record_queue.size() >= kRecordBatch;
+    }
+    if (wake) record_wake.notify_one();
+  }
+
+  // Waits until every queued call is recorded.
+  void Flush() {
+    if (!recorder.joinable()) return;
+    std::unique_lock<std::mutex> lock(record_mutex);
+    if (record_waiting && !record_queue.empty()) record_wake.notify_one();
+    record_idle.wait(lock, [&] { return record_queue.empty() && !record_busy; });
+  }
+
+  void RecorderLoop() {
+    std::vector<std::function<void()>> batch;
+    std::unique_lock<std::mutex> lock(record_mutex);
+    while (true) {
+      if (record_queue.empty()) {
+        record_idle.notify_all();
+        if (record_quit) return;
+        record_waiting = true;
+        record_wake.wait(lock, [&] { return !record_queue.empty() || record_quit; });
+        record_waiting = false;
+        continue;
+      }
+      batch.swap(record_queue);
+      record_busy = true;
+      lock.unlock();
+      for (auto& fn : batch) fn();
+      batch.clear();
+      lock.lock();
+      record_busy = false;
+    }
+  }
+
+  void StopRecorder() {
+    if (!recorder.joinable()) return;
+    {
+      std::lock_guard<std::mutex> lock(record_mutex);
+      record_quit = true;
+    }
+    record_wake.notify_one();
+    recorder.join();
   }
 
   // First flat index of a texture heap in set 0. `heap` is the heap's old
@@ -1536,15 +1627,19 @@ struct Renderer::State {
         uint64_t offset = 0;
         if (!Upload(256, 256, offset)) return;
         std::memset(upload_cpu + offset, 0xFF, 4);
-        commands->barriers(plume::RenderBarrierStage::COPY,
-                           plume::RenderTextureBarrier(defaults[d].get(), plume::RenderTextureLayout::COPY_DEST));
-        commands->copyTextureRegion(
-            plume::RenderTextureCopyLocation::Subresource(defaults[d].get(), 0, layer),
-            plume::RenderTextureCopyLocation::PlacedFootprint(upload.get(), plume::RenderFormat::R8G8B8A8_UNORM,
-                                                              1, 1, 1, 64, offset));
+        Rec([this, texture = defaults[d].get(), layer, offset] {
+          commands->barriers(plume::RenderBarrierStage::COPY,
+                             plume::RenderTextureBarrier(texture, plume::RenderTextureLayout::COPY_DEST));
+          commands->copyTextureRegion(
+              plume::RenderTextureCopyLocation::Subresource(texture, 0, layer),
+              plume::RenderTextureCopyLocation::PlacedFootprint(upload.get(), plume::RenderFormat::R8G8B8A8_UNORM,
+                                                                1, 1, 1, 64, offset));
+        });
       }
-      commands->barriers(plume::RenderBarrierStage::GRAPHICS,
-                         plume::RenderTextureBarrier(defaults[d].get(), plume::RenderTextureLayout::SHADER_READ));
+      Rec([this, texture = defaults[d].get()] {
+        commands->barriers(plume::RenderBarrierStage::GRAPHICS,
+                           plume::RenderTextureBarrier(texture, plume::RenderTextureLayout::SHADER_READ));
+      });
     }
     sets[0]->setTexture(HeapBase(0), defaults[0].get(), plume::RenderTextureLayout::SHADER_READ);
     sets[0]->setTexture(HeapBase(1), defaults[1].get(), plume::RenderTextureLayout::SHADER_READ);
@@ -1691,13 +1786,15 @@ struct Renderer::State {
     } else {
       slot.cpu.clear();
     }
-    commands->barriers(plume::RenderBarrierStage::COPY,
-                       plume::RenderTextureBarrier(slot.texture.get(), plume::RenderTextureLayout::COPY_DEST));
-    commands->copyTextureRegion(
-        plume::RenderTextureCopyLocation::Subresource(slot.texture.get()),
-        plume::RenderTextureCopyLocation::PlacedFootprint(upload.get(), host, width, 1, 1, row_texels, ring));
-    commands->barriers(plume::RenderBarrierStage::GRAPHICS,
-                       plume::RenderTextureBarrier(slot.texture.get(), plume::RenderTextureLayout::SHADER_READ));
+    Rec([this, texture = slot.texture.get(), host, width, row_texels, ring] {
+      commands->barriers(plume::RenderBarrierStage::COPY,
+                         plume::RenderTextureBarrier(texture, plume::RenderTextureLayout::COPY_DEST));
+      commands->copyTextureRegion(
+          plume::RenderTextureCopyLocation::Subresource(texture),
+          plume::RenderTextureCopyLocation::PlacedFootprint(upload.get(), host, width, 1, 1, row_texels, ring));
+      commands->barriers(plume::RenderBarrierStage::GRAPHICS,
+                         plume::RenderTextureBarrier(texture, plume::RenderTextureLayout::SHADER_READ));
+    });
     SetTexture(5, index, slot.texture.get(), plume::RenderTextureLayout::SHADER_READ, slot.view.get());
     ++next_texture1d;
     return index;
@@ -1770,8 +1867,10 @@ struct Renderer::State {
     texture.content = content;
     texture.sample = sample;
     texture.checked = presents;
-    commands->barriers(plume::RenderBarrierStage::COPY,
-                       plume::RenderTextureBarrier(texture.texture.get(), plume::RenderTextureLayout::COPY_DEST));
+    Rec([this, target = texture.texture.get()] {
+      commands->barriers(plume::RenderBarrierStage::COPY,
+                         plume::RenderTextureBarrier(target, plume::RenderTextureLayout::COPY_DEST));
+    });
     for (uint32_t face = 0; face < 6; ++face) {
       const gfx::LinearTexture& linear = faces[face];
       const size_t row_bytes = size_t(linear.width_blocks) * linear.block_bytes;
@@ -1785,13 +1884,17 @@ struct Renderer::State {
         std::memcpy(upload_cpu + offset + y * row, linear.blocks.data() + y * row_bytes, row_bytes);
       }
       const uint32_t row_texels = uint32_t(row / linear.block_bytes) * linear.block_width;
-      commands->copyTextureRegion(
-          plume::RenderTextureCopyLocation::Subresource(texture.texture.get(), 0, face),
-          plume::RenderTextureCopyLocation::PlacedFootprint(upload.get(), host, width, height, 1, row_texels,
-                                                            offset));
+      Rec([this, target = texture.texture.get(), face, host, width, height, row_texels, offset] {
+        commands->copyTextureRegion(
+            plume::RenderTextureCopyLocation::Subresource(target, 0, face),
+            plume::RenderTextureCopyLocation::PlacedFootprint(upload.get(), host, width, height, 1, row_texels,
+                                                              offset));
+      });
     }
-    commands->barriers(plume::RenderBarrierStage::GRAPHICS,
-                       plume::RenderTextureBarrier(texture.texture.get(), plume::RenderTextureLayout::SHADER_READ));
+    Rec([this, target = texture.texture.get()] {
+      commands->barriers(plume::RenderBarrierStage::GRAPHICS,
+                         plume::RenderTextureBarrier(target, plume::RenderTextureLayout::SHADER_READ));
+    });
     SetTexture(2, texture.index, texture.texture.get(), plume::RenderTextureLayout::SHADER_READ,
                         texture.view.get());
     uploaded = true;
@@ -1895,15 +1998,17 @@ struct Renderer::State {
     texture.content = content;
     texture.sample = sample;
     texture.checked = presents;
-    commands->barriers(plume::RenderBarrierStage::COPY,
-                       plume::RenderTextureBarrier(texture.texture.get(), plume::RenderTextureLayout::COPY_DEST));
     const uint32_t row_texels = uint32_t(row / linear.block_bytes) * linear.block_width;
-    commands->copyTextureRegion(
-        plume::RenderTextureCopyLocation::Subresource(texture.texture.get()),
-        plume::RenderTextureCopyLocation::PlacedFootprint(upload.get(), host, width, height, 1, row_texels,
-                                                          offset));
-    commands->barriers(plume::RenderBarrierStage::GRAPHICS,
-                       plume::RenderTextureBarrier(texture.texture.get(), plume::RenderTextureLayout::SHADER_READ));
+    Rec([this, target = texture.texture.get(), host, width, height, row_texels, offset] {
+      commands->barriers(plume::RenderBarrierStage::COPY,
+                         plume::RenderTextureBarrier(target, plume::RenderTextureLayout::COPY_DEST));
+      commands->copyTextureRegion(
+          plume::RenderTextureCopyLocation::Subresource(target),
+          plume::RenderTextureCopyLocation::PlacedFootprint(upload.get(), host, width, height, 1, row_texels,
+                                                            offset));
+      commands->barriers(plume::RenderBarrierStage::GRAPHICS,
+                         plume::RenderTextureBarrier(target, plume::RenderTextureLayout::SHADER_READ));
+    });
     SetTexture(0, texture.index, texture.texture.get(), plume::RenderTextureLayout::SHADER_READ,
                         texture.view.get());
     uploaded = true;
@@ -2505,6 +2610,11 @@ struct Renderer::State {
   void ExecuteDraw(const DrawOp& op) {
     UseTarget(*op.target);
     if (op.uploaded) BindTarget();
+    Rec([this, op, width = target_width, height = target_height] { RecordDraw(op, width, height); });
+  }
+
+  // ExecuteDraw's command list calls, with the target size at queue time.
+  void RecordDraw(const DrawOp& op, uint32_t target_width, uint32_t target_height) {
     if (bound_pipeline != op.pipeline) {
       commands->setPipeline(op.pipeline);
       bound_pipeline = op.pipeline;
@@ -2533,11 +2643,13 @@ struct Renderer::State {
 
   void ExecuteClear(const ClearOp& op) {
     UseTarget(*op.target);
-    if (op.flags & 0xF) commands->clearColor(0, op.color, &op.rect, 1);
-    if (op.flags & 0x30) {
-      commands->clearDepthStencil((op.flags & 0x10) != 0, (op.flags & 0x20) != 0, std::clamp(op.z, 0.0f, 1.0f),
-                                  op.stencil & 0xFF, &op.rect, 1);
-    }
+    Rec([this, flags = op.flags, color = op.color, rect = op.rect, z = op.z, stencil = op.stencil] {
+      if (flags & 0xF) commands->clearColor(0, color, &rect, 1);
+      if (flags & 0x30) {
+        commands->clearDepthStencil((flags & 0x10) != 0, (flags & 0x20) != 0, std::clamp(z, 0.0f, 1.0f),
+                                    stencil & 0xFF, &rect, 1);
+      }
+    });
   }
 
   void ExecuteResolve(const ResolveOp& op) {
@@ -2545,58 +2657,63 @@ struct Renderer::State {
     if (op.kind == ResolveOp::kDepth) {
       Texture& entry = textures[op.key];
       Image& depth_image = *op.target->depth;
-      plume::RenderTextureBarrier to_pass[] = {
-          plume::RenderTextureBarrier(depth, plume::RenderTextureLayout::DEPTH_READ),
-          plume::RenderTextureBarrier(entry.texture.get(), plume::RenderTextureLayout::COLOR_WRITE)};
-      commands->barriers(plume::RenderBarrierStage::GRAPHICS, to_pass, 2);
       SetTexture(0, depth_image.depth_index, depth, plume::RenderTextureLayout::DEPTH_READ,
                           depth_image.depth_view.get());
-      commands->setFramebuffer(entry.framebuffer.get());
-      commands->setGraphicsPipelineLayout(layout.get());
-      for (uint32_t i = 0; i < kSetCount; ++i) commands->setGraphicsDescriptorSet(sets[i].get(), i);
-      commands->setPipeline(depth_resolve_pipeline.get());
-      ForgetBound();
-      const uint64_t push[3] = {upload_gpu + op.constants, 0, 0};
-      commands->setGraphicsPushConstants(0, push, 0, sizeof(push));
-      const plume::RenderViewport viewport{float(op.dst_x), float(op.dst_y), float(op.copy_w), float(op.copy_h)};
-      commands->setViewports(&viewport, 1);
-      const plume::RenderRect scissor(op.dst_x, op.dst_y, op.dst_x + op.copy_w, op.dst_y + op.copy_h);
-      commands->setScissors(&scissor, 1);
-      commands->drawInstanced(3, 1, 0, 0);
-      plume::RenderTextureBarrier back[] = {
-          plume::RenderTextureBarrier(depth, plume::RenderTextureLayout::DEPTH_WRITE),
-          plume::RenderTextureBarrier(entry.texture.get(), plume::RenderTextureLayout::SHADER_READ)};
-      commands->barriers(plume::RenderBarrierStage::GRAPHICS, back, 2);
+      Rec([this, op, depth = depth, target = entry.texture.get(), framebuffer = entry.framebuffer.get()] {
+        plume::RenderTextureBarrier to_pass[] = {
+            plume::RenderTextureBarrier(depth, plume::RenderTextureLayout::DEPTH_READ),
+            plume::RenderTextureBarrier(target, plume::RenderTextureLayout::COLOR_WRITE)};
+        commands->barriers(plume::RenderBarrierStage::GRAPHICS, to_pass, 2);
+        commands->setFramebuffer(framebuffer);
+        commands->setGraphicsPipelineLayout(layout.get());
+        for (uint32_t i = 0; i < kSetCount; ++i) commands->setGraphicsDescriptorSet(sets[i].get(), i);
+        commands->setPipeline(depth_resolve_pipeline.get());
+        ForgetBound();
+        const uint64_t push[3] = {upload_gpu + op.constants, 0, 0};
+        commands->setGraphicsPushConstants(0, push, 0, sizeof(push));
+        const plume::RenderViewport viewport{float(op.dst_x), float(op.dst_y), float(op.copy_w), float(op.copy_h)};
+        commands->setViewports(&viewport, 1);
+        const plume::RenderRect scissor(op.dst_x, op.dst_y, op.dst_x + op.copy_w, op.dst_y + op.copy_h);
+        commands->setScissors(&scissor, 1);
+        commands->drawInstanced(3, 1, 0, 0);
+        plume::RenderTextureBarrier back[] = {
+            plume::RenderTextureBarrier(depth, plume::RenderTextureLayout::DEPTH_WRITE),
+            plume::RenderTextureBarrier(target, plume::RenderTextureLayout::SHADER_READ)};
+        commands->barriers(plume::RenderBarrierStage::GRAPHICS, back, 2);
+      });
       SetTexture(0, entry.index, entry.texture.get(), plume::RenderTextureLayout::SHADER_READ,
                           entry.view.get());
     } else if (op.kind == ResolveOp::kColor) {
       Texture& entry = textures[op.key];
-      const bool multisampled = current_samples > 1;
-      plume::RenderTextureBarrier to_copy[] = {
-          plume::RenderTextureBarrier(color, multisampled ? plume::RenderTextureLayout::RESOLVE_SOURCE
-                                                          : plume::RenderTextureLayout::COPY_SOURCE),
-          plume::RenderTextureBarrier(entry.texture.get(), multisampled ? plume::RenderTextureLayout::RESOLVE_DEST
-                                                                        : plume::RenderTextureLayout::COPY_DEST)};
-      commands->barriers(plume::RenderBarrierStage::COPY, to_copy, 2);
-      if (multisampled) {
-        commands->resolveTextureRegion(entry.texture.get(), uint32_t(op.dst_x), uint32_t(op.dst_y), color, &op.src);
-      } else {
-        const plume::RenderBox box(op.src.left, op.src.top, op.src.right, op.src.bottom);
-        commands->copyTextureRegion(plume::RenderTextureCopyLocation::Subresource(entry.texture.get()),
-                                    plume::RenderTextureCopyLocation::Subresource(color), uint32_t(op.dst_x),
-                                    uint32_t(op.dst_y), 0, &box);
-      }
-      plume::RenderTextureBarrier back[] = {
-          plume::RenderTextureBarrier(color, plume::RenderTextureLayout::COLOR_WRITE),
-          plume::RenderTextureBarrier(entry.texture.get(), plume::RenderTextureLayout::SHADER_READ)};
-      commands->barriers(plume::RenderBarrierStage::GRAPHICS, back, 2);
+      Rec([this, op, color = color, target = entry.texture.get(), multisampled = current_samples > 1] {
+        plume::RenderTextureBarrier to_copy[] = {
+            plume::RenderTextureBarrier(color, multisampled ? plume::RenderTextureLayout::RESOLVE_SOURCE
+                                                            : plume::RenderTextureLayout::COPY_SOURCE),
+            plume::RenderTextureBarrier(target, multisampled ? plume::RenderTextureLayout::RESOLVE_DEST
+                                                             : plume::RenderTextureLayout::COPY_DEST)};
+        commands->barriers(plume::RenderBarrierStage::COPY, to_copy, 2);
+        if (multisampled) {
+          commands->resolveTextureRegion(target, uint32_t(op.dst_x), uint32_t(op.dst_y), color, &op.src);
+        } else {
+          const plume::RenderBox box(op.src.left, op.src.top, op.src.right, op.src.bottom);
+          commands->copyTextureRegion(plume::RenderTextureCopyLocation::Subresource(target),
+                                      plume::RenderTextureCopyLocation::Subresource(color), uint32_t(op.dst_x),
+                                      uint32_t(op.dst_y), 0, &box);
+        }
+        plume::RenderTextureBarrier back[] = {
+            plume::RenderTextureBarrier(color, plume::RenderTextureLayout::COLOR_WRITE),
+            plume::RenderTextureBarrier(target, plume::RenderTextureLayout::SHADER_READ)};
+        commands->barriers(plume::RenderBarrierStage::GRAPHICS, back, 2);
+      });
       SetTexture(0, entry.index, entry.texture.get(), plume::RenderTextureLayout::SHADER_READ,
                           entry.view.get());
     }
     BindTarget();
-    if (op.clear_flags & 0x100) commands->clearColor(0, op.clear_color, &op.clear_region, 1);
-    if (op.clear_flags & 0x200) {
-      commands->clearDepthStencil(true, true, std::clamp(op.z, 0.0f, 1.0f), 0, &op.clear_region, 1);
+    if (op.clear_flags & 0x300) {
+      Rec([this, flags = op.clear_flags, color = op.clear_color, region = op.clear_region, z = op.z] {
+        if (flags & 0x100) commands->clearColor(0, color, &region, 1);
+        if (flags & 0x200) commands->clearDepthStencil(true, true, std::clamp(z, 0.0f, 1.0f), 0, &region, 1);
+      });
     }
   }
 };
@@ -2605,6 +2722,7 @@ Renderer::Renderer() : state_(std::make_unique<State>()) {}
 
 Renderer::~Renderer() {
   State& s = *state_;
+  s.StopRecorder();
   if (s.queue && s.fence && s.fence_pending[s.frame_slot]) s.queue->waitForCommandFence(s.fence.get());
   if (s.queue && s.fence_other && s.fence_pending[s.frame_slot ^ 1]) s.queue->waitForCommandFence(s.fence_other.get());
   if (s.queue) {
@@ -2717,6 +2835,10 @@ bool Renderer::Open(void* native_window, std::string& reason) {
     return false;
   }
   host::ShadowKeepShaderKeys();
+  if (REXCVAR_GET(native_record_thread)) {
+    s.recorder = std::thread([&s] { s.RecorderLoop(); });
+    REXLOG_INFO("native: recording commands on a second thread");
+  }
   step("done");
   return true;
 }
@@ -3829,6 +3951,10 @@ void Renderer::Present(uint32_t frontbuffer, const uint8_t* base) {
   ScopedMs timer(s.ms_present);
   s.BeginFrame();
   s.UploadDefaults();
+  // Present records directly (and replays, reads back, submits): the
+  // recording thread's queue is drained first.
+  s.Flush();
+  s.deferring = false;
   // Swap shows a texture: the last resolve into it when there was one, else
   // whatever the target holds.
   if (s.current) s.ResolveMsaa(*s.current->color);

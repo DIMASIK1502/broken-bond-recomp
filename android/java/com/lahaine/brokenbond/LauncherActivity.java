@@ -45,6 +45,8 @@ public class LauncherActivity extends Activity {
     static final String KEY_INTERPOLATE = "native_interpolate";
     // One frame in flight: the GPU draws a frame before the next is recorded.
     static final String KEY_LOW_LATENCY = "low_latency";
+    // Vulkan commands recorded on a second thread (native_record_thread).
+    static final String KEY_RECORD_THREAD = "record_thread";
     // A custom Vulkan driver (AdrenoTools package, e.g. Turnip): the .so path
     // inside the private folder, and a name to show.
     static final String KEY_DRIVER = "vulkan_driver";
@@ -119,6 +121,12 @@ public class LauncherActivity extends Activity {
         lowLatency.setOnCheckedChangeListener(
                 (button, checked) -> prefs().edit().putBoolean(KEY_LOW_LATENCY, checked).apply());
         layout.addView(lowLatency);
+        CheckBox recordThread = new CheckBox(this);
+        recordThread.setText("Отрисовка во втором потоке (быстрее в боях)");
+        recordThread.setChecked(prefs().getBoolean(KEY_RECORD_THREAD, true));
+        recordThread.setOnCheckedChangeListener(
+                (button, checked) -> prefs().edit().putBoolean(KEY_RECORD_THREAD, checked).apply());
+        layout.addView(recordThread);
 
         // libadrenotools is arm64 only (Snapdragon phones).
         if (Build.SUPPORTED_ABIS.length > 0 && Build.SUPPORTED_ABIS[0].startsWith("arm64")) {
