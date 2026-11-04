@@ -43,6 +43,8 @@ public class LauncherActivity extends Activity {
     static final String KEY_SCALE = "native_resolution_scale";
     static final String KEY_MSAA = "native_msaa";
     static final String KEY_INTERPOLATE = "native_interpolate";
+    // One frame in flight: the GPU draws a frame before the next is recorded.
+    static final String KEY_LOW_LATENCY = "low_latency";
     // A custom Vulkan driver (AdrenoTools package, e.g. Turnip): the .so path
     // inside the private folder, and a name to show.
     static final String KEY_DRIVER = "vulkan_driver";
@@ -111,6 +113,12 @@ public class LauncherActivity extends Activity {
         interpolate.setOnCheckedChangeListener(
                 (button, checked) -> prefs().edit().putBoolean(KEY_INTERPOLATE, checked).apply());
         layout.addView(interpolate);
+        CheckBox lowLatency = new CheckBox(this);
+        lowLatency.setText("Меньше задержка ввода (1 кадр в работе)");
+        lowLatency.setChecked(prefs().getBoolean(KEY_LOW_LATENCY, false));
+        lowLatency.setOnCheckedChangeListener(
+                (button, checked) -> prefs().edit().putBoolean(KEY_LOW_LATENCY, checked).apply());
+        layout.addView(lowLatency);
 
         // libadrenotools is arm64 only (Snapdragon phones).
         if (Build.SUPPORTED_ABIS.length > 0 && Build.SUPPORTED_ABIS[0].startsWith("arm64")) {

@@ -20,8 +20,8 @@ Playable work-in-progress on Windows / D3D12 with the Xenos GPU plugin:
   goes black while UI still draws (EDRAM aliasing)
 - Japanese cutscene voices need the bundled XMA **split-frame hold** SDK patch
   (`rexglue-sdk-v0.10.0.patch`; stock `v0.10.0` hangs at the Hokage coffins,
-  English voices are fine without it). `xma-past-buffer.patch` was made against
-  an earlier SDK revision and `setup.ps1` reports it as skipped.
+  English voices are fine without it). The same patch moves a read offset that
+  ends past an XMA buffer on to the next one, so a sound cannot loop forever.
   Rebuild `rexruntime` from that tree (`-DREXSDK_DIR=thirdparty\rexglue-sdk`); do not
   link an installed unpatched SDK package.
 
@@ -95,9 +95,8 @@ not by the assistant.
 
 This clones the ReXGlue SDK (pinned to `v0.10.0`) into `thirdparty/rexglue-sdk`,
 initializes its submodules, and applies the patches in `patches/sdk/`
-(guest present / draw counters, the boot-movie file hook and the XMA
-split-frame hold; `xma-past-buffer.patch` is skipped until it is rebased onto
-`v0.10.0`). It also clones Plume and
+(guest present / draw counters, the boot-movie file hook, the XMA
+split-frame hold and the Android platform layer). It also clones Plume and
 XenosRecomp for the native renderer. Safe to re-run.
 
 ### 2. Provide the game files

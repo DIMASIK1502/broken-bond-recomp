@@ -34,7 +34,7 @@ index 8426798..d7d477e 100644
  
  }  // namespace rex::audio
 diff --git a/src/audio/xma_context.cpp b/src/audio/xma_context.cpp
-index 11b83be..616eb55 100644
+index 11b83be..ea807b6 100644
 --- a/src/audio/xma_context.cpp
 +++ b/src/audio/xma_context.cpp
 @@ -10,6 +10,7 @@
@@ -181,7 +181,23 @@ index 11b83be..616eb55 100644
    if (!data->IsAnyInputBufferValid()) {
      return;
    }
-@@ -640,7 +751,15 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+@@ -570,8 +681,13 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+   const int16_t packet_index = GetPacketNumber(current_input_size, data->input_buffer_read_offset);
+ 
+   if (packet_index == -1) {
+-    REXAPU_ERROR("XmaContext {}: Invalid packet index. Input read offset: {}", id(),
+-                 static_cast<uint32_t>(data->input_buffer_read_offset));
++    // The offset is past this buffer: a split frame whose tail filled the
++    // whole next packet resumes at its end. Returning here leaves it there,
++    // every later call logs and returns, the voice never ends and the title
++    // waits on it with the last sound looping (Orochimaru fight on Android).
++    REXAPU_WARN("XmaContext {}: read offset {} is past the input buffer ({} bytes); swapping", id(),
++                static_cast<uint32_t>(data->input_buffer_read_offset), current_input_size);
++    SwapInputBuffer(data);
+     return;
+   }
+ 
+@@ -640,7 +756,15 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
        const uint8_t* next_packet =
            GetNextPacket(data, next_packet_index, current_input_packet_count);
        if (!next_packet) {
