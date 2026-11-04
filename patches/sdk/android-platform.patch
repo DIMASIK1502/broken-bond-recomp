@@ -114,6 +114,23 @@ index 0000000..0dfabc5
 +
 +}  // namespace ui
 +}  // namespace rex
+diff --git a/include/rex/ui/windowed_app.h b/include/rex/ui/windowed_app.h
+index 50638d6..e0ba16f 100644
+--- a/include/rex/ui/windowed_app.h
++++ b/include/rex/ui/windowed_app.h
+@@ -24,10 +24,8 @@
+ #include <rex/platform.h>
+ #include <rex/ui/windowed_app_context.h>
+ 
+-#if REX_PLATFORM_ANDROID
+-// Multiple apps in a single library instead of separate executables.
+-#define XE_UI_WINDOWED_APPS_IN_LIBRARY 1
+-#endif
++// Xenia put several apps in one Android library. Here libmain.so holds one
++// app and SDLActivity enters it through SDL_main, as on the desktop.
+ 
+ namespace rex {
+ namespace ui {
 diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
 index 1ddafd0..42207ef 100644
 --- a/src/core/CMakeLists.txt
@@ -315,6 +332,31 @@ index 9ac8d15..88d355c 100644
          auto native_mutex = static_cast<pthread_mutex_t*>(handles[i]->mutex_.native_handle());
          int result = pthread_mutex_trylock(native_mutex);
          if (result == 0 || result == EOWNERDEAD) {
+diff --git a/src/system/gpu_plugin_loader.cpp b/src/system/gpu_plugin_loader.cpp
+index 754fa13..866e89c 100644
+--- a/src/system/gpu_plugin_loader.cpp
++++ b/src/system/gpu_plugin_loader.cpp
+@@ -55,6 +55,12 @@ std::vector<platform::DynamicLibrary>& LoadedPlugins() {
+ }  // namespace
+ 
+ std::unique_ptr<IGraphicsSystem> LoadGpuPlugin(std::string_view name, std::string_view backend) {
++#if REX_PLATFORM_ANDROID
++  // The process is app_process, so there is no executable folder. A bare
++  // name resolves in the APK's native library folder, which is on the app
++  // linker namespace's search path.
++  const std::filesystem::path path = PluginFileName(name);
++#else
+   auto path = rex::filesystem::GetExecutableFolder() / PluginFileName(name);
+   if (!std::filesystem::exists(path)) {
+     REXSYS_ERROR(
+@@ -63,6 +69,7 @@ std::unique_ptr<IGraphicsSystem> LoadGpuPlugin(std::string_view name, std::strin
+         name, path.string(), name);
+     return nullptr;
+   }
++#endif
+ 
+   platform::DynamicLibrary library;
+   if (!library.Load(path, platform::SymbolResolution::kImmediate)) {
 diff --git a/src/ui/CMakeLists.txt b/src/ui/CMakeLists.txt
 index 5bd3dc5..3733ea5 100644
 --- a/src/ui/CMakeLists.txt
@@ -368,7 +410,7 @@ index 0000000..7718ee4
 +}  // namespace ui
 +}  // namespace rex
 diff --git a/src/ui/window_sdl.cpp b/src/ui/window_sdl.cpp
-index 2251429..41175e8 100644
+index 2251429..4de786f 100644
 --- a/src/ui/window_sdl.cpp
 +++ b/src/ui/window_sdl.cpp
 @@ -35,6 +35,8 @@
@@ -380,7 +422,20 @@ index 2251429..41175e8 100644
  #else
  #include <X11/Xlib-xcb.h>
  #include <rex/ui/surface_gnulinux.h>
-@@ -398,6 +400,14 @@ std::unique_ptr<Surface> WindowSDL::CreateSurfaceImpl(Surface::TypeFlags allowed
+@@ -235,6 +237,12 @@ void* WindowSDL::GetNativeWindowHandle() const {
+   }
+   return SDL_GetPointerProperty(SDL_GetWindowProperties(sdl_window_),
+                                 SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr);
++#elif REX_PLATFORM_ANDROID
++  if (!sdl_window_) {
++    return nullptr;
++  }
++  return SDL_GetPointerProperty(SDL_GetWindowProperties(sdl_window_),
++                                SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, nullptr);
+ #else
+   return nullptr;
+ #endif
+@@ -398,6 +406,14 @@ std::unique_ptr<Surface> WindowSDL::CreateSurfaceImpl(Surface::TypeFlags allowed
        SDL_Metal_DestroyView(metal_view);
      }
    }
@@ -395,3 +450,19 @@ index 2251429..41175e8 100644
  #else
    SDL_PropertiesID props = SDL_GetWindowProperties(sdl_window_);
    if (allowed_types & Surface::kTypeFlag_WaylandSurface) {
+diff --git a/src/ui/windowed_app_main_sdl.cpp b/src/ui/windowed_app_main_sdl.cpp
+index 77bb1dc..0fb1b22 100644
+--- a/src/ui/windowed_app_main_sdl.cpp
++++ b/src/ui/windowed_app_main_sdl.cpp
+@@ -22,6 +22,11 @@
+ #include <rex/ui/windowed_app.h>
+ #include <rex/ui/windowed_app_context_sdl.h>
+ 
++#if REX_PLATFORM_ANDROID
++// SDLActivity calls SDL_main in libmain.so; this header renames main().
++#include <SDL3/SDL_main.h>
++#endif
++
+ #if REX_PLATFORM_WIN32
+ #ifndef WIN32_LEAN_AND_MEAN
+ #define WIN32_LEAN_AND_MEAN

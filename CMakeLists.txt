@@ -8,6 +8,12 @@ project(broken_bond LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Android build (NDK toolchain). Windows presets never read cmake/android.
+if(ANDROID)
+    include(cmake/android/broken_bond_android.cmake)
+    return()
+endif()
+
 include(generated/rexglue.cmake)
 
 # Sources
