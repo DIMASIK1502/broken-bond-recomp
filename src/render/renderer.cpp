@@ -2533,7 +2533,10 @@ bool Renderer::Open(void* native_window, std::string& reason) {
   }
   const plume::RenderDeviceCapabilities& caps = s.device->getCapabilities();
   if (!caps.descriptorIndexing || !caps.bufferDeviceAddress) {
-    reason = "the device lacks descriptor indexing or buffer device address";
+    reason = fmt::format("{} lacks{}{} (XenosRecomp shaders read constants through buffer addresses)",
+                         s.device->getDescription().name,
+                         caps.descriptorIndexing ? "" : " descriptor indexing",
+                         caps.bufferDeviceAddress ? "" : " buffer device address");
     return false;
   }
   s.device_name = s.device->getDescription().name;
