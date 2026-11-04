@@ -1080,20 +1080,23 @@ struct Renderer::State {
   // full hash in Unchanged catches.
   static uint64_t SampleHash(const uint8_t* data, size_t bytes) {
     if (bytes <= 16384) return XXH3_64bits(data, bytes);
-    XXH3_state_t state;
-    XXH3_64bits_reset(&state);
+    // The runs are gathered and hashed in one call: 64 streaming updates
+    // cost a phone about a microsecond per texture per frame.
+    alignas(16) uint8_t runs[64 * 64];
     const size_t step = (bytes - 64) / 63;
-    for (size_t i = 0; i < 64; ++i) XXH3_64bits_update(&state, data + i * step, 64);
-    XXH3_64bits_update(&state, &bytes, sizeof(bytes));
-    return XXH3_64bits_digest(&state);
+    for (size_t i = 0; i < 64; ++i) std::memcpy(runs + i * 64, data + i * step, 64);
+    return XXH3_64bits_withSeed(runs, sizeof(runs), bytes);
   }
 
   // Whether a texture's guest texels still match what was uploaded. Each
-  // frame compares the sample; every 16th frame (staggered by heap index)
-  // the full hash. On a mismatch `content` and `sample` hold the new hashes.
+  // frame compares the sample; every 64th frame (staggered by heap index)
+  // the full hash, which only catches a small local rewrite the sample
+  // misses (about a second late at 60 Hz). Every 16th frame cost a phone a
+  // millisecond of each fight frame. On a mismatch `content` and `sample`
+  // hold the new hashes.
   bool Unchanged(const Texture& texture, const uint8_t* guest, size_t bytes, uint64_t& content, uint64_t& sample) {
     sample = SampleHash(guest, bytes);
-    const bool full_due = (presents + texture.index) % 16 == 0;
+    const bool full_due = (presents + texture.index) % 64 == 0;
     if (sample == texture.sample && !full_due) {
       content = texture.content;
       return true;
@@ -1322,6 +1325,33 @@ struct Renderer::State {
     plume::RenderTextureLayout layout = plume::RenderTextureLayout::UNKNOWN;
   };
   std::array<std::vector<Bound>, 6> bound;
+
+  // The last fetch constant each slot resolved to, valid for one generation:
+  // neighbouring draws mostly sample the same textures, and the key and map
+  // lookups behind Texture2DFor cost more than the rest of a draw on a phone.
+  // A new frame or a resolve (which can turn an address into another texture
+  // mid-frame) starts a new generation.
+  struct FetchMemo {
+    uint32_t words[6] = {};
+    uint32_t kind = UINT32_MAX;  // DESCRIPTOR_KIND_* of `index`, or none
+    uint32_t index = 0;
+    uint32_t sampler = 0;
+    uint64_t generation = UINT64_MAX;
+  };
+  std::array<FetchMemo, DESCRIPTOR_SLOT_COUNT> fetch_memo;
+  uint64_t fetch_generation = 0;
+
+  // A large vertex stream drawn again in the same frame (shadow, depth and
+  // colour passes of one mesh) at the same place with the same layout keeps
+  // the key its full hash gave earlier in the frame, if its sample still
+  // matches. The first use in a frame always hashes it whole.
+  struct StreamMemo {
+    uint64_t key = 0;
+    uint64_t sample = 0;
+    uint64_t present = UINT64_MAX;
+  };
+  std::unordered_map<uint64_t, StreamMemo> stream_memo;
+  uint64_t fetch_memo_hits = 0, fetch_memo_misses = 0;
   void SetTexture(uint32_t set, uint32_t index, plume::RenderTexture* texture, plume::RenderTextureLayout layout,
                   plume::RenderTextureView* view) {
     std::vector<Bound>& slots = bound[set];
@@ -1425,6 +1455,7 @@ struct Renderer::State {
     clear_ops.clear();
     resolve_ops.clear();
     commands->begin();
+    ForgetBound();
     // Targets keep their contents across frames (the game draws before Swap
     // and resolves after it); a new command list only needs them rebound.
     current = nullptr;
@@ -1903,6 +1934,7 @@ struct Renderer::State {
     commands->setGraphicsPipelineLayout(layout.get());
     for (uint32_t i = 0; i < kSetCount; ++i) commands->setGraphicsDescriptorSet(sets[i].get(), i);
     commands->setPipeline(present_pipeline.get());
+    ForgetBound();
     const uint64_t push[3] = {upload_gpu + constants, 0, 0};
     commands->setGraphicsPushConstants(0, push, 0, sizeof(push));
     const plume::RenderViewport viewport(0.0f, 0.0f, float(width), float(height));
@@ -2357,10 +2389,12 @@ struct Renderer::State {
       // The held frame was written above; a later submit on the queue sees it.
       std::swap(commands, commands_second[frame_slot]);
       commands->begin();
+      ForgetBound();
       DrawPresentPass(real_image, replayed && show_replay ? front.index : held.index,
                       constants_real);
       commands->end();
       std::swap(commands, commands_second[frame_slot]);
+      ForgetBound();
       const plume::RenderCommandList* second_list = commands_second[frame_slot].get();
       plume::RenderCommandSemaphore* second_wait = acquire_second[frame_slot].get();
       plume::RenderCommandSemaphore* second_signal = release[real_image].get();
@@ -2454,15 +2488,38 @@ struct Renderer::State {
     resolve_ops.push_back(op);
   }
 
+  // Pipeline, viewport and scissor last set on `commands` by ExecuteDraw.
+  // Neighbouring draws mostly repeat them, and each Vulkan call costs a phone
+  // (Turnip) noticeable CPU. Anything else that sets them, a new or swapped
+  // command list, forgets them.
+  const plume::RenderPipeline* bound_pipeline = nullptr;
+  plume::RenderViewport bound_viewport{};
+  plume::RenderRect bound_scissor{};
+  bool bound_dynamic = false;  // bound_viewport and bound_scissor are set
+
+  void ForgetBound() {
+    bound_pipeline = nullptr;
+    bound_dynamic = false;
+  }
+
   void ExecuteDraw(const DrawOp& op) {
     UseTarget(*op.target);
     if (op.uploaded) BindTarget();
-    commands->setPipeline(op.pipeline);
+    if (bound_pipeline != op.pipeline) {
+      commands->setPipeline(op.pipeline);
+      bound_pipeline = op.pipeline;
+    }
     const uint64_t push[3] = {upload_gpu + op.vs_constants, upload_gpu + op.ps_constants, upload_gpu + op.shared};
     commands->setGraphicsPushConstants(0, push, 0, sizeof(push));
-    commands->setViewports(&op.viewport, 1);
     const plume::RenderRect scissor(0, 0, int32_t(target_width), int32_t(target_height));
-    commands->setScissors(&scissor, 1);
+    if (!bound_dynamic || std::memcmp(&bound_viewport, &op.viewport, sizeof(op.viewport)) != 0 ||
+        std::memcmp(&bound_scissor, &scissor, sizeof(scissor)) != 0) {
+      commands->setViewports(&op.viewport, 1);
+      commands->setScissors(&scissor, 1);
+      bound_viewport = op.viewport;
+      bound_scissor = scissor;
+      bound_dynamic = true;
+    }
     if (op.slot_count) commands->setVertexBuffers(0, op.views.data(), op.slot_count, op.slots.data());
     if (op.indexed) {
       const plume::RenderIndexBufferView view(op.index_ref, op.index_count * 4,
@@ -2498,6 +2555,7 @@ struct Renderer::State {
       commands->setGraphicsPipelineLayout(layout.get());
       for (uint32_t i = 0; i < kSetCount; ++i) commands->setGraphicsDescriptorSet(sets[i].get(), i);
       commands->setPipeline(depth_resolve_pipeline.get());
+      ForgetBound();
       const uint64_t push[3] = {upload_gpu + op.constants, 0, 0};
       commands->setGraphicsPushConstants(0, push, 0, sizeof(push));
       const plume::RenderViewport viewport{float(op.dst_x), float(op.dst_y), float(op.copy_w), float(op.copy_h)};
@@ -2927,19 +2985,21 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
     }
     const uint8_t* guest_stream = At(base, PhysicalView(vf.address * 4 + uint32_t(begin)));
     const size_t out_bytes = size_t(vertex_count) * out_stride;
-    XXH3_state_t layout_state;
-    XXH3_64bits_reset(&layout_state);
-    const uint32_t stream_layout[4] = {stride, out_stride, uint32_t(vf.endian), uint32_t(bytes)};
-    XXH3_64bits_update(&layout_state, stream_layout, sizeof(stream_layout));
+    // The layout words are hashed in one call: XXH3's streaming state costs
+    // more than these few dozen bytes on a phone.
+    uint32_t layout[4 + 6 * 16];
+    size_t layout_words = 0;
+    for (const uint32_t w : {stride, out_stride, uint32_t(vf.endian), uint32_t(bytes)}) layout[layout_words++] = w;
     for (uint32_t i = 0; i < element_count; ++i) {
       const Element& e = elems[i];
       if (e.stream != stream) continue;
-      const uint32_t element_layout[6] = {e.offset, e.format_word, e.out_offset, uint32_t(e.convert),
-                                          uint32_t(e.format), e.source.swizzle};
-      XXH3_64bits_update(&layout_state, element_layout, sizeof(element_layout));
+      for (const uint32_t w : {e.offset, e.format_word, e.out_offset, uint32_t(e.convert), uint32_t(e.format),
+                               e.source.swizzle}) {
+        layout[layout_words++] = w;
+      }
     }
     const uint64_t stream_key =
-        XXH3_64bits_withSeed(guest_stream, size_t(bytes), XXH3_64bits_digest(&layout_state));
+        XXH3_64bits_withSeed(guest_stream, size_t(bytes), XXH3_64bits(layout, layout_words * sizeof(uint32_t)));
     s.Lap(8);
     State::CachedStream& cached = s.stream_cache[stream_key];
     cached.last_used = s.presents;
@@ -3200,19 +3260,38 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
     xenos::xe_gpu_texture_fetch_t fetch;
     std::memcpy(&fetch, words, sizeof(words));
     if (uint32_t(fetch.type) != 2) continue;
-    indices[DESCRIPTOR_KIND_SAMPLER * DESCRIPTOR_SLOT_COUNT + slot] = s.SamplerFor(fetch);
+    State::FetchMemo& memo = s.fetch_memo[slot];
+    if (memo.generation == s.fetch_generation && std::memcmp(memo.words, words, sizeof(words)) == 0) {
+      indices[DESCRIPTOR_KIND_SAMPLER * DESCRIPTOR_SLOT_COUNT + slot] = memo.sampler;
+      if (memo.kind != UINT32_MAX) indices[memo.kind * DESCRIPTOR_SLOT_COUNT + slot] = memo.index;
+      ++s.fetch_memo_hits;
+      continue;
+    }
+    ++s.fetch_memo_misses;
+    {
+    }
+    const uint32_t sampler = s.SamplerFor(fetch);
+    indices[DESCRIPTOR_KIND_SAMPLER * DESCRIPTOR_SLOT_COUNT + slot] = sampler;
+    uint32_t kind = UINT32_MAX;
     if (uint32_t(fetch.dimension) == 0) {
-      indices[DESCRIPTOR_KIND_TEXTURE1D * DESCRIPTOR_SLOT_COUNT + slot] = s.Texture1DFor(words, fetch, base, uploaded);
+      kind = DESCRIPTOR_KIND_TEXTURE1D;
+      indices[kind * DESCRIPTOR_SLOT_COUNT + slot] = s.Texture1DFor(words, fetch, base, uploaded);
     } else if (uint32_t(fetch.dimension) == 3) {
-      indices[DESCRIPTOR_KIND_TEXTURECUBE * DESCRIPTOR_SLOT_COUNT + slot] = s.TextureCubeFor(words, fetch, base, uploaded);
+      kind = DESCRIPTOR_KIND_TEXTURECUBE;
+      indices[kind * DESCRIPTOR_SLOT_COUNT + slot] = s.TextureCubeFor(words, fetch, base, uploaded);
     } else if (uint32_t(fetch.dimension) == 2) {
       s.Skip("3d texture");
     } else if (uint32_t(fetch.dimension) == 1) {
       const auto t0 = std::chrono::steady_clock::now();
-      indices[DESCRIPTOR_KIND_TEXTURE2D * DESCRIPTOR_SLOT_COUNT + slot] =
-          s.Texture2DFor(words, fetch, base, uploaded);
+      kind = DESCRIPTOR_KIND_TEXTURE2D;
+      indices[kind * DESCRIPTOR_SLOT_COUNT + slot] = s.Texture2DFor(words, fetch, base, uploaded);
       s.ms_texture += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     }
+    std::memcpy(memo.words, words, sizeof(words));
+    memo.kind = kind;
+    memo.index = kind != UINT32_MAX ? indices[kind * DESCRIPTOR_SLOT_COUNT + slot] : 0;
+    memo.sampler = sampler;
+    memo.generation = s.fetch_generation;
   }
   s.Lap(11);
   const uint32_t bools0 = Be32(base, device + kDeviceBools);
@@ -3645,6 +3724,7 @@ void Renderer::Resolve(uint32_t device, uint32_t flags, uint32_t rect, uint32_t 
       op.constants = constants;
       const uint32_t physical = TexturePhysical(fetch.base_address);
       s.resolved_at[physical] = {key, State::GuestPageHash(base, physical)};
+      ++s.fetch_generation;
       ++s.depth_resolves;
     } else {
       s.Skip("depth resolve");
@@ -3670,6 +3750,7 @@ void Renderer::Resolve(uint32_t device, uint32_t flags, uint32_t rect, uint32_t 
     const uint64_t key = ImageKey(words);
     const uint32_t physical = TexturePhysical(fetch.base_address);
     s.resolved_at[physical] = {key, State::GuestPageHash(base, physical)};
+    ++s.fetch_generation;
     State::Texture& entry = s.textures[key];
     if (!entry.texture || !entry.resolved || entry.format != kColorFormat || entry.width != width ||
         entry.height != height) {
@@ -3851,6 +3932,7 @@ void Renderer::Present(uint32_t frontbuffer, const uint8_t* base) {
     // Record the next frame in the other slot once its last frame is done;
     // this one keeps drawing meanwhile.
     std::swap(s.commands, s.commands_other);
+    s.ForgetBound();
     std::swap(s.fence, s.fence_other);
     std::swap(s.acquire, s.acquire_other);
     s.frame_slot ^= 1;
@@ -3936,6 +4018,7 @@ void Renderer::Present(uint32_t frontbuffer, const uint8_t* base) {
     REXLOG_INFO("native: wrote {}", path);
   }
   ++s.presents;
+  ++s.fetch_generation;
 #if defined(_WIN32)
   // F9 (on its press) dumps the next frame.
   const bool f9 = (GetAsyncKeyState(0x78) & 0x8000) != 0;
@@ -4019,6 +4102,8 @@ std::string Renderer::TakeStats() {
   s.stream_hits = s.stream_misses = 0;
   out += fmt::format(" indices hit={} miss={} cached={}", s.index_hits, s.index_misses, s.index_cache.size());
   s.index_hits = s.index_misses = 0;
+  out += fmt::format(" fetch_memo={}/{}", s.fetch_memo_hits, s.fetch_memo_misses);
+  s.fetch_memo_hits = s.fetch_memo_misses = 0;
   out += " laps";
   for (const double ms : s.ms_lap) out += fmt::format(" {:.0f}", ms);
   s.ms_lap = {};
