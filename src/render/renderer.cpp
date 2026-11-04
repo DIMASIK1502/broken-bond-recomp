@@ -901,7 +901,10 @@ struct Renderer::State {
   uint64_t upload_used = 0;
 
   std::unique_ptr<plume::RenderPipelineLayout> layout;
-  std::unique_ptr<plume::RenderDescriptorSet> sets[6];
+  // Set 0 holds the texture heaps as bindings (2D, 3D, cube, 1D), set 1 the
+  // samplers. HeapBase gives a heap's first flat index in set 0.
+  static constexpr uint32_t kSetCount = 2;
+  std::unique_ptr<plume::RenderDescriptorSet> sets[kSetCount];
 
   // Shader cache from XenosRecomp, decompressed once.
   std::vector<uint8_t> spirv;
@@ -1311,7 +1314,7 @@ struct Renderer::State {
     Bound& b = slots[index];
     if (b.texture == texture && b.view == view && b.layout == layout) return;
     b = {texture, view, layout};
-    sets[set]->setTexture(index, texture, layout, view);
+    sets[0]->setTexture(HeapBase(set) + index, texture, layout, view);
   }
 
   std::mutex mutex;  // Draw and Present run on the guest thread, TakeStats on the sampler
@@ -1415,25 +1418,35 @@ struct Renderer::State {
   void BindTarget() {
     if (framebuffer) commands->setFramebuffer(framebuffer);
     commands->setGraphicsPipelineLayout(layout.get());
-    for (uint32_t i = 0; i < 6; ++i) commands->setGraphicsDescriptorSet(sets[i].get(), i);
+    for (uint32_t i = 0; i < kSetCount; ++i) commands->setGraphicsDescriptorSet(sets[i].get(), i);
+  }
+
+  // First flat index of a texture heap in set 0. `heap` is the heap's old
+  // set number: 0 2D, 1 3D, 2 cube, 5 1D.
+  static uint32_t HeapBase(uint32_t heap) {
+    switch (heap) {
+      case 1: return kTexture2DCount;
+      case 2: return kTexture2DCount + kTexture3DCount;
+      case 5: return kTexture2DCount + kTexture3DCount + kTextureCubeCount;
+      default: return 0;
+    }
   }
 
   bool CreateLayout() {
     using R = plume::RenderDescriptorRangeType;
-    const plume::RenderDescriptorRange ranges[6] = {
+    const plume::RenderDescriptorRange textures[4] = {
         plume::RenderDescriptorRange(R::TEXTURE, 0, kTexture2DCount),
-        plume::RenderDescriptorRange(R::TEXTURE, 0, kTexture3DCount),
-        plume::RenderDescriptorRange(R::TEXTURE, 0, kTextureCubeCount),
-        plume::RenderDescriptorRange(R::SAMPLER, 0, kSamplerCount),
-        plume::RenderDescriptorRange(R::SAMPLER, 0, 1),  // set 4 is unused by the shaders
-        plume::RenderDescriptorRange(R::TEXTURE, 0, kTexture1DCount),
+        plume::RenderDescriptorRange(R::TEXTURE, 1, kTexture3DCount),
+        plume::RenderDescriptorRange(R::TEXTURE, 2, kTextureCubeCount),
+        plume::RenderDescriptorRange(R::TEXTURE, 3, kTexture1DCount),
     };
-    plume::RenderDescriptorSetDesc set_descs[6];
-    for (uint32_t i = 0; i < 6; ++i) {
-      const bool boundless = i != 4;
-      set_descs[i] = plume::RenderDescriptorSetDesc(&ranges[i], 1, boundless,
-                                                    boundless ? ranges[i].count : 0);
-      std::fprintf(stderr, "native open: descriptor set %u (%u)\n", i, ranges[i].count);
+    const plume::RenderDescriptorRange sampler_range(R::SAMPLER, 0, kSamplerCount);
+    plume::RenderDescriptorSetDesc set_descs[kSetCount] = {
+        plume::RenderDescriptorSetDesc(textures, 4, true, kTexture1DCount),
+        plume::RenderDescriptorSetDesc(&sampler_range, 1, true, kSamplerCount),
+    };
+    for (uint32_t i = 0; i < kSetCount; ++i) {
+      std::fprintf(stderr, "native open: descriptor set %u\n", i);
       sets[i] = device->createDescriptorSet(set_descs[i]);
       if (!sets[i]) return false;
     }
@@ -1441,7 +1454,7 @@ struct Renderer::State {
     const plume::RenderPushConstantRange push(0, 0, 0, 24,
                                               plume::RenderShaderStageFlag::VERTEX |
                                                   plume::RenderShaderStageFlag::PIXEL);
-    plume::RenderPipelineLayoutDesc desc(&push, 1, set_descs, 6, false, true);
+    plume::RenderPipelineLayoutDesc desc(&push, 1, set_descs, kSetCount, false, true);
     layout = device->createPipelineLayout(desc);
     if (layout) {
       std::fputs("native open: present pipeline\n", stderr);
@@ -1463,8 +1476,7 @@ struct Renderer::State {
     defaults.push_back(device->createTexture(cube));
     defaults.push_back(device->createTexture(plume::RenderTextureDesc::Texture1D(1, 1, F::R8G8B8A8_UNORM)));
     samplers.push_back(device->createSampler(plume::RenderSamplerDesc()));
-    sets[3]->setSampler(0, samplers[0].get());
-    sets[4]->setSampler(0, samplers[0].get());
+    sets[1]->setSampler(0, samplers[0].get());
   }
 
   bool defaults_uploaded = false;
@@ -1488,10 +1500,10 @@ struct Renderer::State {
       commands->barriers(plume::RenderBarrierStage::GRAPHICS,
                          plume::RenderTextureBarrier(defaults[d].get(), plume::RenderTextureLayout::SHADER_READ));
     }
-    sets[0]->setTexture(0, defaults[0].get(), plume::RenderTextureLayout::SHADER_READ);
-    sets[1]->setTexture(0, defaults[1].get(), plume::RenderTextureLayout::SHADER_READ);
-    sets[2]->setTexture(0, defaults[2].get(), plume::RenderTextureLayout::SHADER_READ);
-    sets[5]->setTexture(0, defaults[3].get(), plume::RenderTextureLayout::SHADER_READ);
+    sets[0]->setTexture(HeapBase(0), defaults[0].get(), plume::RenderTextureLayout::SHADER_READ);
+    sets[0]->setTexture(HeapBase(1), defaults[1].get(), plume::RenderTextureLayout::SHADER_READ);
+    sets[0]->setTexture(HeapBase(2), defaults[2].get(), plume::RenderTextureLayout::SHADER_READ);
+    sets[0]->setTexture(HeapBase(5), defaults[3].get(), plume::RenderTextureLayout::SHADER_READ);
   }
 
   bool LoadShaderCache() {
@@ -1536,7 +1548,7 @@ struct Renderer::State {
     desc.mipmapMode = uint32_t(fetch.mip_filter) == 0 ? plume::RenderMipmapMode::NEAREST : plume::RenderMipmapMode::LINEAR;
     const uint32_t index = uint32_t(samplers.size());
     samplers.push_back(device->createSampler(desc));
-    sets[3]->setSampler(index, samplers.back().get());
+    sets[1]->setSampler(index, samplers.back().get());
     sampler_index[key] = index;
     return index;
   }
@@ -1874,7 +1886,7 @@ struct Renderer::State {
                        plume::RenderTextureBarrier(target, plume::RenderTextureLayout::COLOR_WRITE));
     commands->setFramebuffer(SwapFramebuffer(image));
     commands->setGraphicsPipelineLayout(layout.get());
-    for (uint32_t i = 0; i < 6; ++i) commands->setGraphicsDescriptorSet(sets[i].get(), i);
+    for (uint32_t i = 0; i < kSetCount; ++i) commands->setGraphicsDescriptorSet(sets[i].get(), i);
     commands->setPipeline(present_pipeline.get());
     const uint64_t push[3] = {upload_gpu + constants, 0, 0};
     commands->setGraphicsPushConstants(0, push, 0, sizeof(push));
@@ -2469,7 +2481,7 @@ struct Renderer::State {
                           depth_image.depth_view.get());
       commands->setFramebuffer(entry.framebuffer.get());
       commands->setGraphicsPipelineLayout(layout.get());
-      for (uint32_t i = 0; i < 6; ++i) commands->setGraphicsDescriptorSet(sets[i].get(), i);
+      for (uint32_t i = 0; i < kSetCount; ++i) commands->setGraphicsDescriptorSet(sets[i].get(), i);
       commands->setPipeline(depth_resolve_pipeline.get());
       const uint64_t push[3] = {upload_gpu + op.constants, 0, 0};
       commands->setGraphicsPushConstants(0, push, 0, sizeof(push));

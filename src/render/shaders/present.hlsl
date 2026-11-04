@@ -19,7 +19,7 @@ struct PushConstants {
 [[vk::push_constant]] ConstantBuffer<PushConstants> g_Push;
 
 Texture2D<float4> g_Textures[] : register(t0, space0);
-SamplerState g_Samplers[] : register(s0, space3);
+[[vk::binding(0, 1)]] SamplerState g_Samplers[] : register(s0, space3);
 
 void VSMain(uint id : SV_VertexID, out float4 position : SV_Position, out float2 uv : TEXCOORD0)
 {

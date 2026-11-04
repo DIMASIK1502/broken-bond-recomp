@@ -186,11 +186,13 @@ float4 vfetchIndexed(uint location, float index, bool rounded)
 #define TEXTURECube_INDEX(SLOT) DESCRIPTOR_INDEX(DESCRIPTOR_KIND_TEXTURECUBE, SLOT)
 #define SAMPLER_INDEX(SLOT)     DESCRIPTOR_INDEX(DESCRIPTOR_KIND_SAMPLER, SLOT)
 
-Texture2D<float4> g_Texture2DDescriptorHeap[] : register(t0, space0);
-Texture3D<float4> g_Texture3DDescriptorHeap[] : register(t0, space1);
-TextureCube<float4> g_TextureCubeDescriptorHeap[] : register(t0, space2);
-SamplerState g_SamplerDescriptorHeap[] : register(s0, space3);
-Texture1D<float4> g_Texture1DDescriptorHeap[] : register(t0, space5);
+// Vulkan: all texture heaps are bindings of set 0 and the samplers are set 1,
+// so a draw binds two sets (Adreno 6xx drivers allow four).
+[[vk::binding(0, 0)]] Texture2D<float4> g_Texture2DDescriptorHeap[] : register(t0, space0);
+[[vk::binding(1, 0)]] Texture3D<float4> g_Texture3DDescriptorHeap[] : register(t0, space1);
+[[vk::binding(2, 0)]] TextureCube<float4> g_TextureCubeDescriptorHeap[] : register(t0, space2);
+[[vk::binding(0, 1)]] SamplerState g_SamplerDescriptorHeap[] : register(s0, space3);
+[[vk::binding(3, 0)]] Texture1D<float4> g_Texture1DDescriptorHeap[] : register(t0, space5);
 
 uint2 getTexture2DDimensions(Texture2D<float4> texture)
 {
