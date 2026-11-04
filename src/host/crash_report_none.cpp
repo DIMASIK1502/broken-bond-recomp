@@ -20,6 +20,7 @@ void InstallCrashReport() {
   const std::filesystem::path path = std::filesystem::path(log_file).parent_path() / "stderr.txt";
   if (std::freopen(path.c_str(), "w", stderr)) {
     std::setvbuf(stderr, nullptr, _IONBF, 0);
+    std::fputs("stderr: ready\n", stderr);
   }
 }
 

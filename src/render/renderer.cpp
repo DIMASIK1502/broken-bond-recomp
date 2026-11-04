@@ -2528,6 +2528,10 @@ const std::string& Renderer::device_name() const { return state_->device_name; }
 
 bool Renderer::Open(void* native_window, std::string& reason) {
   State& s = *state_;
+  // Each step goes to stderr unbuffered before it runs: a driver that
+  // crashes the process (the phone) leaves the last one in stderr.txt.
+  auto step = [](const char* what) { std::fprintf(stderr, "native open: %s\n", what); };
+  step("vulkan interface");
   s.render_interface = plume::CreateVulkanInterface();
   if (!native_window) {
     reason = "the game window has no native handle yet";
@@ -2537,6 +2541,7 @@ bool Renderer::Open(void* native_window, std::string& reason) {
     reason = "no Vulkan interface";
     return false;
   }
+  step("device");
   s.device = s.render_interface->createDevice();
   if (!s.device) {
     reason = "no Vulkan device";
@@ -2551,6 +2556,7 @@ bool Renderer::Open(void* native_window, std::string& reason) {
     return false;
   }
   s.device_name = s.device->getDescription().name;
+  step("queue, fences, command lists");
   s.queue = s.device->createCommandQueue(plume::RenderCommandListType::DIRECT);
   s.fence = s.device->createCommandFence();
   s.commands = s.queue->createCommandList();
@@ -2561,6 +2567,7 @@ bool Renderer::Open(void* native_window, std::string& reason) {
     s.commands_other = s.queue->createCommandList();
     s.acquire_other = s.device->createCommandSemaphore();
   }
+  step("swap chain");
   s.swap_chain = s.queue->createSwapChain(plume::RenderSwapChainDesc(
       static_cast<plume::RenderWindow>(native_window), kSwapChainFormat,
       REXCVAR_GET(native_interpolate)
@@ -2573,10 +2580,12 @@ bool Renderer::Open(void* native_window, std::string& reason) {
   while (s.release.size() < s.swap_chain->getTextureCount()) {
     s.release.push_back(s.device->createCommandSemaphore());
   }
+  step("render target");
   if (!s.CreateTarget()) {
     reason = "no render target";
     return false;
   }
+  step("upload buffer");
   s.upload = s.device->createBuffer(plume::RenderBufferDesc::UploadBuffer(
       kUploadBytes, plume::RenderBufferFlag::VERTEX | plume::RenderBufferFlag::INDEX |
                         plume::RenderBufferFlag::CONSTANT | plume::RenderBufferFlag::DEVICE_ADDRESSABLE));
@@ -2586,16 +2595,20 @@ bool Renderer::Open(void* native_window, std::string& reason) {
   }
   s.upload_cpu = static_cast<uint8_t*>(s.upload->map());
   s.upload_gpu = s.upload->getDeviceAddress();
+  step("pipeline layout");
   if (!s.CreateLayout()) {
     reason = "no pipeline layout";
     return false;
   }
+  step("default resources");
   s.CreateDefaults();
+  step("shader cache");
   if (!s.LoadShaderCache()) {
     reason = "the shader cache did not inflate";
     return false;
   }
   host::ShadowKeepShaderKeys();
+  step("done");
   return true;
 }
 

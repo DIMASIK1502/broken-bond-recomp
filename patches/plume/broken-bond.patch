@@ -1,8 +1,23 @@
 diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
-index 4fdc4bf..8ecc556 100644
+index 4fdc4bf..160a7d9 100644
 --- a/plume_vulkan.cpp
 +++ b/plume_vulkan.cpp
-@@ -3860,17 +3860,22 @@ namespace plume {
+@@ -27,6 +27,14 @@
+ // TODO:
+ // - Fix resource pools.
+ 
++// Android: each startup step goes to stderr first, so a driver that kills
++// the process leaves the last one behind (no debugger on a phone).
++#if defined(__ANDROID__)
++#   define PLUME_STEP(what) fprintf(stderr, "plume: %s\n", what)
++#else
++#   define PLUME_STEP(what) ((void)0)
++#endif
++
+ namespace plume {
+     // Backend constants.
+ 
+@@ -3860,17 +3868,22 @@ namespace plume {
          // Store properties.
          vkGetPhysicalDeviceProperties(physicalDevice, &physicalDeviceProperties);
  
@@ -28,7 +43,7 @@ index 4fdc4bf..8ecc556 100644
          if (scalarBlockLayoutFound) {
              layoutFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES;
              layoutFeatures.pNext = featuresChain;
-@@ -3899,7 +3904,7 @@ namespace plume {
+@@ -3899,7 +3912,7 @@ namespace plume {
          }
  
          VkPhysicalDeviceBufferDeviceAddressFeatures bufferDeviceAddressFeatures = {};
@@ -37,7 +52,23 @@ index 4fdc4bf..8ecc556 100644
          if (bufferDeviceAddressFound) {
              bufferDeviceAddressFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
              bufferDeviceAddressFeatures.pNext = featuresChain;
-@@ -4092,6 +4097,14 @@ namespace plume {
+@@ -3930,6 +3943,7 @@ namespace plume {
+         VkPhysicalDeviceFeatures2 deviceFeatures = {};
+         deviceFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+         deviceFeatures.pNext = featuresChain;
++        PLUME_STEP("device: features");
+         vkGetPhysicalDeviceFeatures2(physicalDevice, &deviceFeatures);
+ 
+         // Check for properties.
+@@ -4080,6 +4094,7 @@ namespace plume {
+         createInfo.enabledExtensionCount = uint32_t(enabledExtensions.size());
+         createInfo.pEnabledFeatures = &deviceFeatures.features;
+ 
++        PLUME_STEP("device: vkCreateDevice");
+         VkResult res = vkCreateDevice(physicalDevice, &createInfo, nullptr, &vk);
+         if (res != VK_SUCCESS) {
+             fprintf(stderr, "vkCreateDevice failed with error code 0x%X.\n", res);
+@@ -4092,6 +4107,14 @@ namespace plume {
              }
          }
  
@@ -52,7 +83,7 @@ index 4fdc4bf..8ecc556 100644
          VmaVulkanFunctions vmaFunctions = {};
          vmaFunctions.vkGetInstanceProcAddr = vkGetInstanceProcAddr;
          vmaFunctions.vkGetDeviceProcAddr = vkGetDeviceProcAddr;
-@@ -4119,7 +4132,10 @@ namespace plume {
+@@ -4119,8 +4142,12 @@ namespace plume {
          allocatorInfo.device = vk;
          allocatorInfo.pVulkanFunctions = &vmaFunctions;
          allocatorInfo.instance = renderInterface->instance;
@@ -62,5 +93,31 @@ index 4fdc4bf..8ecc556 100644
 +        allocatorInfo.vulkanApiVersion = std::min(renderInterface->appInfo.apiVersion,
 +            VK_MAKE_API_VERSION(0, VK_API_VERSION_MAJOR(physicalDeviceProperties.apiVersion), VK_API_VERSION_MINOR(physicalDeviceProperties.apiVersion), 0));
  
++        PLUME_STEP("device: VMA");
          res = vmaCreateAllocator(&allocatorInfo, &allocator);
          if (res != VK_SUCCESS) {
+             fprintf(stderr, "vmaCreateAllocator failed with error code 0x%X.\n", res);
+@@ -4495,6 +4522,7 @@ namespace plume {
+ #else
+     VulkanInterface::VulkanInterface() {
+ #endif
++        PLUME_STEP("instance: volk");
+         VkResult res = volkInitialize();
+         if (res != VK_SUCCESS) {
+             fprintf(stderr, "volkInitialize failed with error code 0x%X.\n", res);
+@@ -4614,6 +4642,7 @@ namespace plume {
+         }
+ #   endif
+         
++        PLUME_STEP("instance: vkCreateInstance");
+         res = vkCreateInstance(&createInfo, nullptr, &instance);
+         if (res != VK_SUCCESS) {
+             fprintf(stderr, "vkCreateInstance failed with error code 0x%X.\n", res);
+@@ -4627,6 +4656,7 @@ namespace plume {
+ 
+         // Fill device names.
+         uint32_t deviceCount = 0;
++        PLUME_STEP("instance: physical devices");
+         vkEnumeratePhysicalDevices(instance, &deviceCount, nullptr);
+         if (deviceCount > 0) {
+             std::vector<VkPhysicalDevice> physicalDevices(deviceCount);
