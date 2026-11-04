@@ -9,8 +9,14 @@ import android.os.Environment;
 import android.provider.DocumentsContract;
 import android.provider.Settings;
 import android.view.Gravity;
+import android.view.View;
+import android.widget.AdapterView;
+import android.widget.ArrayAdapter;
 import android.widget.Button;
+import android.widget.CheckBox;
 import android.widget.LinearLayout;
+import android.widget.ScrollView;
+import android.widget.Spinner;
 import android.widget.TextView;
 
 import java.io.File;
@@ -19,8 +25,20 @@ import java.io.File;
 // The game reads that folder in place; nothing is copied.
 public class LauncherActivity extends Activity {
     private static final int PICK_FOLDER = 1;
-    private static final String PREFS = "launcher";
+    static final String PREFS = "launcher";
     private static final String KEY_GAME_DIR = "game_dir";
+    // Renderer settings, passed to the game as cvars by GameActivity.
+    static final String KEY_SCALE = "native_resolution_scale";
+    static final String KEY_MSAA = "native_msaa";
+    static final String KEY_INTERPOLATE = "native_interpolate";
+    static final String DEFAULT_SCALE = "1";
+    static final String DEFAULT_MSAA = "2";
+
+    private static final String[] SCALE_LABELS = {
+        "По размеру экрана", "360p (0.5)", "540p (0.75)", "720p (1.0)", "1080p (1.5)", "1440p (2.0)"};
+    private static final String[] SCALE_VALUES = {"0", "0.5", "0.75", "1", "1.5", "2"};
+    private static final String[] MSAA_LABELS = {"Выключено", "2x", "4x"};
+    private static final String[] MSAA_VALUES = {"1", "2", "4"};
 
     private TextView status;
     private Button access;
@@ -63,7 +81,23 @@ public class LauncherActivity extends Activity {
         });
         layout.addView(play);
 
-        setContentView(layout);
+        TextView settings = new TextView(this);
+        settings.setText("Графика");
+        settings.setTextSize(18);
+        settings.setPadding(0, pad, 0, 0);
+        layout.addView(settings);
+        layout.addView(choice("Внутреннее разрешение", KEY_SCALE, DEFAULT_SCALE, SCALE_LABELS, SCALE_VALUES));
+        layout.addView(choice("Сглаживание (MSAA)", KEY_MSAA, DEFAULT_MSAA, MSAA_LABELS, MSAA_VALUES));
+        CheckBox interpolate = new CheckBox(this);
+        interpolate.setText("60 FPS (промежуточные кадры)");
+        interpolate.setChecked(prefs().getBoolean(KEY_INTERPOLATE, false));
+        interpolate.setOnCheckedChangeListener(
+                (button, checked) -> prefs().edit().putBoolean(KEY_INTERPOLATE, checked).apply());
+        layout.addView(interpolate);
+
+        ScrollView scroll = new ScrollView(this);
+        scroll.addView(layout);
+        setContentView(scroll);
     }
 
     @Override
@@ -72,8 +106,40 @@ public class LauncherActivity extends Activity {
         refresh();
     }
 
+    private SharedPreferences prefs() {
+        return getSharedPreferences(PREFS, MODE_PRIVATE);
+    }
+
     private String gameDir() {
-        return getSharedPreferences(PREFS, MODE_PRIVATE).getString(KEY_GAME_DIR, "");
+        return prefs().getString(KEY_GAME_DIR, "");
+    }
+
+    // A labelled drop-down that stores values[i] under key.
+    private View choice(String title, String key, String fallback, String[] labels, String[] values) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        TextView label = new TextView(this);
+        label.setText(title);
+        label.setLayoutParams(new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
+        row.addView(label);
+        Spinner spinner = new Spinner(this);
+        spinner.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item, labels));
+        String current = prefs().getString(key, fallback);
+        for (int i = 0; i < values.length; i++) {
+            if (values[i].equals(current)) spinner.setSelection(i);
+        }
+        spinner.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+            @Override
+            public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
+                prefs().edit().putString(key, values[position]).apply();
+            }
+
+            @Override
+            public void onNothingSelected(AdapterView<?> parent) {}
+        });
+        row.addView(spinner);
+        return row;
     }
 
     private static boolean hasGame(String dir) {

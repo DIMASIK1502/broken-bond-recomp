@@ -2,6 +2,8 @@ package com.lahaine.brokenbond;
 
 import java.io.File;
 
+import android.content.SharedPreferences;
+
 import org.libsdl.app.SDLActivity;
 
 // Runs the game. SDL loads the libraries below and calls SDL_main in
@@ -23,6 +25,7 @@ public class GameActivity extends SDLActivity {
         File user = getExternalFilesDir(null);
         File logs = new File(user, "logs");
         logs.mkdirs();
+        SharedPreferences prefs = getSharedPreferences(LauncherActivity.PREFS, MODE_PRIVATE);
         return new String[] {
             "--game_data_root=" + (gameDir != null ? gameDir : ""),
             "--user_data_root=" + user.getPath(),
@@ -30,6 +33,10 @@ public class GameActivity extends SDLActivity {
             "--renderer=native",
             "--mnk_mode",
             "--log_file=" + new File(logs, "native.log").getPath(),
+            "--native_resolution_scale="
+                    + prefs.getString(LauncherActivity.KEY_SCALE, LauncherActivity.DEFAULT_SCALE),
+            "--native_msaa=" + prefs.getString(LauncherActivity.KEY_MSAA, LauncherActivity.DEFAULT_MSAA),
+            "--native_interpolate=" + prefs.getBoolean(LauncherActivity.KEY_INTERPOLATE, false),
         };
     }
 }
