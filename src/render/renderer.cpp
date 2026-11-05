@@ -244,18 +244,30 @@ uint32_t PhysicalView(uint32_t address) {
 // the page range and lifts the protection. Each 4 KB page keeps the clock
 // value of its last write, so a hash taken at clock C still describes the
 // bytes while every page it covers is at C or below.
+//
+// Protecting pages and taking the fault both hold the SDK's global lock and
+// change page protection, which on a phone stalls other threads (audio
+// among them). So a page written to in the last kWatchHotFrames frames is
+// "hot" and is not protected again until it cools down; ranges over it are
+// hashed unwatched meanwhile.
 constexpr uint32_t kWatchPageShift = 12;
 constexpr uint32_t kWatchPages = 0x20000000u >> kWatchPageShift;
+constexpr uint32_t kWatchHotFrames = 120;
 std::atomic<uint32_t> g_watch_clock{1};
 std::unique_ptr<std::atomic<uint32_t>[]> g_watch_page_clock;
+// Frame of each page's last write plus one; 0 for never.
+std::unique_ptr<std::atomic<uint32_t>[]> g_watch_page_frame;
+std::atomic<uint32_t> g_watch_frame{0};
 std::atomic<uint64_t> g_watch_faults{0};
 
 std::pair<uint32_t, uint32_t> OnGuestWrite(void*, uint32_t physical, uint32_t length, bool) {
   const uint32_t clock = g_watch_clock.fetch_add(1, std::memory_order_acq_rel) + 1;
   const uint32_t last = std::min<uint64_t>((uint64_t(physical) + std::max(length, 1u) - 1) >> kWatchPageShift,
                                            kWatchPages - 1);
+  const uint32_t frame = g_watch_frame.load(std::memory_order_relaxed) + 1;
   for (uint32_t page = physical >> kWatchPageShift; page <= last; ++page) {
     g_watch_page_clock[page].store(clock, std::memory_order_release);
+    g_watch_page_frame[page].store(frame, std::memory_order_relaxed);
   }
   g_watch_faults.fetch_add(1, std::memory_order_relaxed);
   // Only the pages written to stop being watched.
@@ -982,8 +994,6 @@ struct Renderer::State {
     // native_watch_memory: watch clock before the texels were last hashed,
     // or UINT32_MAX when they are not watched.
     uint32_t watch_clock = UINT32_MAX;
-    uint32_t watch_strikes = 0;
-    uint64_t watch_paused_until = 0;
     uint32_t width = 0;
     uint32_t height = 0;
     plume::RenderFormat format = kColorFormat;
@@ -1461,31 +1471,39 @@ struct Renderer::State {
     uint32_t physical = 0, bytes = 0;
     uint64_t seed = 0, hash = 0;
     uint32_t clock = 0;  // watch clock before the bytes were hashed
-    uint32_t strikes = 0;
-    uint64_t paused_until = 0, last_used = 0;
+    uint64_t last_used = 0;
     bool valid = false;
   };
   std::unordered_map<uint64_t, WatchedHash> watched;
   bool watch_registered = false;
-  uint64_t watch_hits = 0, watch_misses = 0, watch_paused = 0;
+  uint64_t watch_hits = 0, watch_misses = 0, watch_paused = 0, watch_arms = 0;
   uint64_t texture_watch_hits = 0;
 
   void RegisterWatch() {
     if (watch_registered) return;
     watch_registered = true;
     g_watch_page_clock = std::make_unique<std::atomic<uint32_t>[]>(kWatchPages);
+    g_watch_page_frame = std::make_unique<std::atomic<uint32_t>[]>(kWatchPages);
     rex::system::kernel_memory()->RegisterPhysicalMemoryInvalidationCallback(OnGuestWrite, nullptr);
   }
 
   // Write-protects a guest range in the 0xA0000000 view before its bytes are
   // hashed. Returns the watch clock to keep with the hash, or UINT32_MAX when
-  // the range is not watched.
+  // the range is not watched (out of the view, or over a hot page).
   uint32_t ArmWatch(uint32_t address, uint32_t bytes) {
     if (!REXCVAR_GET(native_watch_memory) || bytes == 0 || address < 0xA0000000u ||
         uint64_t(address) + bytes > 0xC0000000u) {
       return UINT32_MAX;
     }
     RegisterWatch();
+    const uint32_t physical = address - 0xA0000000u;
+    const uint32_t frame = uint32_t(presents) + 1;
+    for (uint32_t page = physical >> kWatchPageShift, last = (physical + bytes - 1) >> kWatchPageShift;
+         page <= last; ++page) {
+      const uint32_t written = g_watch_page_frame[page].load(std::memory_order_relaxed);
+      if (written != 0 && frame - written < kWatchHotFrames) return UINT32_MAX;
+    }
+    ++watch_arms;
     const uint32_t clock = g_watch_clock.load(std::memory_order_acquire);
     rex::system::kernel_memory()->EnablePhysicalMemoryAccessCallbacks(address - 0xA0000000u, bytes, true, false);
     return clock;
@@ -1507,27 +1525,16 @@ struct Renderer::State {
       w.seed = seed;
     }
     w.last_used = presents;
-    if (w.valid) {
-      if (WatchedPagesClean(physical, bytes, w.clock)) {
-        ++watch_hits;
-        w.strikes = 0;
-        return w.hash;
-      }
-      // Rewritten since. Data rewritten frame after frame would fault on
-      // every write, so it is hashed unwatched for a while.
-      if (++w.strikes >= 2) w.paused_until = presents + 300;
+    if (w.valid && WatchedPagesClean(physical, bytes, w.clock)) {
+      ++watch_hits;
+      return w.hash;
     }
-    w.valid = false;
-    if (presents < w.paused_until) {
-      ++watch_paused;
-      return XXH3_64bits_withSeed(At(base, address), bytes, seed);
-    }
-    ++watch_misses;
     // The clock is read before the pages are protected: a write landing
     // between the two only costs one more hash.
     w.clock = ArmWatch(address, bytes);
     w.hash = XXH3_64bits_withSeed(At(base, address), bytes, seed);
-    w.valid = true;
+    w.valid = w.clock != UINT32_MAX;
+    ++(w.valid ? watch_misses : watch_paused);
     return w.hash;
   }
   std::chrono::steady_clock::time_point lap_start;
@@ -2067,15 +2074,13 @@ struct Renderer::State {
       if (known.watch_clock != UINT32_MAX) {
         if (WatchedPagesClean(guest_address - 0xA0000000u, bytes, known.watch_clock)) {
           ++texture_watch_hits;
-          known.watch_strikes = 0;
           return known.index;
         }
-        // Texels rewritten frame after frame are compared unwatched for a
-        // while instead of faulting on every write.
-        if (++known.watch_strikes >= 2) known.watch_paused_until = presents + 300;
         known.watch_clock = UINT32_MAX;
       }
-      if (presents >= known.watch_paused_until) watch_clock = ArmWatch(guest_address, bytes);
+      // Texels rewritten lately stay unwatched (ArmWatch refuses hot pages)
+      // and are compared as before.
+      watch_clock = ArmWatch(guest_address, bytes);
       bool unchanged;
       if (watch_clock != UINT32_MAX) {
         // The watch stands in for the periodic full hash from now on, so a
@@ -4292,6 +4297,7 @@ void Renderer::Present(uint32_t frontbuffer, const uint8_t* base) {
     REXLOG_INFO("native: wrote {}", path);
   }
   ++s.presents;
+  g_watch_frame.store(uint32_t(s.presents), std::memory_order_relaxed);
   ++s.fetch_generation;
 #if defined(_WIN32)
   // F9 (on its press) dumps the next frame.
@@ -4379,10 +4385,10 @@ std::string Renderer::TakeStats() {
   out += fmt::format(" fetch_memo={}/{}", s.fetch_memo_hits, s.fetch_memo_misses);
   s.fetch_memo_hits = s.fetch_memo_misses = 0;
   if (REXCVAR_GET(native_watch_memory)) {
-    out += fmt::format(" watch hit={} miss={} paused={} faults={} ranges={} textures={}", s.watch_hits,
+    out += fmt::format(" watch hit={} miss={} paused={} faults={} ranges={} textures={} arms={}", s.watch_hits,
                        s.watch_misses, s.watch_paused, g_watch_faults.exchange(0, std::memory_order_relaxed),
-                       s.watched.size(), s.texture_watch_hits);
-    s.watch_hits = s.watch_misses = s.watch_paused = s.texture_watch_hits = 0;
+                       s.watched.size(), s.texture_watch_hits, s.watch_arms);
+    s.watch_hits = s.watch_misses = s.watch_paused = s.texture_watch_hits = s.watch_arms = 0;
   }
   out += " laps";
   for (const double ms : s.ms_lap) out += fmt::format(" {:.0f}", ms);
