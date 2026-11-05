@@ -47,7 +47,8 @@ public class LauncherActivity extends Activity {
     static final String KEY_LOW_LATENCY = "low_latency";
     // Vulkan commands recorded on a second thread (native_record_thread).
     static final String KEY_RECORD_THREAD = "record_thread";
-    // Vertex and index hashes kept until the game writes to them (native_watch_memory).
+    // Vertex, index and texture checks skipped while the game leaves them alone
+    // (native_watch_memory).
     static final String KEY_WATCH_MEMORY = "watch_memory";
     // A custom Vulkan driver (AdrenoTools package, e.g. Turnip): the .so path
     // inside the private folder, and a name to show.
@@ -130,7 +131,7 @@ public class LauncherActivity extends Activity {
                 (button, checked) -> prefs().edit().putBoolean(KEY_RECORD_THREAD, checked).apply());
         layout.addView(recordThread);
         CheckBox watchMemory = new CheckBox(this);
-        watchMemory.setText("Не пересчитывать неизменную геометрию (быстрее в боях)");
+        watchMemory.setText("Не пересчитывать неизменные данные (быстрее в боях)");
         watchMemory.setChecked(prefs().getBoolean(KEY_WATCH_MEMORY, true));
         watchMemory.setOnCheckedChangeListener(
                 (button, checked) -> prefs().edit().putBoolean(KEY_WATCH_MEMORY, checked).apply());

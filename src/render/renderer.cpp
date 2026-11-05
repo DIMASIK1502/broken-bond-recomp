@@ -979,6 +979,11 @@ struct Renderer::State {
     uint64_t content = 0;   // XXH3 of the guest texels last uploaded
     uint64_t sample = 0;    // SampleHash of the same texels
     uint64_t checked = UINT64_MAX;  // present the content was last compared
+    // native_watch_memory: watch clock before the texels were last hashed,
+    // or UINT32_MAX when they are not watched.
+    uint32_t watch_clock = UINT32_MAX;
+    uint32_t watch_strikes = 0;
+    uint64_t watch_paused_until = 0;
     uint32_t width = 0;
     uint32_t height = 0;
     plume::RenderFormat format = kColorFormat;
@@ -1463,6 +1468,28 @@ struct Renderer::State {
   std::unordered_map<uint64_t, WatchedHash> watched;
   bool watch_registered = false;
   uint64_t watch_hits = 0, watch_misses = 0, watch_paused = 0;
+  uint64_t texture_watch_hits = 0;
+
+  void RegisterWatch() {
+    if (watch_registered) return;
+    watch_registered = true;
+    g_watch_page_clock = std::make_unique<std::atomic<uint32_t>[]>(kWatchPages);
+    rex::system::kernel_memory()->RegisterPhysicalMemoryInvalidationCallback(OnGuestWrite, nullptr);
+  }
+
+  // Write-protects a guest range in the 0xA0000000 view before its bytes are
+  // hashed. Returns the watch clock to keep with the hash, or UINT32_MAX when
+  // the range is not watched.
+  uint32_t ArmWatch(uint32_t address, uint32_t bytes) {
+    if (!REXCVAR_GET(native_watch_memory) || bytes == 0 || address < 0xA0000000u ||
+        uint64_t(address) + bytes > 0xC0000000u) {
+      return UINT32_MAX;
+    }
+    RegisterWatch();
+    const uint32_t clock = g_watch_clock.load(std::memory_order_acquire);
+    rex::system::kernel_memory()->EnablePhysicalMemoryAccessCallbacks(address - 0xA0000000u, bytes, true, false);
+    return clock;
+  }
 
   uint64_t HashGuest(const uint8_t* base, uint32_t address, uint32_t bytes, uint64_t seed) {
     // Only the 0xA0000000 view maps physical memory one to one.
@@ -1470,11 +1497,7 @@ struct Renderer::State {
         uint64_t(address) + bytes > 0xC0000000u) {
       return XXH3_64bits_withSeed(At(base, address), bytes, seed);
     }
-    if (!watch_registered) {
-      watch_registered = true;
-      g_watch_page_clock = std::make_unique<std::atomic<uint32_t>[]>(kWatchPages);
-      rex::system::kernel_memory()->RegisterPhysicalMemoryInvalidationCallback(OnGuestWrite, nullptr);
-    }
+    RegisterWatch();
     const uint32_t physical = address - 0xA0000000u;
     WatchedHash& w = watched[(seed ^ ((uint64_t(physical) << 32) | bytes)) * 0x9E3779B97F4A7C15ull];
     if (w.physical != physical || w.bytes != bytes || w.seed != seed) {
@@ -1502,8 +1525,7 @@ struct Renderer::State {
     ++watch_misses;
     // The clock is read before the pages are protected: a write landing
     // between the two only costs one more hash.
-    w.clock = g_watch_clock.load(std::memory_order_acquire);
-    rex::system::kernel_memory()->EnablePhysicalMemoryAccessCallbacks(physical, bytes, true, false);
+    w.clock = ArmWatch(address, bytes);
     w.hash = XXH3_64bits_withSeed(At(base, address), bytes, seed);
     w.valid = true;
     return w.hash;
@@ -2034,18 +2056,47 @@ struct Renderer::State {
       Skip("texture size");
       return 0;
     }
-    const uint8_t* guest = At(base, PhysicalView(fetch.base_address << 12));
+    const uint32_t guest_address = PhysicalView(fetch.base_address << 12);
+    const uint8_t* guest = At(base, guest_address);
     uint64_t content = 0, sample = 0;
+    uint32_t watch_clock = UINT32_MAX;
     if (found != textures.end()) {
-      found->second.checked = presents;
-      if (Unchanged(found->second, guest, bytes, content, sample)) {
-        found->second.sample = sample;
-        return found->second.index;
+      Texture& known = found->second;
+      known.checked = presents;
+      // Watched texels nobody wrote to since they were hashed need no look.
+      if (known.watch_clock != UINT32_MAX) {
+        if (WatchedPagesClean(guest_address - 0xA0000000u, bytes, known.watch_clock)) {
+          ++texture_watch_hits;
+          known.watch_strikes = 0;
+          return known.index;
+        }
+        // Texels rewritten frame after frame are compared unwatched for a
+        // while instead of faulting on every write.
+        if (++known.watch_strikes >= 2) known.watch_paused_until = presents + 300;
+        known.watch_clock = UINT32_MAX;
+      }
+      if (presents >= known.watch_paused_until) watch_clock = ArmWatch(guest_address, bytes);
+      bool unchanged;
+      if (watch_clock != UINT32_MAX) {
+        // The watch stands in for the periodic full hash from now on, so a
+        // newly watched texture is compared whole: a small rewrite the
+        // sample misses would otherwise stay unseen for good.
+        sample = SampleHash(guest, bytes);
+        content = bytes <= 16384 ? sample : XXH3_64bits(guest, bytes);
+        unchanged = content == known.content;
+      } else {
+        unchanged = Unchanged(known, guest, bytes, content, sample);
+      }
+      if (unchanged) {
+        known.sample = sample;
+        known.watch_clock = watch_clock;
+        return known.index;
       }
       ++reuploads;
     } else if (next_texture2d >= kTexture2DCount) {
       return 0;
     } else {
+      watch_clock = ArmWatch(guest_address, bytes);
       sample = SampleHash(guest, bytes);
       content = bytes <= 16384 ? sample : XXH3_64bits(guest, bytes);
     }
@@ -2093,6 +2144,7 @@ struct Renderer::State {
     texture.content = content;
     texture.sample = sample;
     texture.checked = presents;
+    texture.watch_clock = watch_clock;
     const uint32_t row_texels = uint32_t(row / linear.block_bytes) * linear.block_width;
     Rec([this, target = texture.texture.get(), host, width, height, row_texels, offset] {
       commands->barriers(plume::RenderBarrierStage::COPY,
@@ -4327,9 +4379,10 @@ std::string Renderer::TakeStats() {
   out += fmt::format(" fetch_memo={}/{}", s.fetch_memo_hits, s.fetch_memo_misses);
   s.fetch_memo_hits = s.fetch_memo_misses = 0;
   if (REXCVAR_GET(native_watch_memory)) {
-    out += fmt::format(" watch hit={} miss={} paused={} faults={} ranges={}", s.watch_hits, s.watch_misses,
-                       s.watch_paused, g_watch_faults.exchange(0, std::memory_order_relaxed), s.watched.size());
-    s.watch_hits = s.watch_misses = s.watch_paused = 0;
+    out += fmt::format(" watch hit={} miss={} paused={} faults={} ranges={} textures={}", s.watch_hits,
+                       s.watch_misses, s.watch_paused, g_watch_faults.exchange(0, std::memory_order_relaxed),
+                       s.watched.size(), s.texture_watch_hits);
+    s.watch_hits = s.watch_misses = s.watch_paused = s.texture_watch_hits = 0;
   }
   out += " laps";
   for (const double ms : s.ms_lap) out += fmt::format(" {:.0f}", ms);
