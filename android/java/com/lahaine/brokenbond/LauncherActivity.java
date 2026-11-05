@@ -52,6 +52,8 @@ public class LauncherActivity extends Activity {
     static final String KEY_WATCH_MEMORY = "watch_memory";
     // Game threads kept on the big CPU cores with a performance hint (android_big_cores).
     static final String KEY_BIG_CORES = "big_cores";
+    // Game thread sampled into the log every 5 s (android_profile).
+    static final String KEY_PROFILE = "profile";
     // A custom Vulkan driver (AdrenoTools package, e.g. Turnip): the .so path
     // inside the private folder, and a name to show.
     static final String KEY_DRIVER = "vulkan_driver";
@@ -144,6 +146,12 @@ public class LauncherActivity extends Activity {
         bigCores.setOnCheckedChangeListener(
                 (button, checked) -> prefs().edit().putBoolean(KEY_BIG_CORES, checked).apply());
         layout.addView(bigCores);
+        CheckBox profile = new CheckBox(this);
+        profile.setText("Профилировщик в лог (для отладки)");
+        profile.setChecked(prefs().getBoolean(KEY_PROFILE, false));
+        profile.setOnCheckedChangeListener(
+                (button, checked) -> prefs().edit().putBoolean(KEY_PROFILE, checked).apply());
+        layout.addView(profile);
 
         // libadrenotools is arm64 only (Snapdragon phones).
         if (Build.SUPPORTED_ABIS.length > 0 && Build.SUPPORTED_ABIS[0].startsWith("arm64")) {

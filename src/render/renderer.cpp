@@ -58,8 +58,13 @@ extern "C" __declspec(dllimport) short __stdcall GetAsyncKeyState(int key);
 #include <adrenotools/driver.h>
 #endif
 #if defined(__ANDROID__)
+#include <cxxabi.h>
 #include <dlfcn.h>
+#include <pthread.h>
 #include <sched.h>
+#include <signal.h>
+#include <time.h>
+#include <ucontext.h>
 #include <unistd.h>
 #endif
 
@@ -80,6 +85,10 @@ REXCVAR_DEFINE_BOOL(android_big_cores, false, "Game",
                     "On Android, keep the game and recording threads on the fastest CPU cores and tell the system "
                     "(performance hint) how long their frames take, so it does not move them to slow cores or "
                     "lower the clock mid-fight")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(android_profile, false, "Game",
+                    "On Android, sample the game thread's call stack 1000 times a second and log the functions it "
+                    "spends its time in every 5 s (a profiler for a phone with no adb at hand)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_STRING(android_vulkan_driver, "", "Game",
                       "Android arm64: a custom Vulkan driver (the .so of an AdrenoTools package such as Turnip, "
@@ -348,6 +357,143 @@ struct PerformanceHint {
     if (session) report(session, ns);
   }
 };
+#endif
+
+#if defined(__ANDROID__) && defined(__aarch64__)
+// android_profile: a timer signal samples the game thread's program counter
+// and its frame-pointer chain into a ring the 5 s stats drain. The handler
+// only reads registers and the thread's own stack, within its bounds.
+namespace profiler {
+constexpr uint32_t kDepth = 16;
+constexpr uint32_t kRing = 16384;  // 16 s at 1 kHz; drained every 5 s
+struct Sample {
+  uintptr_t pc[kDepth];
+  uint32_t depth;
+};
+Sample g_ring[kRing];
+std::atomic<uint32_t> g_head{0};
+uint32_t g_tail = 0;
+uintptr_t g_stack_low = 0, g_stack_high = 0;
+
+uintptr_t Strip(uintptr_t address) { return address & ((uintptr_t(1) << 48) - 1); }
+
+void OnSample(int, siginfo_t*, void* context) {
+  const auto& mc = static_cast<ucontext_t*>(context)->uc_mcontext;
+  const uint32_t at = g_head.load(std::memory_order_relaxed);
+  Sample& sample = g_ring[at % kRing];
+  uint32_t depth = 0;
+  sample.pc[depth++] = Strip(mc.pc);
+  sample.pc[depth++] = Strip(mc.regs[30]);  // lr: the caller of a leaf without a frame
+  uintptr_t fp = mc.regs[29];
+  while (depth < kDepth && fp >= g_stack_low && fp + 16 <= g_stack_high && (fp & 7) == 0) {
+    const uintptr_t* frame = reinterpret_cast<const uintptr_t*>(fp);
+    const uintptr_t ret = Strip(frame[1]);
+    if (ret != sample.pc[depth - 1]) sample.pc[depth++] = ret;
+    if (frame[0] <= fp) break;
+    fp = frame[0];
+  }
+  sample.depth = depth;
+  g_head.store(at + 1, std::memory_order_release);
+}
+
+void Start() {
+  pthread_attr_t attr;
+  if (pthread_getattr_np(pthread_self(), &attr) == 0) {
+    void* low = nullptr;
+    size_t size = 0;
+    pthread_attr_getstack(&attr, &low, &size);
+    pthread_attr_destroy(&attr);
+    g_stack_low = reinterpret_cast<uintptr_t>(low);
+    g_stack_high = g_stack_low + size;
+  }
+  struct sigaction action {};
+  action.sa_sigaction = OnSample;
+  action.sa_flags = SA_SIGINFO | SA_RESTART;
+  sigemptyset(&action.sa_mask);
+  sigaction(SIGPROF, &action, nullptr);
+  sigevent event{};
+  event.sigev_notify = SIGEV_THREAD_ID;
+  event.sigev_signo = SIGPROF;
+  event.sigev_notify_thread_id = gettid();
+  timer_t timer;
+  if (timer_create(CLOCK_MONOTONIC, &event, &timer) != 0) {
+    REXLOG_WARN("native: profiler timer failed");
+    return;
+  }
+  itimerspec every{};
+  every.it_interval.tv_nsec = 1'000'000;
+  every.it_value.tv_nsec = 1'000'000;
+  timer_settime(timer, 0, &every, nullptr);
+  REXLOG_INFO("native: profiling the game thread at 1 kHz");
+}
+
+// Name of the function holding `pc` (exported symbols; the game's and the
+// SDK's are), or module+offset.
+const std::string& NameOf(uintptr_t pc) {
+  static std::unordered_map<uintptr_t, std::string> names;
+  static std::unordered_map<uintptr_t, uintptr_t> function_of;
+  auto known = function_of.find(pc);
+  if (known == function_of.end()) {
+    Dl_info info{};
+    uintptr_t function = pc;
+    std::string name;
+    if (dladdr(reinterpret_cast<void*>(pc), &info) && info.dli_fname) {
+      const char* module = std::strrchr(info.dli_fname, '/');
+      module = module ? module + 1 : info.dli_fname;
+      if (info.dli_sname && info.dli_saddr) {
+        function = reinterpret_cast<uintptr_t>(info.dli_saddr);
+        int status = 0;
+        char* demangled = abi::__cxa_demangle(info.dli_sname, nullptr, nullptr, &status);
+        name = demangled && status == 0 ? demangled : info.dli_sname;
+        std::free(demangled);
+        if (name.size() > 90) name = name.substr(0, 90) + "...";
+        name += fmt::format(" [{}]", module);
+      } else {
+        name = fmt::format("{}+{:x}", module, pc - reinterpret_cast<uintptr_t>(info.dli_fbase));
+      }
+    } else {
+      name = fmt::format("?{:x}", pc);
+    }
+    known = function_of.emplace(pc, function).first;
+    names.emplace(function, std::move(name));
+  }
+  return names[known->second];
+}
+
+// Logs the functions the game thread was in (self) and under (total) since
+// the last report.
+void Report() {
+  const uint32_t head = g_head.load(std::memory_order_acquire);
+  const uint32_t count = std::min(head - g_tail, kRing);
+  if (count == 0) return;
+  std::unordered_map<const std::string*, uint32_t> self, total;
+  std::vector<const std::string*> seen;
+  for (uint32_t i = head - count; i != head; ++i) {
+    const Sample& sample = g_ring[i % kRing];
+    seen.clear();
+    for (uint32_t d = 0; d < sample.depth; ++d) {
+      const std::string* name = &NameOf(sample.pc[d]);
+      if (d == 0) ++self[name];
+      if (std::find(seen.begin(), seen.end(), name) == seen.end()) {
+        seen.push_back(name);
+        ++total[name];
+      }
+    }
+  }
+  g_tail = head;
+  auto top = [&](std::unordered_map<const std::string*, uint32_t>& counts, const char* what) {
+    std::vector<std::pair<uint32_t, const std::string*>> sorted;
+    for (const auto& [name, n] : counts) sorted.emplace_back(n, name);
+    std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    for (size_t i = 0; i < std::min<size_t>(sorted.size(), 25); ++i) {
+      REXLOG_INFO("profile {} {:5.1f}% {}", what, 100.0 * sorted[i].first / count, *sorted[i].second);
+    }
+  };
+  REXLOG_INFO("profile: {} samples of the game thread", count);
+  top(self, "self ");
+  top(total, "total");
+}
+}  // namespace profiler
 #endif
 
 bool WatchedPagesClean(uint32_t physical, uint32_t bytes, uint32_t clock) {
@@ -1698,6 +1844,7 @@ struct Renderer::State {
 #if defined(__ANDROID__)
   std::atomic<int32_t> recorder_tid{0};
   bool game_thread_set = false;
+  bool profiling = false;
   PerformanceHint hint;
   std::chrono::steady_clock::time_point last_present{};
 #endif
@@ -4206,6 +4353,12 @@ void Renderer::Present(uint32_t frontbuffer, const uint8_t* base) {
   s.deferring = false;
   ++s.frames;
 #if defined(__ANDROID__)
+#if defined(__aarch64__)
+  if (REXCVAR_GET(android_profile) && !s.profiling) {
+    s.profiling = true;
+    profiler::Start();
+  }
+#endif
   if (const int cpu = sched_getcpu(); cpu >= 0) ++s.frames_on_cpu[std::min(cpu, 15)];
   if (REXCVAR_GET(android_big_cores)) {
     const auto now = std::chrono::steady_clock::now();
@@ -4512,6 +4665,9 @@ std::string Renderer::TakeStats() {
     if (s.frames_on_cpu[cpu] != 0) out += fmt::format(" {}:{}", cpu, s.frames_on_cpu[cpu]);
   }
   s.frames_on_cpu.fill(0);
+#if defined(__aarch64__)
+  if (s.profiling) profiler::Report();
+#endif
 #endif
   s.fetch_memo_hits = s.fetch_memo_misses = 0;
   if (REXCVAR_GET(native_watch_memory)) {
