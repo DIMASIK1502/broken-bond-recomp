@@ -25,6 +25,9 @@
         android:largeHeap="true"
         android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
 
+        <!-- Lets simpleperf sample the release build over adb. -->
+        <profileable android:shell="true" />
+
         <activity
             android:name=".LauncherActivity"
             android:exported="true">
