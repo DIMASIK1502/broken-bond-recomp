@@ -4,6 +4,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
@@ -56,6 +57,11 @@ extern "C" __declspec(dllimport) short __stdcall GetAsyncKeyState(int key);
 
 #include <adrenotools/driver.h>
 #endif
+#if defined(__ANDROID__)
+#include <dlfcn.h>
+#include <sched.h>
+#include <unistd.h>
+#endif
 
 namespace plume {
 std::unique_ptr<RenderInterface> CreateVulkanInterface();
@@ -69,6 +75,11 @@ REXCVAR_DEFINE_INT32(native_dump_frame, 0, "Game",
 REXCVAR_DEFINE_BOOL(native_decl_swizzle, true, "Game",
                     "With renderer=native, apply the vertex declaration swizzle (D3DCOLOR is zyxw) "
                     "while gathering streams")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(android_big_cores, false, "Game",
+                    "On Android, keep the game and recording threads on the fastest CPU cores and tell the system "
+                    "(performance hint) how long their frames take, so it does not move them to slow cores or "
+                    "lower the clock mid-fight")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_STRING(android_vulkan_driver, "", "Game",
                       "Android arm64: a custom Vulkan driver (the .so of an AdrenoTools package such as Turnip, "
@@ -273,6 +284,71 @@ std::pair<uint32_t, uint32_t> OnGuestWrite(void*, uint32_t physical, uint32_t le
   // Only the pages written to stop being watched.
   return {physical, length};
 }
+
+#if defined(__ANDROID__)
+// The CPUs of every cluster but the slowest one, by their top clock.
+cpu_set_t BigCores() {
+  cpu_set_t set;
+  CPU_ZERO(&set);
+  std::vector<std::pair<int, long>> cpus;
+  long lowest = LONG_MAX;
+  const long count = sysconf(_SC_NPROCESSORS_CONF);
+  for (int cpu = 0; cpu < count && cpu < CPU_SETSIZE; ++cpu) {
+    FILE* f = std::fopen(fmt::format("/sys/devices/system/cpu/cpu{}/cpufreq/cpuinfo_max_freq", cpu).c_str(), "r");
+    if (!f) continue;
+    long khz = 0;
+    if (std::fscanf(f, "%ld", &khz) == 1 && khz > 0) {
+      cpus.emplace_back(cpu, khz);
+      lowest = std::min(lowest, khz);
+    }
+    std::fclose(f);
+  }
+  for (const auto& [cpu, khz] : cpus) {
+    if (khz > lowest) CPU_SET(cpu, &set);
+  }
+  return set;
+}
+
+void PinToBigCores(const char* thread) {
+  cpu_set_t set = BigCores();
+  if (CPU_COUNT(&set) == 0) return;
+  std::string list;
+  for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+    if (CPU_ISSET(cpu, &set)) list += fmt::format("{}{}", list.empty() ? "" : ",", cpu);
+  }
+  if (sched_setaffinity(0, sizeof(set), &set) == 0) {
+    REXLOG_INFO("native: {} thread kept on CPUs {}", thread, list);
+  } else {
+    REXLOG_WARN("native: could not keep the {} thread on CPUs {}", thread, list);
+  }
+}
+
+// Android's performance hint (ADPF, API 33): the threads of a session get
+// the clock and cores their reported frame times call for. Loaded at run
+// time since the APK also runs on API 30.
+struct PerformanceHint {
+  using ReportFn = int (*)(void*, int64_t);
+  void* session = nullptr;
+  ReportFn report = nullptr;
+
+  void Start(const std::vector<int32_t>& threads, int64_t target_ns) {
+    void* lib = dlopen("libandroid.so", RTLD_NOW);
+    if (!lib) return;
+    using GetManagerFn = void* (*)();
+    using CreateFn = void* (*)(void*, const int32_t*, size_t, int64_t);
+    auto get_manager = reinterpret_cast<GetManagerFn>(dlsym(lib, "APerformanceHint_getManager"));
+    auto create = reinterpret_cast<CreateFn>(dlsym(lib, "APerformanceHint_createSession"));
+    report = reinterpret_cast<ReportFn>(dlsym(lib, "APerformanceHint_reportActualWorkDuration"));
+    void* manager = get_manager ? get_manager() : nullptr;
+    session = manager && create && report ? create(manager, threads.data(), threads.size(), target_ns) : nullptr;
+    REXLOG_INFO("native: performance hint session {}", session ? "started" : "unavailable");
+  }
+
+  void Report(int64_t ns) {
+    if (session) report(session, ns);
+  }
+};
+#endif
 
 bool WatchedPagesClean(uint32_t physical, uint32_t bytes, uint32_t clock) {
   const uint32_t last = (physical + bytes - 1) >> kWatchPageShift;
@@ -1615,6 +1691,16 @@ struct Renderer::State {
   // directly. Turnip's per-draw recording took a quarter of a phone's game
   // thread in fights.
   std::thread recorder;
+  double ms_recorder = 0;  // the recording thread's busy time, under record_mutex
+  double ms_flush = 0;     // the game thread's wait for it at Present
+  uint32_t frames = 0;
+  std::array<uint32_t, 16> frames_on_cpu{};  // the game thread's CPU at each Present
+#if defined(__ANDROID__)
+  std::atomic<int32_t> recorder_tid{0};
+  bool game_thread_set = false;
+  PerformanceHint hint;
+  std::chrono::steady_clock::time_point last_present{};
+#endif
   std::mutex record_mutex;
   std::condition_variable record_wake;
   std::condition_variable record_idle;
@@ -1651,6 +1737,10 @@ struct Renderer::State {
   }
 
   void RecorderLoop() {
+#if defined(__ANDROID__)
+    recorder_tid = gettid();
+    if (REXCVAR_GET(android_big_cores)) PinToBigCores("recording");
+#endif
     std::vector<std::function<void()>> batch;
     std::unique_lock<std::mutex> lock(record_mutex);
     while (true) {
@@ -1665,9 +1755,12 @@ struct Renderer::State {
       batch.swap(record_queue);
       record_busy = true;
       lock.unlock();
+      const auto t_batch = std::chrono::steady_clock::now();
       for (auto& fn : batch) fn();
       batch.clear();
+      const auto busy = std::chrono::steady_clock::now() - t_batch;
       lock.lock();
+      ms_recorder += std::chrono::duration<double, std::milli>(busy).count();
       record_busy = false;
     }
   }
@@ -4105,8 +4198,31 @@ void Renderer::Present(uint32_t frontbuffer, const uint8_t* base) {
   s.UploadDefaults();
   // Present records directly (and replays, reads back, submits): the
   // recording thread's queue is drained first.
-  s.Flush();
+  {
+    const auto t_flush = std::chrono::steady_clock::now();
+    s.Flush();
+    s.ms_flush += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_flush).count();
+  }
   s.deferring = false;
+  ++s.frames;
+#if defined(__ANDROID__)
+  if (const int cpu = sched_getcpu(); cpu >= 0) ++s.frames_on_cpu[std::min(cpu, 15)];
+  if (REXCVAR_GET(android_big_cores)) {
+    const auto now = std::chrono::steady_clock::now();
+    if (!s.game_thread_set) {
+      s.game_thread_set = true;
+      PinToBigCores("game");
+      std::vector<int32_t> threads{int32_t(gettid())};
+      if (const int32_t tid = s.recorder_tid.load(); tid != 0) threads.push_back(tid);
+      s.hint.Start(threads, 16'666'667);
+    } else {
+      // Present to present: what a 60 Hz frame took, waits included, so a
+      // frame over budget asks for more clock.
+      s.hint.Report(std::chrono::duration_cast<std::chrono::nanoseconds>(now - s.last_present).count());
+    }
+    s.last_present = now;
+  }
+#endif
   // Swap shows a texture: the last resolve into it when there was one, else
   // whatever the target holds.
   if (s.current) s.ResolveMsaa(*s.current->color);
@@ -4383,6 +4499,20 @@ std::string Renderer::TakeStats() {
   out += fmt::format(" indices hit={} miss={} cached={}", s.index_hits, s.index_misses, s.index_cache.size());
   s.index_hits = s.index_misses = 0;
   out += fmt::format(" fetch_memo={}/{}", s.fetch_memo_hits, s.fetch_memo_misses);
+  {
+    std::lock_guard<std::mutex> lock(s.record_mutex);
+    out += fmt::format(" frames={} flush={:.0f} recorder={:.0f}", s.frames, s.ms_flush, s.ms_recorder);
+    s.ms_recorder = 0;
+  }
+  s.ms_flush = 0;
+  s.frames = 0;
+#if defined(__ANDROID__)
+  out += " game_cpu";
+  for (size_t cpu = 0; cpu < s.frames_on_cpu.size(); ++cpu) {
+    if (s.frames_on_cpu[cpu] != 0) out += fmt::format(" {}:{}", cpu, s.frames_on_cpu[cpu]);
+  }
+  s.frames_on_cpu.fill(0);
+#endif
   s.fetch_memo_hits = s.fetch_memo_misses = 0;
   if (REXCVAR_GET(native_watch_memory)) {
     out += fmt::format(" watch hit={} miss={} paused={} faults={} ranges={} textures={} arms={}", s.watch_hits,

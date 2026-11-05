@@ -50,6 +50,8 @@ public class LauncherActivity extends Activity {
     // Vertex, index and texture checks skipped while the game leaves them alone
     // (native_watch_memory).
     static final String KEY_WATCH_MEMORY = "watch_memory";
+    // Game threads kept on the big CPU cores with a performance hint (android_big_cores).
+    static final String KEY_BIG_CORES = "big_cores";
     // A custom Vulkan driver (AdrenoTools package, e.g. Turnip): the .so path
     // inside the private folder, and a name to show.
     static final String KEY_DRIVER = "vulkan_driver";
@@ -136,6 +138,12 @@ public class LauncherActivity extends Activity {
         watchMemory.setOnCheckedChangeListener(
                 (button, checked) -> prefs().edit().putBoolean(KEY_WATCH_MEMORY, checked).apply());
         layout.addView(watchMemory);
+        CheckBox bigCores = new CheckBox(this);
+        bigCores.setText("Держать игру на быстрых ядрах процессора");
+        bigCores.setChecked(prefs().getBoolean(KEY_BIG_CORES, true));
+        bigCores.setOnCheckedChangeListener(
+                (button, checked) -> prefs().edit().putBoolean(KEY_BIG_CORES, checked).apply());
+        layout.addView(bigCores);
 
         // libadrenotools is arm64 only (Snapdragon phones).
         if (Build.SUPPORTED_ABIS.length > 0 && Build.SUPPORTED_ABIS[0].startsWith("arm64")) {
