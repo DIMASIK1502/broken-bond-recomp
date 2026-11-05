@@ -41,7 +41,8 @@ public class GameActivity extends SDLActivity {
             "--native_msaa=" + prefs.getString(LauncherActivity.KEY_MSAA, LauncherActivity.DEFAULT_MSAA),
             "--native_interpolate=" + prefs.getBoolean(LauncherActivity.KEY_INTERPOLATE, false),
             "--native_frames_in_flight=" + (prefs.getBoolean(LauncherActivity.KEY_LOW_LATENCY, false) ? 1 : 2),
-            "--native_record_thread=" + prefs.getBoolean(LauncherActivity.KEY_RECORD_THREAD, true)));
+            "--native_record_thread=" + prefs.getBoolean(LauncherActivity.KEY_RECORD_THREAD, true),
+            "--native_watch_memory=" + prefs.getBoolean(LauncherActivity.KEY_WATCH_MEMORY, true)));
         // A custom Vulkan driver (Turnip) from the launcher, loaded by
         // libadrenotools with its hooks from the native library folder.
         String driver = prefs.getString(LauncherActivity.KEY_DRIVER, "");

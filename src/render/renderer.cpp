@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -26,6 +27,7 @@
 #include <plume_render_interface.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/xenos.h>
+#include <rex/system/kernel_state.h>
 #include <rex/system/xmemory.h>
 #include <smolv.h>
 #include <zstd.h>
@@ -99,6 +101,10 @@ REXCVAR_DEFINE_INT32(native_interpolate_dump, 0, "Game",
 REXCVAR_DEFINE_BOOL(native_record_thread, false, "Game",
                     "With renderer=native, record Vulkan commands on a second thread: the game thread keeps "
                     "reading its memory and queues each draw's commands (a phone's fight frame is bound by them)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(native_watch_memory, false, "Game",
+                    "With renderer=native, write-protect the guest pages of vertex and index data once hashed, so "
+                    "the same data is not hashed again every frame until the game writes to it")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_INT32(native_frames_in_flight, 2, "Game",
                      "With renderer=native, frames the GPU may still be drawing while the next is recorded: 2 lets "
@@ -231,6 +237,37 @@ bool ShaderListed(std::string_view list, uint64_t vs_key, uint64_t ps_key) {
 
 uint32_t PhysicalView(uint32_t address) {
   return address < 0x20000000u ? 0xA0000000u + address : address;
+}
+
+// Write watch over guest physical memory (native_watch_memory). A guest
+// write to a watched page faults once; the SDK then calls OnGuestWrite with
+// the page range and lifts the protection. Each 4 KB page keeps the clock
+// value of its last write, so a hash taken at clock C still describes the
+// bytes while every page it covers is at C or below.
+constexpr uint32_t kWatchPageShift = 12;
+constexpr uint32_t kWatchPages = 0x20000000u >> kWatchPageShift;
+std::atomic<uint32_t> g_watch_clock{1};
+std::unique_ptr<std::atomic<uint32_t>[]> g_watch_page_clock;
+std::atomic<uint64_t> g_watch_faults{0};
+
+std::pair<uint32_t, uint32_t> OnGuestWrite(void*, uint32_t physical, uint32_t length, bool) {
+  const uint32_t clock = g_watch_clock.fetch_add(1, std::memory_order_acq_rel) + 1;
+  const uint32_t last = std::min<uint64_t>((uint64_t(physical) + std::max(length, 1u) - 1) >> kWatchPageShift,
+                                           kWatchPages - 1);
+  for (uint32_t page = physical >> kWatchPageShift; page <= last; ++page) {
+    g_watch_page_clock[page].store(clock, std::memory_order_release);
+  }
+  g_watch_faults.fetch_add(1, std::memory_order_relaxed);
+  // Only the pages written to stop being watched.
+  return {physical, length};
+}
+
+bool WatchedPagesClean(uint32_t physical, uint32_t bytes, uint32_t clock) {
+  const uint32_t last = (physical + bytes - 1) >> kWatchPageShift;
+  for (uint32_t page = physical >> kWatchPageShift; page <= last; ++page) {
+    if (g_watch_page_clock[page].load(std::memory_order_acquire) > clock) return false;
+  }
+  return true;
 }
 
 constexpr uint32_t kDeviceFetch = 1152;
@@ -1413,6 +1450,64 @@ struct Renderer::State {
   uint64_t index_hits = 0, index_misses = 0;
   uint64_t stream_hits = 0, stream_misses = 0;
   uint64_t indexed_fetch_draws = 0;
+  // Hashes of guest ranges kept while their pages stay unwritten
+  // (native_watch_memory), by range and seed.
+  struct WatchedHash {
+    uint32_t physical = 0, bytes = 0;
+    uint64_t seed = 0, hash = 0;
+    uint32_t clock = 0;  // watch clock before the bytes were hashed
+    uint32_t strikes = 0;
+    uint64_t paused_until = 0, last_used = 0;
+    bool valid = false;
+  };
+  std::unordered_map<uint64_t, WatchedHash> watched;
+  bool watch_registered = false;
+  uint64_t watch_hits = 0, watch_misses = 0, watch_paused = 0;
+
+  uint64_t HashGuest(const uint8_t* base, uint32_t address, uint32_t bytes, uint64_t seed) {
+    // Only the 0xA0000000 view maps physical memory one to one.
+    if (!REXCVAR_GET(native_watch_memory) || bytes == 0 || address < 0xA0000000u ||
+        uint64_t(address) + bytes > 0xC0000000u) {
+      return XXH3_64bits_withSeed(At(base, address), bytes, seed);
+    }
+    if (!watch_registered) {
+      watch_registered = true;
+      g_watch_page_clock = std::make_unique<std::atomic<uint32_t>[]>(kWatchPages);
+      rex::system::kernel_memory()->RegisterPhysicalMemoryInvalidationCallback(OnGuestWrite, nullptr);
+    }
+    const uint32_t physical = address - 0xA0000000u;
+    WatchedHash& w = watched[(seed ^ ((uint64_t(physical) << 32) | bytes)) * 0x9E3779B97F4A7C15ull];
+    if (w.physical != physical || w.bytes != bytes || w.seed != seed) {
+      w = WatchedHash{};
+      w.physical = physical;
+      w.bytes = bytes;
+      w.seed = seed;
+    }
+    w.last_used = presents;
+    if (w.valid) {
+      if (WatchedPagesClean(physical, bytes, w.clock)) {
+        ++watch_hits;
+        w.strikes = 0;
+        return w.hash;
+      }
+      // Rewritten since. Data rewritten frame after frame would fault on
+      // every write, so it is hashed unwatched for a while.
+      if (++w.strikes >= 2) w.paused_until = presents + 300;
+    }
+    w.valid = false;
+    if (presents < w.paused_until) {
+      ++watch_paused;
+      return XXH3_64bits_withSeed(At(base, address), bytes, seed);
+    }
+    ++watch_misses;
+    // The clock is read before the pages are protected: a write landing
+    // between the two only costs one more hash.
+    w.clock = g_watch_clock.load(std::memory_order_acquire);
+    rex::system::kernel_memory()->EnablePhysicalMemoryAccessCallbacks(physical, bytes, true, false);
+    w.hash = XXH3_64bits_withSeed(At(base, address), bytes, seed);
+    w.valid = true;
+    return w.hash;
+  }
   std::chrono::steady_clock::time_point lap_start;
   void Lap(size_t section) {
     const auto now = std::chrono::steady_clock::now();
@@ -2915,8 +3010,8 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
     index_address = address;
     const size_t index_size = index32 ? 4 : 2;
     const uint8_t* src = At(base, address + uint32_t(index_size) * draw.start);
-    const uint64_t index_key =
-        XXH3_64bits_withSeed(src, index_size * draw.count, (uint64_t(quads) << 1) | uint64_t(index32));
+    const uint64_t index_key = s.HashGuest(base, address + uint32_t(index_size) * draw.start,
+                                           uint32_t(index_size * draw.count), (uint64_t(quads) << 1) | uint64_t(index32));
     State::CachedIndices& entry = s.index_cache[index_key];
     entry.last_used = s.presents;
     if (entry.seen == 0) {
@@ -3120,8 +3215,8 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
         layout[layout_words++] = w;
       }
     }
-    const uint64_t stream_key =
-        XXH3_64bits_withSeed(guest_stream, size_t(bytes), XXH3_64bits(layout, layout_words * sizeof(uint32_t)));
+    const uint64_t stream_key = s.HashGuest(base, PhysicalView(vf.address * 4 + uint32_t(begin)), uint32_t(bytes),
+                                            XXH3_64bits(layout, layout_words * sizeof(uint32_t)));
     s.Lap(8);
     State::CachedStream& cached = s.stream_cache[stream_key];
     cached.last_used = s.presents;
@@ -4112,6 +4207,7 @@ void Renderer::Present(uint32_t frontbuffer, const uint8_t* base) {
   if ((s.presents & 63) == 0) {
     std::erase_if(s.stream_cache, [&](const auto& entry) { return s.presents - entry.second.last_used > 120; });
     std::erase_if(s.index_cache, [&](const auto& entry) { return s.presents - entry.second.last_used > 120; });
+    std::erase_if(s.watched, [&](const auto& entry) { return s.presents - entry.second.last_used > 600; });
   }
   s.ms_submit +=std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_submit).count();
   if (s.Dumping()) {
@@ -4230,6 +4326,11 @@ std::string Renderer::TakeStats() {
   s.index_hits = s.index_misses = 0;
   out += fmt::format(" fetch_memo={}/{}", s.fetch_memo_hits, s.fetch_memo_misses);
   s.fetch_memo_hits = s.fetch_memo_misses = 0;
+  if (REXCVAR_GET(native_watch_memory)) {
+    out += fmt::format(" watch hit={} miss={} paused={} faults={} ranges={}", s.watch_hits, s.watch_misses,
+                       s.watch_paused, g_watch_faults.exchange(0, std::memory_order_relaxed), s.watched.size());
+    s.watch_hits = s.watch_misses = s.watch_paused = 0;
+  }
   out += " laps";
   for (const double ms : s.ms_lap) out += fmt::format(" {:.0f}", ms);
   s.ms_lap = {};
