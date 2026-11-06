@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <atomic>
 #include <chrono>
 #include <climits>
@@ -121,6 +122,18 @@ REXCVAR_DEFINE_INT32(native_interpolate_dump, 0, "Game",
 REXCVAR_DEFINE_BOOL(native_record_thread, false, "Game",
                     "With renderer=native, record Vulkan commands on a second thread: the game thread keeps "
                     "reading its memory and queues each draw's commands (a phone's fight frame is bound by them)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(native_draw_timing, true, "Game",
+                    "With renderer=native, time each section of a draw for the 5 s stats (laps); a phone spends "
+                    "a few percent of the game thread reading the clock for them")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(native_trim_constants, false, "Game",
+                    "With renderer=native, copy only the float constants each shader's constant table covers "
+                    "instead of all 256 vertex and 224 pixel registers on every draw")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(native_flat_maps, false, "Game",
+                    "With renderer=native, keep the per-draw caches (vertex streams, index lists, watched ranges) "
+                    "in flat open-addressing tables instead of std::unordered_map")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(native_watch_memory, false, "Game",
                     "With renderer=native, write-protect the guest pages of vertex and index data once hashed, so "
@@ -589,6 +602,139 @@ void CopySwappedDwords(uint8_t* dst, const uint8_t* src, size_t bytes) {
     std::memcpy(dst + i, &v, 4);
   }
 }
+
+// Float registers [first, end) a guest shader's constant table (D3DX CTAB in
+// the virtual half of its container) declares. The recompiled shader would
+// read an array indexed past its declared size up to the end of the file;
+// D3DX declares a relatively indexed array whole, so the declared registers
+// are taken as all it reads. All registers when the table cannot be read.
+struct ConstantRange {
+  uint16_t first = 0, end = 0;
+};
+
+ConstantRange ShaderConstantRange(const uint8_t* base, uint32_t object, bool vertex, uint32_t registers) {
+  const ConstantRange all{0, uint16_t(registers)};
+  if (object == 0) return all;
+  // Offsets of the container in the shader object, as in host/shadow_draw.
+  const uint32_t container = object + (vertex ? 872 : 40);
+  if ((Be32(base, container) & 0xFFFFFF00u) != 0x102A1100u) return all;
+  const uint32_t virtual_size = Be32(base, container + 4);
+  const uint32_t table_offset = Be32(base, container + 16);
+  if (virtual_size > (1u << 20) || table_offset == 0 || uint64_t(table_offset) + 32 > virtual_size) return all;
+  // A size word, then D3DXSHADER_CONSTANTTABLE; its offsets count from itself.
+  const uint32_t table = container + table_offset + 4;
+  const uint32_t count = Be32(base, table + 12);
+  const uint32_t info = Be32(base, table + 16);
+  if (count > 4096 || uint64_t(table_offset) + 4 + info + uint64_t(count) * 20 > virtual_size) return all;
+  uint32_t first = registers, end = 0;
+  for (uint32_t i = 0; i < count; ++i) {
+    const uint32_t entry = table + info + i * 20;  // D3DXSHADER_CONSTANTINFO
+    if (Be16(base, entry + 4) != 2) continue;      // RegisterSet::Float4
+    const uint32_t index = Be16(base, entry + 6);
+    const uint32_t size = Be16(base, entry + 8);
+    if (size == 0) continue;
+    first = std::min(first, index);
+    end = std::max(end, index + size);
+  }
+  if (end == 0) return {};
+  return {uint16_t(std::min(first, registers)), uint16_t(std::min(end, registers))};
+}
+
+// A map from well-mixed 64-bit keys (hashes) to values in one array, linear
+// probing: a lookup reads a slot or two where std::unordered_map follows a
+// bucket to a node. Any insert or erase moves values, so references to them
+// last until the next one.
+template <typename V>
+class FlatMap {
+ public:
+  V& operator[](uint64_t key) {
+    if ((count_ + 1) * 2 > slots_.size()) Grow();
+    size_t i = Home(key);
+    for (; slots_[i].used; i = (i + 1) & mask_) {
+      if (slots_[i].key == key) return slots_[i].value;
+    }
+    slots_[i].used = true;
+    slots_[i].key = key;
+    ++count_;
+    return slots_[i].value;
+  }
+  size_t size() const { return count_; }
+
+  template <typename Pred>
+  void EraseIf(Pred pred) {
+    std::vector<uint64_t> doomed;
+    for (const Slot& slot : slots_) {
+      if (slot.used && pred(slot.value)) doomed.push_back(slot.key);
+    }
+    for (uint64_t key : doomed) Erase(key);
+  }
+
+ private:
+  struct Slot {
+    uint64_t key = 0;
+    bool used = false;
+    V value{};
+  };
+
+  size_t Home(uint64_t key) const { return size_t((key * 0x9E3779B97F4A7C15ull) >> shift_); }
+
+  // Backward-shift deletion: later slots of the probe run move up so no
+  // run is cut by the hole.
+  void Erase(uint64_t key) {
+    size_t hole = Home(key);
+    while (!(slots_[hole].used && slots_[hole].key == key)) hole = (hole + 1) & mask_;
+    for (size_t j = (hole + 1) & mask_; slots_[j].used; j = (j + 1) & mask_) {
+      // j may fill the hole when its home is not between the hole and j.
+      if (((j - Home(slots_[j].key)) & mask_) >= ((j - hole) & mask_)) {
+        slots_[hole] = std::move(slots_[j]);
+        hole = j;
+      }
+    }
+    slots_[hole] = Slot{};
+    --count_;
+  }
+
+  void Grow() {
+    std::vector<Slot> old;
+    old.swap(slots_);
+    const size_t size = std::max<size_t>(64, old.size() * 2);
+    slots_.resize(size);
+    mask_ = size - 1;
+    shift_ = 64 - uint32_t(std::countr_zero(size));
+    count_ = 0;
+    for (Slot& slot : old) {
+      if (slot.used) (*this)[slot.key] = std::move(slot.value);
+    }
+  }
+
+  std::vector<Slot> slots_;
+  size_t mask_ = 0, count_ = 0;
+  uint32_t shift_ = 64;
+};
+
+// FlatMap or std::unordered_map, as native_flat_maps chose at start.
+template <typename V>
+class HotMap {
+ public:
+  V& operator[](uint64_t key) { return Flat() ? flat_[key] : std_[key]; }
+  size_t size() const { return Flat() ? flat_.size() : std_.size(); }
+  template <typename Pred>
+  void EraseIf(Pred pred) {
+    if (Flat()) {
+      flat_.EraseIf(pred);
+    } else {
+      std::erase_if(std_, [&](const auto& entry) { return pred(entry.second); });
+    }
+  }
+
+ private:
+  static bool Flat() {
+    static const bool flat = REXCVAR_GET(native_flat_maps);
+    return flat;
+  }
+  FlatMap<V> flat_;
+  std::unordered_map<uint64_t, V> std_;
+};
 
 // ---------------------------------------------------------------------------
 // Translation tables.
@@ -1670,7 +1816,7 @@ struct Renderer::State {
     uint64_t last_used = 0;
     uint32_t seen = 0;
   };
-  std::unordered_map<uint64_t, CachedStream> stream_cache;
+  HotMap<CachedStream> stream_cache;
   // Indexed draws' host index lists by the guest index bytes. `host` holds
   // indices relative to the lowest one (quad lists already as triangles),
   // so the same bytes serve any base vertex. Lists of 4 KB and more get a
@@ -1683,7 +1829,7 @@ struct Renderer::State {
     uint32_t seen = 0;
     uint64_t last_used = 0;
   };
-  std::unordered_map<uint64_t, CachedIndices> index_cache;
+  HotMap<CachedIndices> index_cache;
   uint64_t index_hits = 0, index_misses = 0;
   uint64_t stream_hits = 0, stream_misses = 0;
   uint64_t indexed_fetch_draws = 0;
@@ -1696,7 +1842,7 @@ struct Renderer::State {
     uint64_t last_used = 0;
     bool valid = false;
   };
-  std::unordered_map<uint64_t, WatchedHash> watched;
+  HotMap<WatchedHash> watched;
   bool watch_registered = false;
   uint64_t watch_hits = 0, watch_misses = 0, watch_paused = 0, watch_arms = 0;
   uint64_t texture_watch_hits = 0;
@@ -1759,8 +1905,27 @@ struct Renderer::State {
     ++(w.valid ? watch_misses : watch_paused);
     return w.hash;
   }
+  // native_trim_constants: each shader's constant range by shader key,
+  // direct-mapped.
+  struct ConstantRangeMemo {
+    uint64_t key = 0;
+    ConstantRange range;
+  };
+  std::array<ConstantRangeMemo, 1024> constant_ranges{};
+  uint64_t constant_bytes = 0, constant_bytes_full = 0;
+  ConstantRange ConstantsOf(uint64_t key, const uint8_t* base, uint32_t object, bool vertex, uint32_t registers) {
+    ConstantRangeMemo& memo = constant_ranges[(key * 0x9E3779B97F4A7C15ull) >> 54];
+    if (memo.key != key || key == 0) {
+      memo.key = key;
+      memo.range = ShaderConstantRange(base, object, vertex, registers);
+    }
+    return memo.range;
+  }
+
   std::chrono::steady_clock::time_point lap_start;
+  bool timing = true;  // native_draw_timing
   void Lap(size_t section) {
+    if (!timing) return;
     const auto now = std::chrono::steady_clock::now();
     ms_lap[section] += std::chrono::duration<double, std::milli>(now - lap_start).count();
     lap_start = now;
@@ -3239,7 +3404,8 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
   State& s = *state_;
   std::lock_guard<std::mutex> lock(s.mutex);
   ScopedMs timer(s.ms_draw);
-  s.lap_start = std::chrono::steady_clock::now();
+  s.timing = REXCVAR_GET(native_draw_timing);
+  if (s.timing) s.lap_start = std::chrono::steady_clock::now();
   s.BeginFrame();
   s.UploadDefaults();
   const uint32_t device = draw.device;
@@ -3428,7 +3594,7 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
 
   XXH3_state_t key_state;
   XXH3_64bits_reset(&key_state);
-  const auto t_stream = std::chrono::steady_clock::now();
+  const auto t_stream = s.timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
   for (uint32_t stream = 0; stream < 16; ++stream) {
     uint32_t out_stride = 0;
     for (uint32_t i = 0; i < element_count; ++i) {
@@ -3585,7 +3751,9 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
     XXH3_64bits_update(&key_state, &out_stride, 4);
     ++slot_count;
   }
-  s.ms_stream += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_stream).count();
+  if (s.timing) {
+    s.ms_stream += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_stream).count();
+  }
   if (indexed_fetch) {
     ++s.indexed_fetch_draws;
     XXH3_64bits_update(&key_state, "indexed fetch", 13);
@@ -3749,6 +3917,15 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
     auto* vs_cpu = reinterpret_cast<uint8_t*>(s.frame_vs.data() + size_t(cpu_index) * State::kVsFloats);
     CopySwappedDwords(vs_cpu, At(base, device + kDeviceVsConstants), gfx::kVertexShaderConstantsBytes);
     std::memcpy(s.upload_cpu + vs_constants, vs_cpu, gfx::kVertexShaderConstantsBytes);
+  } else if (REXCVAR_GET(native_trim_constants) && !s.Dumping()) {
+    // Registers outside the range stay as the ring left them: the shader
+    // never reads them.
+    const ConstantRange r =
+        s.ConstantsOf(vs_key, base, vs_object, true, gfx::kVertexShaderConstantsBytes / 16);
+    CopySwappedDwords(s.upload_cpu + vs_constants + r.first * 16u,
+                      At(base, device + kDeviceVsConstants + r.first * 16u), (r.end - r.first) * 16u);
+    s.constant_bytes += (r.end - r.first) * 16u;
+    s.constant_bytes_full += gfx::kVertexShaderConstantsBytes;
   } else {
     CopySwappedDwords(s.upload_cpu + vs_constants, At(base, device + kDeviceVsConstants),
                       gfx::kVertexShaderConstantsBytes);
@@ -3758,6 +3935,13 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
     auto* ps_cpu = reinterpret_cast<uint8_t*>(s.frame_ps.data() + size_t(cpu_index) * State::kPsFloats);
     CopySwappedDwords(ps_cpu, At(base, device + kDevicePsConstants), gfx::kPixelShaderConstantsBytes);
     std::memcpy(s.upload_cpu + ps_constants, ps_cpu, gfx::kPixelShaderConstantsBytes);
+  } else if (REXCVAR_GET(native_trim_constants) && !s.Dumping()) {
+    const ConstantRange r =
+        s.ConstantsOf(ps_key, base, ps_object, false, gfx::kPixelShaderConstantsBytes / 16);
+    CopySwappedDwords(s.upload_cpu + ps_constants + r.first * 16u,
+                      At(base, device + kDevicePsConstants + r.first * 16u), (r.end - r.first) * 16u);
+    s.constant_bytes += (r.end - r.first) * 16u;
+    s.constant_bytes_full += gfx::kPixelShaderConstantsBytes;
   } else {
     CopySwappedDwords(s.upload_cpu + ps_constants, At(base, device + kDevicePsConstants),
                       gfx::kPixelShaderConstantsBytes);
@@ -3796,10 +3980,12 @@ void Renderer::Draw(const GuestDraw& draw, const uint8_t* base) {
     } else if (uint32_t(fetch.dimension) == 2) {
       s.Skip("3d texture");
     } else if (uint32_t(fetch.dimension) == 1) {
-      const auto t0 = std::chrono::steady_clock::now();
+      const auto t0 = s.timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
       kind = DESCRIPTOR_KIND_TEXTURE2D;
       indices[kind * DESCRIPTOR_SLOT_COUNT + slot] = s.Texture2DFor(words, fetch, base, uploaded);
-      s.ms_texture += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+      if (s.timing) {
+        s.ms_texture += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+      }
     }
     std::memcpy(memo.words, words, sizeof(words));
     memo.kind = kind;
@@ -4531,9 +4717,9 @@ void Renderer::Present(uint32_t frontbuffer, const uint8_t* base) {
   }
   // Streams unused for 120 frames are in no frame in flight and can go.
   if ((s.presents & 63) == 0) {
-    std::erase_if(s.stream_cache, [&](const auto& entry) { return s.presents - entry.second.last_used > 120; });
-    std::erase_if(s.index_cache, [&](const auto& entry) { return s.presents - entry.second.last_used > 120; });
-    std::erase_if(s.watched, [&](const auto& entry) { return s.presents - entry.second.last_used > 600; });
+    s.stream_cache.EraseIf([&](const auto& entry) { return s.presents - entry.last_used > 120; });
+    s.index_cache.EraseIf([&](const auto& entry) { return s.presents - entry.last_used > 120; });
+    s.watched.EraseIf([&](const auto& entry) { return s.presents - entry.last_used > 600; });
   }
   s.ms_submit +=std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_submit).count();
   if (s.Dumping()) {
@@ -4652,6 +4838,10 @@ std::string Renderer::TakeStats() {
   out += fmt::format(" indices hit={} miss={} cached={}", s.index_hits, s.index_misses, s.index_cache.size());
   s.index_hits = s.index_misses = 0;
   out += fmt::format(" fetch_memo={}/{}", s.fetch_memo_hits, s.fetch_memo_misses);
+  if (s.constant_bytes_full != 0) {
+    out += fmt::format(" constants={:.0f}%", 100.0 * double(s.constant_bytes) / double(s.constant_bytes_full));
+    s.constant_bytes = s.constant_bytes_full = 0;
+  }
   {
     std::lock_guard<std::mutex> lock(s.record_mutex);
     out += fmt::format(" frames={} flush={:.0f} recorder={:.0f}", s.frames, s.ms_flush, s.ms_recorder);

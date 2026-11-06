@@ -52,6 +52,10 @@ public class LauncherActivity extends Activity {
     static final String KEY_WATCH_MEMORY = "watch_memory";
     // Game threads kept on the big CPU cores with a performance hint (android_big_cores).
     static final String KEY_BIG_CORES = "big_cores";
+    // Only the shader constants each shader declares copied per draw (native_trim_constants).
+    static final String KEY_TRIM_CONSTANTS = "trim_constants";
+    // Per-draw caches in flat tables (native_flat_maps).
+    static final String KEY_FLAT_MAPS = "flat_maps";
     // Game thread sampled into the log every 5 s (android_profile).
     static final String KEY_PROFILE = "profile";
     // A custom Vulkan driver (AdrenoTools package, e.g. Turnip): the .so path
@@ -146,8 +150,20 @@ public class LauncherActivity extends Activity {
         bigCores.setOnCheckedChangeListener(
                 (button, checked) -> prefs().edit().putBoolean(KEY_BIG_CORES, checked).apply());
         layout.addView(bigCores);
+        CheckBox trimConstants = new CheckBox(this);
+        trimConstants.setText("Копировать только нужные константы шейдеров (быстрее в боях)");
+        trimConstants.setChecked(prefs().getBoolean(KEY_TRIM_CONSTANTS, true));
+        trimConstants.setOnCheckedChangeListener(
+                (button, checked) -> prefs().edit().putBoolean(KEY_TRIM_CONSTANTS, checked).apply());
+        layout.addView(trimConstants);
+        CheckBox flatMaps = new CheckBox(this);
+        flatMaps.setText("Быстрые таблицы кэшей отрисовки (быстрее в боях)");
+        flatMaps.setChecked(prefs().getBoolean(KEY_FLAT_MAPS, true));
+        flatMaps.setOnCheckedChangeListener(
+                (button, checked) -> prefs().edit().putBoolean(KEY_FLAT_MAPS, checked).apply());
+        layout.addView(flatMaps);
         CheckBox profile = new CheckBox(this);
-        profile.setText("Профилировщик в лог (для отладки)");
+        profile.setText("Профилировщик и замеры в лог (для отладки, чуть медленнее)");
         profile.setChecked(prefs().getBoolean(KEY_PROFILE, false));
         profile.setOnCheckedChangeListener(
                 (button, checked) -> prefs().edit().putBoolean(KEY_PROFILE, checked).apply());

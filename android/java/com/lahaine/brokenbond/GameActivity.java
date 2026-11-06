@@ -44,6 +44,10 @@ public class GameActivity extends SDLActivity {
             "--native_record_thread=" + prefs.getBoolean(LauncherActivity.KEY_RECORD_THREAD, true),
             "--native_watch_memory=" + prefs.getBoolean(LauncherActivity.KEY_WATCH_MEMORY, true),
             "--android_big_cores=" + prefs.getBoolean(LauncherActivity.KEY_BIG_CORES, true),
+            "--native_trim_constants=" + prefs.getBoolean(LauncherActivity.KEY_TRIM_CONSTANTS, true),
+            "--native_flat_maps=" + prefs.getBoolean(LauncherActivity.KEY_FLAT_MAPS, true),
+            // The per-draw timers cost a phone a few percent: only while profiling.
+            "--native_draw_timing=" + prefs.getBoolean(LauncherActivity.KEY_PROFILE, false),
             "--android_profile=" + prefs.getBoolean(LauncherActivity.KEY_PROFILE, false)));
         // A custom Vulkan driver (Turnip) from the launcher, loaded by
         // libadrenotools with its hooks from the native library folder.
