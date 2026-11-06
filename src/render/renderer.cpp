@@ -135,6 +135,11 @@ REXCVAR_DEFINE_BOOL(native_flat_maps, false, "Game",
                     "With renderer=native, keep the per-draw caches (vertex streams, index lists, watched ranges) "
                     "in flat open-addressing tables instead of std::unordered_map")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(native_clear_new_textures, false, "Game",
+                    "With renderer=native, fill a texture a resolve creates with zeros first, so the texels the "
+                    "resolve does not reach are transparent black, as fresh memory reads on a PC, and not "
+                    "leftover memory (colored checkers on a phone)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(native_watch_memory, false, "Game",
                     "With renderer=native, write-protect the guest pages of vertex and index data once hashed, so "
                     "the same data is not hashed again every frame until the game writes to it")
@@ -1721,8 +1726,35 @@ struct Renderer::State {
     std::vector<std::unique_ptr<plume::RenderTexture>> textures;
     std::vector<std::unique_ptr<plume::RenderTextureView>> views;
     std::vector<std::unique_ptr<plume::RenderFramebuffer>> framebuffers;
+    std::vector<std::unique_ptr<plume::RenderBuffer>> buffers;
   };
   std::array<Retired, 2> retired;
+
+  // native_clear_new_textures: an upload buffer of zeros, grown on demand,
+  // copied into new resolve textures.
+  std::unique_ptr<plume::RenderBuffer> zeros;
+  uint64_t zeros_size = 0;
+  // Fills a new 4-byte-texel texture with zeros, then leaves it for reading.
+  void ClearNewTexture(plume::RenderTexture* texture, plume::RenderFormat format, uint32_t width, uint32_t height) {
+    const uint32_t row = (width + 63) & ~63u;  // 256-byte rows
+    const uint64_t bytes = uint64_t(row) * height * 4;
+    if (bytes > zeros_size) {
+      if (zeros) retired[frame_slot].buffers.push_back(std::move(zeros));
+      zeros = device->createBuffer(plume::RenderBufferDesc::UploadBuffer(bytes));
+      std::memset(zeros->map(), 0, bytes);
+      zeros->unmap();
+      zeros_size = bytes;
+    }
+    Rec([this, texture, format, width, height, row, buffer = zeros.get()] {
+      commands->barriers(plume::RenderBarrierStage::COPY,
+                         plume::RenderTextureBarrier(texture, plume::RenderTextureLayout::COPY_DEST));
+      commands->copyTextureRegion(
+          plume::RenderTextureCopyLocation::Subresource(texture, 0, 0),
+          plume::RenderTextureCopyLocation::PlacedFootprint(buffer, format, width, height, 1, row, 0));
+      commands->barriers(plume::RenderBarrierStage::GRAPHICS,
+                         plume::RenderTextureBarrier(texture, plume::RenderTextureLayout::SHADER_READ));
+    });
+  }
 
   void Retire(std::unique_ptr<plume::RenderTexture>& texture) {
     if (texture) retired[frame_slot].textures.push_back(std::move(texture));
@@ -1737,6 +1769,7 @@ struct Renderer::State {
     retired[slot].framebuffers.clear();
     retired[slot].views.clear();
     retired[slot].textures.clear();
+    retired[slot].buffers.clear();
   }
 
   // Frames in flight. Each slot has its own command list, fence, acquire
@@ -4374,6 +4407,9 @@ void Renderer::Resolve(uint32_t device, uint32_t flags, uint32_t rect, uint32_t 
       s.Retire(entry.view);
       s.Retire(entry.texture);
       entry.texture = s.device->createTexture(plume::RenderTextureDesc::ColorTarget(width, height, kDepthCopyFormat));
+      if (REXCVAR_GET(native_clear_new_textures)) {
+        s.ClearNewTexture(entry.texture.get(), kDepthCopyFormat, width, height);
+      }
       plume::RenderTextureViewDesc view = plume::RenderTextureViewDesc::Texture2D(kDepthCopyFormat);
       view.componentMapping = ComponentMapping(DepthSwizzle(fetch.swizzle));
       entry.view = entry.texture->createTextureView(view);
@@ -4458,6 +4494,7 @@ void Renderer::Resolve(uint32_t device, uint32_t flags, uint32_t rect, uint32_t 
       s.Retire(entry.view);
       s.Retire(entry.texture);
       entry.texture = s.device->createTexture(plume::RenderTextureDesc::Texture2D(width, height, 1, kColorFormat));
+      if (REXCVAR_GET(native_clear_new_textures)) s.ClearNewTexture(entry.texture.get(), kColorFormat, width, height);
       plume::RenderTextureViewDesc view = plume::RenderTextureViewDesc::Texture2D(kColorFormat);
       entry.view_swizzle = ResolvedSwizzle(fetch.swizzle, fetch.format);
       view.componentMapping = ComponentMapping(entry.view_swizzle);

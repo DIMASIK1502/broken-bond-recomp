@@ -46,6 +46,7 @@ public class GameActivity extends SDLActivity {
             "--android_big_cores=" + prefs.getBoolean(LauncherActivity.KEY_BIG_CORES, true),
             "--native_trim_constants=" + prefs.getBoolean(LauncherActivity.KEY_TRIM_CONSTANTS, true),
             "--native_flat_maps=" + prefs.getBoolean(LauncherActivity.KEY_FLAT_MAPS, true),
+            "--native_clear_new_textures=" + prefs.getBoolean(LauncherActivity.KEY_CLEAR_TEXTURES, true),
             // The per-draw timers cost a phone a few percent: only while profiling.
             "--native_draw_timing=" + prefs.getBoolean(LauncherActivity.KEY_PROFILE, false),
             "--android_profile=" + prefs.getBoolean(LauncherActivity.KEY_PROFILE, false)));
