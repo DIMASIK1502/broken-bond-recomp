@@ -61,6 +61,8 @@ public class LauncherActivity extends Activity {
     // A custom Vulkan driver (AdrenoTools package, e.g. Turnip): the .so path
     // inside the private folder, and a name to show.
     static final String KEY_DRIVER = "vulkan_driver";
+    // TU_DEBUG for Turnip (android_turnip_debug); "none" for unset.
+    static final String KEY_TURNIP_DEBUG = "turnip_debug";
     static final String KEY_DRIVER_NAME = "vulkan_driver_name";
     static final String DEFAULT_SCALE = "1";
     static final String DEFAULT_MSAA = "2";
@@ -70,6 +72,9 @@ public class LauncherActivity extends Activity {
     private static final String[] SCALE_VALUES = {"0", "0.5", "0.75", "1", "1.5", "2"};
     private static final String[] MSAA_LABELS = {"Выключено", "2x", "4x"};
     private static final String[] MSAA_VALUES = {"1", "2", "4"};
+    private static final String[] TURNIP_DEBUG_LABELS = {
+        "Нет", "Без сжатия UBWC (noubwc)", "Без GMEM (sysmem)", "Оба (noubwc,sysmem)"};
+    private static final String[] TURNIP_DEBUG_VALUES = {"none", "noubwc", "sysmem", "noubwc,sysmem"};
 
     private TextView status;
     private Button access;
@@ -120,6 +125,8 @@ public class LauncherActivity extends Activity {
         layout.addView(settings);
         layout.addView(choice("Внутреннее разрешение", KEY_SCALE, DEFAULT_SCALE, SCALE_LABELS, SCALE_VALUES));
         layout.addView(choice("Сглаживание (MSAA)", KEY_MSAA, DEFAULT_MSAA, MSAA_LABELS, MSAA_VALUES));
+        layout.addView(choice("Отладка Turnip (TU_DEBUG)", KEY_TURNIP_DEBUG, "none", TURNIP_DEBUG_LABELS,
+                TURNIP_DEBUG_VALUES));
         CheckBox interpolate = new CheckBox(this);
         interpolate.setText("60 FPS (промежуточные кадры)");
         interpolate.setChecked(prefs().getBoolean(KEY_INTERPOLATE, false));

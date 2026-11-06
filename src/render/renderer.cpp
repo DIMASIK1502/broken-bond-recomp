@@ -95,6 +95,9 @@ REXCVAR_DEFINE_BOOL(android_profile, false, "Game",
                     "On Android, sample the game thread's call stack 1000 times a second and log the functions it "
                     "spends its time in every 5 s (a profiler for a phone with no adb at hand)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_STRING(android_turnip_debug, "", "Game",
+                      "On Android, TU_DEBUG for a custom Turnip driver (e.g. noubwc, sysmem), set before it loads")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_STRING(android_vulkan_driver, "", "Game",
                       "Android arm64: a custom Vulkan driver (the .so of an AdrenoTools package such as Turnip, "
                       "in the app's private folder) loaded through libadrenotools; empty uses the system driver")
@@ -3310,6 +3313,11 @@ bool Renderer::Open(void* native_window, std::string& reason) {
   // both. libadrenotools loads it into this process from the private folder.
   if (const std::string driver = REXCVAR_GET(android_vulkan_driver); !driver.empty()) {
     step("custom vulkan driver");
+    // Turnip reads its debug switches from the environment when it loads.
+    if (const std::string debug = REXCVAR_GET(android_turnip_debug); !debug.empty()) {
+      setenv("TU_DEBUG", debug.c_str(), 1);
+      REXLOG_INFO("native: TU_DEBUG={}", debug);
+    }
     const std::filesystem::path path(driver);
     const std::string driver_dir = path.parent_path().string() + "/";
     const std::string hook_dir = REXCVAR_GET(android_native_lib_dir) + "/";

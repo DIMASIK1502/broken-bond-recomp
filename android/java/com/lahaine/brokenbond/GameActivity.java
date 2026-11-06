@@ -76,6 +76,8 @@ public class GameActivity extends SDLActivity {
         if (!driver.isEmpty() && new File(driver).isFile()) {
             args.add("--android_vulkan_driver=" + driver);
             args.add("--android_native_lib_dir=" + getApplicationInfo().nativeLibraryDir);
+            String turnipDebug = prefs.getString(LauncherActivity.KEY_TURNIP_DEBUG, "none");
+            if (!turnipDebug.equals("none")) args.add("--android_turnip_debug=" + turnipDebug);
         }
         return args.toArray(new String[0]);
     }
