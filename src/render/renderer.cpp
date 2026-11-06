@@ -135,16 +135,6 @@ REXCVAR_DEFINE_BOOL(native_flat_maps, false, "Game",
                     "With renderer=native, keep the per-draw caches (vertex streams, index lists, watched ranges) "
                     "in flat open-addressing tables instead of std::unordered_map")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
-REXCVAR_DEFINE_BOOL(native_clear_new_textures, false, "Game",
-                    "With renderer=native, fill a texture a resolve creates with zeros first, so the texels the "
-                    "resolve does not reach are transparent black, as fresh memory reads on a PC, and not "
-                    "leftover memory (colored checkers on a phone)")
-    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
-REXCVAR_DEFINE_BOOL(native_blank_descriptors, false, "Game",
-                    "With renderer=native, point every texture slot not yet given a texture at a transparent black "
-                    "1x1 one, so a shader sampling such a slot reads zeros as on a PC driver and not stray memory "
-                    "(colored checkers on a phone)")
-    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(native_watch_memory, false, "Game",
                     "With renderer=native, write-protect the guest pages of vertex and index data once hashed, so "
                     "the same data is not hashed again every frame until the game writes to it")
@@ -1731,35 +1721,8 @@ struct Renderer::State {
     std::vector<std::unique_ptr<plume::RenderTexture>> textures;
     std::vector<std::unique_ptr<plume::RenderTextureView>> views;
     std::vector<std::unique_ptr<plume::RenderFramebuffer>> framebuffers;
-    std::vector<std::unique_ptr<plume::RenderBuffer>> buffers;
   };
   std::array<Retired, 2> retired;
-
-  // native_clear_new_textures: an upload buffer of zeros, grown on demand,
-  // copied into new resolve textures.
-  std::unique_ptr<plume::RenderBuffer> zeros;
-  uint64_t zeros_size = 0;
-  // Fills a new 4-byte-texel texture with zeros, then leaves it for reading.
-  void ClearNewTexture(plume::RenderTexture* texture, plume::RenderFormat format, uint32_t width, uint32_t height) {
-    const uint32_t row = (width + 63) & ~63u;  // 256-byte rows
-    const uint64_t bytes = uint64_t(row) * height * 4;
-    if (bytes > zeros_size) {
-      if (zeros) retired[frame_slot].buffers.push_back(std::move(zeros));
-      zeros = device->createBuffer(plume::RenderBufferDesc::UploadBuffer(bytes));
-      std::memset(zeros->map(), 0, bytes);
-      zeros->unmap();
-      zeros_size = bytes;
-    }
-    Rec([this, texture, format, width, height, row, buffer = zeros.get()] {
-      commands->barriers(plume::RenderBarrierStage::COPY,
-                         plume::RenderTextureBarrier(texture, plume::RenderTextureLayout::COPY_DEST));
-      commands->copyTextureRegion(
-          plume::RenderTextureCopyLocation::Subresource(texture, 0, 0),
-          plume::RenderTextureCopyLocation::PlacedFootprint(buffer, format, width, height, 1, row, 0));
-      commands->barriers(plume::RenderBarrierStage::GRAPHICS,
-                         plume::RenderTextureBarrier(texture, plume::RenderTextureLayout::SHADER_READ));
-    });
-  }
 
   void Retire(std::unique_ptr<plume::RenderTexture>& texture) {
     if (texture) retired[frame_slot].textures.push_back(std::move(texture));
@@ -1774,7 +1737,6 @@ struct Renderer::State {
     retired[slot].framebuffers.clear();
     retired[slot].views.clear();
     retired[slot].textures.clear();
-    retired[slot].buffers.clear();
   }
 
   // Frames in flight. Each slot has its own command list, fence, acquire
@@ -2179,13 +2141,6 @@ struct Renderer::State {
     cube.flags |= plume::RenderTextureFlag::CUBE;
     defaults.push_back(device->createTexture(cube));
     defaults.push_back(device->createTexture(plume::RenderTextureDesc::Texture1D(1, 1, F::R8G8B8A8_UNORM)));
-    if (REXCVAR_GET(native_blank_descriptors)) {
-      // Transparent black twins (defaults 4-7) for the slots not yet used.
-      defaults.push_back(device->createTexture(plume::RenderTextureDesc::Texture2D(1, 1, 1, F::R8G8B8A8_UNORM)));
-      defaults.push_back(device->createTexture(plume::RenderTextureDesc::Texture3D(1, 1, 1, 1, F::R8G8B8A8_UNORM)));
-      defaults.push_back(device->createTexture(cube));
-      defaults.push_back(device->createTexture(plume::RenderTextureDesc::Texture1D(1, 1, F::R8G8B8A8_UNORM)));
-    }
     samplers.push_back(device->createSampler(plume::RenderSamplerDesc()));
     sets[1]->setSampler(0, samplers[0].get());
   }
@@ -2196,11 +2151,11 @@ struct Renderer::State {
     if (defaults_uploaded) return;
     defaults_uploaded = true;
     const uint32_t layers[4] = {1, 1, 6, 1};
-    for (uint32_t d = 0; d < defaults.size(); ++d) {
-      for (uint32_t layer = 0; layer < layers[d % 4]; ++layer) {
+    for (uint32_t d = 0; d < 4; ++d) {
+      for (uint32_t layer = 0; layer < layers[d]; ++layer) {
         uint64_t offset = 0;
         if (!Upload(256, 256, offset)) return;
-        std::memset(upload_cpu + offset, d < 4 ? 0xFF : 0x00, 4);
+        std::memset(upload_cpu + offset, 0xFF, 4);
         Rec([this, texture = defaults[d].get(), layer, offset] {
           commands->barriers(plume::RenderBarrierStage::COPY,
                              plume::RenderTextureBarrier(texture, plume::RenderTextureLayout::COPY_DEST));
@@ -2219,18 +2174,6 @@ struct Renderer::State {
     sets[0]->setTexture(HeapBase(1), defaults[1].get(), plume::RenderTextureLayout::SHADER_READ);
     sets[0]->setTexture(HeapBase(2), defaults[2].get(), plume::RenderTextureLayout::SHADER_READ);
     sets[0]->setTexture(HeapBase(5), defaults[3].get(), plume::RenderTextureLayout::SHADER_READ);
-    if (defaults.size() == 8) {
-      // Nothing is allocated yet: this runs before the first draw, clear,
-      // resolve or present does anything else.
-      const uint32_t heaps[4] = {0, 1, 2, 5};
-      const uint32_t counts[4] = {kTexture2DCount, kTexture3DCount, kTextureCubeCount, kTexture1DCount};
-      for (uint32_t d = 0; d < 4; ++d) {
-        for (uint32_t i = 1; i < counts[d]; ++i) {
-          sets[0]->setTexture(HeapBase(heaps[d]) + i, defaults[4 + d].get(), plume::RenderTextureLayout::SHADER_READ);
-        }
-      }
-      for (uint32_t i = 1; i < kSamplerCount; ++i) sets[1]->setSampler(i, samplers[0].get());
-    }
   }
 
   bool LoadShaderCache() {
@@ -4431,9 +4374,6 @@ void Renderer::Resolve(uint32_t device, uint32_t flags, uint32_t rect, uint32_t 
       s.Retire(entry.view);
       s.Retire(entry.texture);
       entry.texture = s.device->createTexture(plume::RenderTextureDesc::ColorTarget(width, height, kDepthCopyFormat));
-      if (REXCVAR_GET(native_clear_new_textures)) {
-        s.ClearNewTexture(entry.texture.get(), kDepthCopyFormat, width, height);
-      }
       plume::RenderTextureViewDesc view = plume::RenderTextureViewDesc::Texture2D(kDepthCopyFormat);
       view.componentMapping = ComponentMapping(DepthSwizzle(fetch.swizzle));
       entry.view = entry.texture->createTextureView(view);
@@ -4518,7 +4458,6 @@ void Renderer::Resolve(uint32_t device, uint32_t flags, uint32_t rect, uint32_t 
       s.Retire(entry.view);
       s.Retire(entry.texture);
       entry.texture = s.device->createTexture(plume::RenderTextureDesc::Texture2D(width, height, 1, kColorFormat));
-      if (REXCVAR_GET(native_clear_new_textures)) s.ClearNewTexture(entry.texture.get(), kColorFormat, width, height);
       plume::RenderTextureViewDesc view = plume::RenderTextureViewDesc::Texture2D(kColorFormat);
       entry.view_swizzle = ResolvedSwizzle(fetch.swizzle, fetch.format);
       view.componentMapping = ComponentMapping(entry.view_swizzle);

@@ -56,10 +56,6 @@ public class LauncherActivity extends Activity {
     static final String KEY_TRIM_CONSTANTS = "trim_constants";
     // Per-draw caches in flat tables (native_flat_maps).
     static final String KEY_FLAT_MAPS = "flat_maps";
-    // New resolve textures filled with zeros first (native_clear_new_textures).
-    static final String KEY_CLEAR_TEXTURES = "clear_new_textures";
-    // Unused texture and sampler slots filled with blanks (native_blank_descriptors).
-    static final String KEY_BLANK_DESCRIPTORS = "blank_descriptors";
     // Game thread sampled into the log every 5 s (android_profile).
     static final String KEY_PROFILE = "profile";
     // A custom Vulkan driver (AdrenoTools package, e.g. Turnip): the .so path
@@ -166,18 +162,6 @@ public class LauncherActivity extends Activity {
         flatMaps.setOnCheckedChangeListener(
                 (button, checked) -> prefs().edit().putBoolean(KEY_FLAT_MAPS, checked).apply());
         layout.addView(flatMaps);
-        CheckBox clearTextures = new CheckBox(this);
-        clearTextures.setText("Очищать новые текстуры (убирает цветные клетки в меню)");
-        clearTextures.setChecked(prefs().getBoolean(KEY_CLEAR_TEXTURES, true));
-        clearTextures.setOnCheckedChangeListener(
-                (button, checked) -> prefs().edit().putBoolean(KEY_CLEAR_TEXTURES, checked).apply());
-        layout.addView(clearTextures);
-        CheckBox blankDescriptors = new CheckBox(this);
-        blankDescriptors.setText("Пустые слоты текстур прозрачные (против цветных клеток)");
-        blankDescriptors.setChecked(prefs().getBoolean(KEY_BLANK_DESCRIPTORS, true));
-        blankDescriptors.setOnCheckedChangeListener(
-                (button, checked) -> prefs().edit().putBoolean(KEY_BLANK_DESCRIPTORS, checked).apply());
-        layout.addView(blankDescriptors);
         CheckBox profile = new CheckBox(this);
         profile.setText("Профилировщик и замеры в лог (для отладки, чуть медленнее)");
         profile.setChecked(prefs().getBoolean(KEY_PROFILE, false));
