@@ -140,6 +140,11 @@ REXCVAR_DEFINE_BOOL(native_clear_new_textures, false, "Game",
                     "resolve does not reach are transparent black, as fresh memory reads on a PC, and not "
                     "leftover memory (colored checkers on a phone)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(native_blank_descriptors, false, "Game",
+                    "With renderer=native, point every texture slot not yet given a texture at a transparent black "
+                    "1x1 one, so a shader sampling such a slot reads zeros as on a PC driver and not stray memory "
+                    "(colored checkers on a phone)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(native_watch_memory, false, "Game",
                     "With renderer=native, write-protect the guest pages of vertex and index data once hashed, so "
                     "the same data is not hashed again every frame until the game writes to it")
@@ -2174,6 +2179,13 @@ struct Renderer::State {
     cube.flags |= plume::RenderTextureFlag::CUBE;
     defaults.push_back(device->createTexture(cube));
     defaults.push_back(device->createTexture(plume::RenderTextureDesc::Texture1D(1, 1, F::R8G8B8A8_UNORM)));
+    if (REXCVAR_GET(native_blank_descriptors)) {
+      // Transparent black twins (defaults 4-7) for the slots not yet used.
+      defaults.push_back(device->createTexture(plume::RenderTextureDesc::Texture2D(1, 1, 1, F::R8G8B8A8_UNORM)));
+      defaults.push_back(device->createTexture(plume::RenderTextureDesc::Texture3D(1, 1, 1, 1, F::R8G8B8A8_UNORM)));
+      defaults.push_back(device->createTexture(cube));
+      defaults.push_back(device->createTexture(plume::RenderTextureDesc::Texture1D(1, 1, F::R8G8B8A8_UNORM)));
+    }
     samplers.push_back(device->createSampler(plume::RenderSamplerDesc()));
     sets[1]->setSampler(0, samplers[0].get());
   }
@@ -2184,11 +2196,11 @@ struct Renderer::State {
     if (defaults_uploaded) return;
     defaults_uploaded = true;
     const uint32_t layers[4] = {1, 1, 6, 1};
-    for (uint32_t d = 0; d < 4; ++d) {
-      for (uint32_t layer = 0; layer < layers[d]; ++layer) {
+    for (uint32_t d = 0; d < defaults.size(); ++d) {
+      for (uint32_t layer = 0; layer < layers[d % 4]; ++layer) {
         uint64_t offset = 0;
         if (!Upload(256, 256, offset)) return;
-        std::memset(upload_cpu + offset, 0xFF, 4);
+        std::memset(upload_cpu + offset, d < 4 ? 0xFF : 0x00, 4);
         Rec([this, texture = defaults[d].get(), layer, offset] {
           commands->barriers(plume::RenderBarrierStage::COPY,
                              plume::RenderTextureBarrier(texture, plume::RenderTextureLayout::COPY_DEST));
@@ -2207,6 +2219,18 @@ struct Renderer::State {
     sets[0]->setTexture(HeapBase(1), defaults[1].get(), plume::RenderTextureLayout::SHADER_READ);
     sets[0]->setTexture(HeapBase(2), defaults[2].get(), plume::RenderTextureLayout::SHADER_READ);
     sets[0]->setTexture(HeapBase(5), defaults[3].get(), plume::RenderTextureLayout::SHADER_READ);
+    if (defaults.size() == 8) {
+      // Nothing is allocated yet: this runs before the first draw, clear,
+      // resolve or present does anything else.
+      const uint32_t heaps[4] = {0, 1, 2, 5};
+      const uint32_t counts[4] = {kTexture2DCount, kTexture3DCount, kTextureCubeCount, kTexture1DCount};
+      for (uint32_t d = 0; d < 4; ++d) {
+        for (uint32_t i = 1; i < counts[d]; ++i) {
+          sets[0]->setTexture(HeapBase(heaps[d]) + i, defaults[4 + d].get(), plume::RenderTextureLayout::SHADER_READ);
+        }
+      }
+      for (uint32_t i = 1; i < kSamplerCount; ++i) sets[1]->setSampler(i, samplers[0].get());
+    }
   }
 
   bool LoadShaderCache() {
