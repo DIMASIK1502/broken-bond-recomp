@@ -59,6 +59,7 @@ extern "C" __declspec(dllimport) short __stdcall GetAsyncKeyState(int key);
 #include <adrenotools/driver.h>
 #endif
 #if defined(__ANDROID__)
+#include <jni.h>
 #include <cxxabi.h>
 #include <dlfcn.h>
 #include <pthread.h>
@@ -77,6 +78,9 @@ void SetVulkanGetInstanceProcAddr(void* getInstanceProcAddr);
 REXCVAR_DEFINE_INT32(native_dump_frame, 0, "Game",
                      "With renderer=native, describe every draw of this present (from 1) in "
                      "logs/native-frame-<n>.txt; 0 writes none")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_STRING(native_dump_dir, "logs", "Game",
+                      "With renderer=native, the folder native_dump_frame and the dump key write frames to")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(native_decl_swizzle, true, "Game",
                     "With renderer=native, apply the vertex declaration swizzle (D3DCOLOR is zyxw) "
@@ -370,6 +374,11 @@ struct PerformanceHint {
     if (session) report(session, ns);
   }
 };
+#endif
+
+#if defined(__ANDROID__)
+// Frames the game activity asked to dump (its volume-down key).
+std::atomic<uint32_t> g_dump_requests{0};
 #endif
 
 #if defined(__ANDROID__) && defined(__aarch64__)
@@ -1481,6 +1490,7 @@ struct Renderer::State {
   }
   // F9 asks for a dump of the next frame, with its picture.
   uint64_t key_dump = 0;
+  uint32_t dump_burst = 0;  // frames still to dump one after another
   bool key_down = false;
   bool frame_image_pending = false;
   bool recording = false;
@@ -4723,11 +4733,12 @@ void Renderer::Present(uint32_t frontbuffer, const uint8_t* base) {
   }
   s.ms_submit +=std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_submit).count();
   if (s.Dumping()) {
-    const std::string path = fmt::format("logs/native-frame-{}.txt", s.presents + 1);
+    const std::string dir = REXCVAR_GET(native_dump_dir);
+    const std::string path = fmt::format("{}/native-frame-{}.txt", dir, s.presents + 1);
     if (s.frame_image_pending) {
       s.frame_image_pending = false;
       if (const auto* data = static_cast<const uint8_t*>(s.debug_readback->map())) {
-        const std::string image = fmt::format("logs/native-frame-{}-{}x{}.bgra", s.presents + 1, s.debug_width,
+        const std::string image = fmt::format("{}/native-frame-{}-{}x{}.bgra", dir, s.presents + 1, s.debug_width,
                                               s.debug_height);
         if (FILE* f = std::fopen(image.c_str(), "wb")) {
           std::fwrite(data, 1, size_t(s.debug_width) * s.debug_height * 4, f);
@@ -4760,6 +4771,14 @@ void Renderer::Present(uint32_t frontbuffer, const uint8_t* base) {
   if (f9 && !s.key_down) s.key_dump = s.presents + 1;
   s.key_down = f9;
 #endif
+#if defined(__ANDROID__)
+  // The dump key asks for a run of frames: a flicker shows in only some.
+  if (g_dump_requests.exchange(0, std::memory_order_relaxed) != 0) s.dump_burst = 5;
+#endif
+  if (s.dump_burst > 0 && s.key_dump <= s.presents) {
+    s.key_dump = s.presents + 1;
+    --s.dump_burst;
+  }
   if (resize) {
     // Targets and swap chain images are replaced at once: no frame may be
     // in flight.
@@ -4898,3 +4917,10 @@ std::string Renderer::TakeStats() {
 }
 
 }  // namespace broken_bond::render
+
+#if defined(__ANDROID__)
+// GameActivity's volume-down key: dump the next frames.
+extern "C" JNIEXPORT void JNICALL Java_com_lahaine_brokenbond_GameActivity_nativeRequestDump(JNIEnv*, jclass) {
+  broken_bond::render::g_dump_requests.store(1, std::memory_order_relaxed);
+}
+#endif

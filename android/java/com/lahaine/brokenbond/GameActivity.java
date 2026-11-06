@@ -6,6 +6,7 @@ import java.util.Arrays;
 import java.util.List;
 
 import android.content.SharedPreferences;
+import android.view.KeyEvent;
 
 import org.libsdl.app.SDLActivity;
 
@@ -13,6 +14,25 @@ import org.libsdl.app.SDLActivity;
 // libmain.so with getArguments() as argv, the same flags run_native.bat uses.
 public class GameActivity extends SDLActivity {
     public static final String EXTRA_GAME_DIR = "game_dir";
+
+    // Writes the next few frames (draw lists and pictures) to the logs
+    // folder, for finding a draw that shows wrong on the phone.
+    private static native void nativeRequestDump();
+
+    @Override
+    public boolean dispatchKeyEvent(KeyEvent event) {
+        if (event.getKeyCode() == KeyEvent.KEYCODE_VOLUME_DOWN) {
+            if (event.getAction() == KeyEvent.ACTION_DOWN && event.getRepeatCount() == 0) {
+                try {
+                    nativeRequestDump();
+                } catch (UnsatisfiedLinkError e) {
+                    // The game library is not loaded yet.
+                }
+            }
+            return true;
+        }
+        return super.dispatchKeyEvent(event);
+    }
 
     @Override
     protected String[] getLibraries() {
@@ -36,6 +56,7 @@ public class GameActivity extends SDLActivity {
             "--renderer=native",
             "--mnk_mode",
             "--log_file=" + new File(logs, "native.log").getPath(),
+            "--native_dump_dir=" + logs.getPath(),
             "--native_resolution_scale="
                     + prefs.getString(LauncherActivity.KEY_SCALE, LauncherActivity.DEFAULT_SCALE),
             "--native_msaa=" + prefs.getString(LauncherActivity.KEY_MSAA, LauncherActivity.DEFAULT_MSAA),
