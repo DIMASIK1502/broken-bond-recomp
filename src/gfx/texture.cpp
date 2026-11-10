@@ -585,4 +585,60 @@ bool LoadGuestTextureBase(uint32_t format, uint32_t width, uint32_t height, uint
   return true;
 }
 
+bool DecodeLinearToRgba8(uint32_t format, uint32_t width, uint32_t height, const LinearTexture& in,
+                         std::vector<uint8_t>& rgba) {
+  using F = rex::graphics::xenos::TextureFormat;
+  const auto fmt = static_cast<F>(format);
+  if (width == 0 || height == 0 || in.block_width != 4 || in.blocks.empty()) return false;
+  if (fmt != F::k_DXT1 && fmt != F::k_DXT4_5 && fmt != F::k_DXT5A) return false;
+  if ((fmt == F::k_DXT5A && in.block_bytes < 8u) || (fmt == F::k_DXT1 && in.block_bytes < 8u) ||
+      (fmt == F::k_DXT4_5 && in.block_bytes < 16u)) {
+    return false;
+  }
+  rgba.assign(size_t(width) * height * 4u, 0);
+  const uint32_t width_blocks = in.width_blocks;
+  const uint32_t height_blocks = in.height_blocks;
+  for (uint32_t by = 0; by < height_blocks; ++by) {
+    for (uint32_t bx = 0; bx < width_blocks; ++bx) {
+      const uint8_t* block =
+          in.blocks.data() + (size_t(by) * width_blocks + bx) * in.block_bytes;
+      if (fmt == F::k_DXT1) {
+        DecodeDxt1Block(block, rgba.data(), width, height, bx * 4u, by * 4u);
+      } else if (fmt == F::k_DXT4_5) {
+        DecodeDxt5Block(block, rgba.data(), width, height, bx * 4u, by * 4u);
+      } else {
+        // BC4: the DXT5 alpha block, stored as the single channel.
+        const uint32_t alpha0 = block[0];
+        const uint32_t alpha1 = block[1];
+        uint8_t alpha[8];
+        alpha[0] = static_cast<uint8_t>(alpha0);
+        alpha[1] = static_cast<uint8_t>(alpha1);
+        if (alpha0 > alpha1) {
+          for (uint32_t i = 1; i <= 6u; ++i) {
+            alpha[i + 1] = static_cast<uint8_t>(((7u - i) * alpha0 + i * alpha1) / 7u);
+          }
+        } else {
+          for (uint32_t i = 1; i <= 4u; ++i) {
+            alpha[i + 1] = static_cast<uint8_t>(((5u - i) * alpha0 + i * alpha1) / 5u);
+          }
+          alpha[6] = 0;
+          alpha[7] = 255;
+        }
+        uint64_t indices = 0;
+        for (uint32_t i = 0; i < 6u; ++i) indices |= uint64_t(block[2u + i]) << (8u * i);
+        for (uint32_t py = 0; py < 4u; ++py) {
+          for (uint32_t px = 0; px < 4u; ++px) {
+            const uint32_t x = bx * 4u + px;
+            const uint32_t y = by * 4u + py;
+            if (x >= width || y >= height) continue;
+            const uint32_t index = (indices >> ((py * 4u + px) * 3u)) & 7u;
+            rgba[(size_t(y) * width + x) * 4u] = alpha[index];
+          }
+        }
+      }
+    }
+  }
+  return true;
+}
+
 }  // namespace broken_bond::gfx

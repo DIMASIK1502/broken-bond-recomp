@@ -10,6 +10,10 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#if defined(__EMSCRIPTEN__)
+#include <atomic>
+#include <iostream>
+#endif
 
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/graphics_system.h>
@@ -29,7 +33,14 @@ class HostCommandProcessor : public CommandProcessor {
  public:
   using CommandProcessor::CommandProcessor;
 
-  void IssueSwap(uint32_t, uint32_t, uint32_t) override {}
+  void IssueSwap(uint32_t, uint32_t, uint32_t) override {
+#if defined(__EMSCRIPTEN__)
+    static std::atomic<int> swaps{0};
+    if (swaps.fetch_add(1, std::memory_order_relaxed) == 0) {
+      std::cout << "broken_bond web: guest gpu swap" << std::endl;
+    }
+#endif
+  }
 
  protected:
   bool SetupContext() override { return true; }
@@ -51,6 +62,12 @@ class HostCommandProcessor : public CommandProcessor {
   }
 
   bool IssueDraw(rex::graphics::xenos::PrimitiveType, uint32_t, IndexBufferInfo*, bool) override {
+#if defined(__EMSCRIPTEN__)
+    static std::atomic<int> draws{0};
+    if (draws.fetch_add(1, std::memory_order_relaxed) < 3) {
+      std::cout << "broken_bond web: guest draw" << std::endl;
+    }
+#endif
     return true;
   }
   bool IssueCopy() override { return true; }

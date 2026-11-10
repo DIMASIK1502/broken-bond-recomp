@@ -69,6 +69,29 @@ foreach ($dep in $hostDeps) {
     if ($LASTEXITCODE -ne 0) { throw "submodule init of $($dep.Name) failed" }
 }
 
+# WebGPU backend of Plume. A separate tree: thirdparty/plume stays the native
+# Vulkan/D3D12 renderer. The browser build is the only one that links this.
+$plumeWebDir = Join-Path $root "thirdparty\plume-web"
+$plumeWebCommit = "73a662579698c8eb954e0697220a8817cdc64472"
+if (-not (Test-Path (Join-Path $plumeWebDir ".git"))) {
+    Write-Host "Cloning plume-web into thirdparty\plume-web ..."
+    git clone https://github.com/n64hub/plume-web.git $plumeWebDir
+    if ($LASTEXITCODE -ne 0) { throw "git clone of plume-web failed" }
+}
+git -C $plumeWebDir checkout --quiet $plumeWebCommit
+if ($LASTEXITCODE -ne 0) { throw "checkout of plume-web at $plumeWebCommit failed" }
+git -C $plumeWebDir submodule update --init --recursive --depth 1
+if ($LASTEXITCODE -ne 0) { throw "submodule init of plume-web failed" }
+$plumeWebPatch = Join-Path $root "patches\plume-web\wasm64-watch-device.patch"
+git -C $plumeWebDir apply --reverse --check $plumeWebPatch 2>&1 | Out-Null
+if ($LASTEXITCODE -eq 0) {
+    Write-Host "plume-web wasm64 patch already applied"
+} else {
+    Write-Host "Applying patches\plume-web\wasm64-watch-device.patch ..."
+    git -C $plumeWebDir apply $plumeWebPatch
+    if ($LASTEXITCODE -ne 0) { throw "plume-web wasm64 patch failed" }
+}
+
 # Broken Bond changes to XenosRecomp: fetch-slot descriptor indices, 1D
 # textures and this game's vertex input locations.
 $xenosRecompDir = Join-Path $root "thirdparty\xenosrecomp"

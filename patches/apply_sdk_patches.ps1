@@ -13,7 +13,10 @@ $patches = @(
     @{ File = "rexglue-sdk-v0.10.0.patch"; Optional = $false },
     # Android platform layer (surface, fibers, robust mutexes, libc++ chrono).
     # Every change is behind ANDROID / REX_PLATFORM_ANDROID.
-    @{ File = "android-platform.patch"; Optional = $false }
+    @{ File = "android-platform.patch"; Optional = $false },
+    # Browser platform layer, made on top of the Android one. Every change is
+    # behind __EMSCRIPTEN__ / REX_PLATFORM_EMSCRIPTEN.
+    @{ File = "web-platform.patch"; Optional = $false }
 )
 
 if (-not (Test-Path $sdkPath)) {

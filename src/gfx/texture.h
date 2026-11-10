@@ -87,4 +87,9 @@ bool LoadGuestTextureBase(uint32_t format, uint32_t width, uint32_t height, uint
                           uint32_t endian, bool tiled, bool packed_mips, const uint8_t* guest,
                           size_t guest_bytes, LinearTexture& out, std::string& reason);
 
+// Decodes a linear base level to tightly packed RGBA8, before the fetch
+// swizzle. One-channel blocks keep the value in R. DXT1, DXT5 and DXT5A only.
+bool DecodeLinearToRgba8(uint32_t format, uint32_t width, uint32_t height, const LinearTexture& in,
+                         std::vector<uint8_t>& rgba);
+
 }  // namespace broken_bond::gfx

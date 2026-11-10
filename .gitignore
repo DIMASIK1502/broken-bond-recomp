@@ -26,6 +26,7 @@ thirdparty/rexglue-sdk/
 
 # --- Host renderer dependencies (cloned at pinned commits by setup.ps1) ---
 thirdparty/plume/
+thirdparty/plume-web/
 thirdparty/xenosrecomp/
 
 # --- Disc images (copyrighted, do NOT commit) ---
