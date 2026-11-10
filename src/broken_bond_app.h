@@ -16,6 +16,7 @@ class BrokenBondApp : public rex::ReXApp {
         PPCImageConfig));
   }
 
+  void OnPreSetup(rex::RuntimeConfig& config) override;
   void OnPostSetup() override;
   void OnPostLaunchModule(rex::system::XThread* thread) override;
   void OnShutdown() override;

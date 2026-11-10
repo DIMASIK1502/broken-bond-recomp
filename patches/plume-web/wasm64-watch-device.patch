@@ -1,0 +1,13 @@
+diff --git a/plume_webgpu.cpp b/plume_webgpu.cpp
+index 1268982..62993b9 100644
+--- a/plume_webgpu.cpp
++++ b/plume_webgpu.cpp
+@@ -87,7 +87,7 @@ EM_JS(void, plume_webgpu_hold_canvas_size, (const char *selector), {
+ EM_JS(void, plume_webgpu_watch_device, (int32_t *flag), {
+     const device = Module['preinitializedWebGPUDevice'];
+     if (device && device.plumeReplaced) {
+-        device.plumeReplaced.then(() => Atomics.store(HEAP32, flag >> 2, 1));
++        device.plumeReplaced.then(() => Atomics.store(HEAP32, Number(flag) >> 2, 1));
+     }
+ });
+ 

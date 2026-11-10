@@ -2,6 +2,7 @@
 
 #include "generated/default/broken_bond_init.h"
 #include "broken_bond_app.h"
+#include "host/crash_report.h"
 
 #include <filesystem>
 #include <string>
@@ -9,6 +10,14 @@
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
+#include <rex/system/gpu_plugin.h>
+
+// The SDK loads its GPU plugin with backend "any", which takes D3D12 first.
+REXCVAR_DEFINE_BOOL(debug_crash, false, "Game", "Crash on purpose at startup to check the crash report in logs/")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_STRING(gpu_backend, "any", "GPU",
+                      "Backend inside the GPU plugin: any, d3d12 or vulkan")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace {
 
@@ -58,6 +67,26 @@ std::optional<rex::PathConfig> BrokenBondApp::OnFinalizePaths(
     }
   }
   return paths;
+}
+
+void BrokenBondApp::OnPreSetup(rex::RuntimeConfig& config) {
+  broken_bond::host::InstallCrashReport();
+  if (REXCVAR_GET(debug_crash)) {
+    // Checks the crash report: a write through a null pointer.
+    *static_cast<volatile int*>(nullptr) = 0;
+  }
+  const std::string backend = REXCVAR_GET(gpu_backend);
+  if (config.graphics || config.gpu_plugin.empty() || backend.empty() || backend == "any") {
+    return;
+  }
+  config.graphics = rex::system::LoadGpuPlugin(config.gpu_plugin, backend);
+  if (config.graphics) {
+    REXLOG_INFO("GPU plugin '{}' started on backend '{}'", config.gpu_plugin, backend);
+  } else {
+    // The SDK then loads the plugin itself with "any".
+    REXLOG_ERROR("GPU plugin '{}' has no backend '{}'; falling back to 'any'",
+                 config.gpu_plugin, backend);
+  }
 }
 
 void BrokenBondApp::OnPostSetup() {

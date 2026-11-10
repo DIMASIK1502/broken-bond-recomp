@@ -1,0 +1,729 @@
+diff --git a/XenosRecomp/dxc_compiler.cpp b/XenosRecomp/dxc_compiler.cpp
+index fcbc43a..4e69bce 100644
+--- a/XenosRecomp/dxc_compiler.cpp
++++ b/XenosRecomp/dxc_compiler.cpp
+@@ -1,5 +1,7 @@
+ #include "dxc_compiler.h"
+ 
++#include <cstdlib>
++
+ DxcCompiler::DxcCompiler()
+ {
+     HRESULT hr = DxcCreateInstance(CLSID_DxcCompiler, IID_PPV_ARGS(&dxcCompiler));
+@@ -38,12 +40,27 @@ IDxcBlob* DxcCompiler::compile(const std::string& shaderSource, bool compilePixe
+     args[argCount++] = L"-HV 2021";
+     args[argCount++] = L"-all-resources-bound";
+ 
++    const bool wgsl = std::getenv("BROKEN_BOND_WGSL") != nullptr;
++    if (wgsl) {
++        args[argCount++] = L"-DBROKEN_BOND_WGSL";
++        // Optimized DXC forwards push-constant pointers across blocks. naga then
++        // spills that pointer into a local, which WGSL cannot store. A few
++        // shaders instead need the optimizer, because -Od emits a fall-through
++        // switch naga cannot write; the caller retries those with
++        // BROKEN_BOND_DXC_OPT set.
++        const char* optimized = std::getenv("BROKEN_BOND_DXC_OPT");
++        if (optimized == nullptr || optimized[0] != '1')
++            args[argCount++] = L"-Od";
++    }
++
+     if (compileSpirv)
+     {
+         args[argCount++] = L"-spirv";
+         args[argCount++] = L"-fvk-use-dx-layout";
+ 
+-        if (!compilePixelShader)
++        // WebGPU clip space matches D3D. naga keeps it with --keep-coordinate-space,
++        // so the browser cache must not invert y here.
++        if (!compilePixelShader && !wgsl)
+             args[argCount++] = L"-fvk-invert-y";
+     }
+     else
+diff --git a/XenosRecomp/main.cpp b/XenosRecomp/main.cpp
+index d015145..3521af1 100644
+--- a/XenosRecomp/main.cpp
++++ b/XenosRecomp/main.cpp
+@@ -2,6 +2,97 @@
+ #include "shader_recompiler.h"
+ #include "dxc_compiler.h"
+ 
++#include <cstdlib>
++#include <functional>
++#include <process.h>
++#include <string>
++
++#ifdef _WIN32
++#define WIN32_LEAN_AND_MEAN
++#include <windows.h>
++#endif
++
++static std::unique_ptr<uint8_t[]> readAllBytes(const char* filePath, size_t& fileSize);
++static void writeAllBytes(const char* filePath, const void* data, size_t dataSize);
++
++// BROKEN_BOND_WGSL stores WGSL text in the spirv blob instead of smol-v.
++// naga declares push constants as var<immediate>, which plume-web rewrites to
++// the uniform buffer at group 3 binding 999. The PC cache leaves this unset.
++static bool ConvertSpirvToWgsl(const void* spirv, size_t spirvSize, uint64_t hash, const std::string& naga,
++                               std::vector<uint8_t>& wgsl)
++{
++#ifndef _WIN32
++    (void)spirv;
++    (void)spirvSize;
++    (void)hash;
++    (void)naga;
++    (void)wgsl;
++    fputs("WGSL conversion is implemented for the Windows host tool\n", stderr);
++    return false;
++#else
++    const auto directory = std::filesystem::temp_directory_path();
++    const auto spirvPath = directory / fmt::format("bb-{:016X}.spv", hash);
++    const auto wgslPath = directory / fmt::format("bb-{:016X}.wgsl", hash);
++    const auto logPath = directory / fmt::format("bb-{:016X}.log", hash);
++    writeAllBytes(spirvPath.string().c_str(), spirv, spirvSize);
++
++    SECURITY_ATTRIBUTES inherit{};
++    inherit.nLength = sizeof(inherit);
++    inherit.bInheritHandle = TRUE;
++    HANDLE log = CreateFileA(logPath.string().c_str(), GENERIC_WRITE, FILE_SHARE_READ, &inherit, CREATE_ALWAYS,
++                             FILE_ATTRIBUTE_TEMPORARY, nullptr);
++    std::string command = fmt::format("\"{}\" --input-kind spv --keep-coordinate-space \"{}\" \"{}\"", naga,
++                                      spirvPath.string(), wgslPath.string());
++    STARTUPINFOA startup{};
++    startup.cb = sizeof(startup);
++    startup.dwFlags = STARTF_USESTDHANDLES;
++    startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
++    startup.hStdOutput = log;
++    startup.hStdError = log;
++    PROCESS_INFORMATION process{};
++    const BOOL started = log != INVALID_HANDLE_VALUE &&
++                         CreateProcessA(nullptr, command.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr,
++                                        nullptr, &startup, &process);
++    DWORD code = 1;
++    if (started) {
++        WaitForSingleObject(process.hProcess, INFINITE);
++        GetExitCodeProcess(process.hProcess, &code);
++        CloseHandle(process.hThread);
++        CloseHandle(process.hProcess);
++    }
++    if (log != INVALID_HANDLE_VALUE) CloseHandle(log);
++
++    std::string text;
++    if (started && code == 0 && std::filesystem::exists(wgslPath)) {
++        size_t wgslSize = 0;
++        auto wgslBytes = readAllBytes(wgslPath.string().c_str(), wgslSize);
++        text.assign(reinterpret_cast<const char*>(wgslBytes.get()), wgslSize);
++        const auto rewrite = [](std::string& value, const std::string& from, const std::string& to) {
++            for (size_t at = 0; (at = value.find(from, at)) != std::string::npos; at += to.size())
++                value.replace(at, from.size(), to);
++        };
++        rewrite(text, "var<immediate>", "@group(3) @binding(999) var<uniform>");
++        rewrite(text, "var<push_constant>", "@group(3) @binding(999) var<uniform>");
++    }
++    std::filesystem::remove(spirvPath);
++    std::filesystem::remove(wgslPath);
++
++    if (!started || code != 0 || text.empty() || text.find("binding_array") != std::string::npos) {
++        fmt::print(stderr, "WGSL conversion failed for {:016X}\n", hash);
++        if (std::filesystem::exists(logPath)) {
++            size_t logSize = 0;
++            auto logBytes = readAllBytes(logPath.string().c_str(), logSize);
++            fwrite(logBytes.get(), 1, logSize, stderr);
++            std::filesystem::remove(logPath);
++        }
++        return false;
++    }
++    std::filesystem::remove(logPath);
++    wgsl.assign(text.begin(), text.end());
++    return true;
++#endif
++}
++
+ static std::unique_ptr<uint8_t[]> readAllBytes(const char* filePath, size_t& fileSize)
+ {
+     FILE* file = fopen(filePath, "rb");
+@@ -114,8 +205,14 @@ int main(int argc, char** argv)
+         }
+ 
+         std::atomic<uint32_t> progress = 0;
+-
+-        std::for_each(std::execution::par_unseq, shaders.begin(), shaders.end(), [&](auto& hashShaderPair)
++        const bool web = std::getenv("BROKEN_BOND_WGSL") != nullptr;
++        const char* nagaEnv = std::getenv("BROKEN_BOND_NAGA");
++        const std::string naga = nagaEnv != nullptr && nagaEnv[0] != '\0' ? nagaEnv : "naga";
++        std::atomic<uint32_t> webFailures = 0;
++
++        // DXC compiling the web heap overflows the 1 MiB stack of a parallel
++        // worker. The web path uses a few threads with a 16 MiB stack instead.
++        auto compileOne = [&](auto& hashShaderPair)
+             {
+                 auto& shader = hashShaderPair.second;
+ 
+@@ -136,15 +233,73 @@ int main(int argc, char** argv)
+                 IDxcBlob* spirv = dxcCompiler.compile(recompiler.out, recompiler.isPixelShader, false, true);
+                 assert(spirv != nullptr);
+ 
+-                bool result = smolv::Encode(spirv->GetBufferPointer(), spirv->GetBufferSize(), shader.spirv, smolv::kEncodeFlagStripDebugInfo);
+-                assert(result);
++                if (web) {
++                    const uint64_t hash = hashShaderPair.first;
++                    bool converted = ConvertSpirvToWgsl(spirv->GetBufferPointer(), spirv->GetBufferSize(), hash, naga,
++                                                        shader.spirv);
++                    if (!converted) {
++                        // -Od avoids the pointer spill. The shaders it cannot
++                        // convert are retried with DXC's optimizer.
++                        _putenv("BROKEN_BOND_DXC_OPT=1");
++                        spirv->Release();
++                        spirv = dxcCompiler.compile(recompiler.out, recompiler.isPixelShader, false, true);
++                        _putenv("BROKEN_BOND_DXC_OPT=0");
++                        converted = spirv != nullptr &&
++                                    ConvertSpirvToWgsl(spirv->GetBufferPointer(), spirv->GetBufferSize(), hash, naga,
++                                                       shader.spirv);
++                    }
++                    if (!converted)
++                        webFailures.fetch_add(1);
++                } else {
++                    bool result = smolv::Encode(spirv->GetBufferPointer(), spirv->GetBufferSize(), shader.spirv,
++                                                smolv::kEncodeFlagStripDebugInfo);
++                    assert(result);
++                }
+ 
+-                spirv->Release();
++                if (spirv != nullptr)
++                    spirv->Release();
+ 
+                 size_t currentProgress = ++progress;
+                 if ((currentProgress % 10) == 0 || (currentProgress == shaders.size() - 1))
+                     fmt::println("Recompiling shaders... {}%", currentProgress / float(shaders.size()) * 100.0f);
+-            });
++            };
++
++        if (!web) {
++            std::for_each(std::execution::par_unseq, shaders.begin(), shaders.end(), compileOne);
++        } else {
++            struct Pool {
++                std::vector<std::map<XXH64_hash_t, RecompiledShader>::iterator> items;
++                std::atomic<size_t> cursor{0};
++                std::function<void(std::pair<const XXH64_hash_t, RecompiledShader>&)> compile;
++            } state;
++            for (auto it = shaders.begin(); it != shaders.end(); ++it)
++                state.items.push_back(it);
++            state.compile = compileOne;
++            static Pool* active = nullptr;
++            active = &state;
++            // More than one DXC compile of this heap at a time aborts the process.
++            constexpr unsigned kThreads = 1;
++            HANDLE threads[kThreads]{};
++            auto entry = [](void*) -> unsigned {
++                while (true) {
++                    const size_t index = active->cursor.fetch_add(1);
++                    if (index >= active->items.size())
++                        return 0;
++                    active->compile(*active->items[index]);
++                }
++            };
++            for (unsigned i = 0; i < kThreads; i++)
++                threads[i] = reinterpret_cast<HANDLE>(_beginthreadex(nullptr, 16u * 1024u * 1024u, entry, nullptr, 0, nullptr));
++            WaitForMultipleObjects(kThreads, threads, TRUE, INFINITE);
++            for (HANDLE thread : threads)
++                CloseHandle(thread);
++            active = nullptr;
++        }
++
++        if (webFailures.load() != 0) {
++            fmt::print(stderr, "{} shaders did not convert to WGSL\n", webFailures.load());
++            return 1;
++        }
+ 
+         fmt::println("Creating shader cache...");
+ 
+diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
+index 1c74034..f5739af 100644
+--- a/XenosRecomp/shader_common.h
++++ b/XenosRecomp/shader_common.h
+@@ -3,6 +3,21 @@
+ 
+ #define SPEC_CONSTANT_R11G11B10_NORMAL  (1 << 0)
+ #define SPEC_CONSTANT_ALPHA_TEST        (1 << 1)
++// Not a specialization constant: marks vertex shaders whose fetches read
++// the fetch table by a computed index (see vfetchIndexed).
++#define SPEC_CONSTANT_INDEXED_FETCH     (1 << 8)
++// Not specialization constants either: mark vertex shaders whose constant
++// table names these registers (frame interpolation blends them).
++#define SPEC_CONSTANT_SKIN_MATRICES     (1 << 9)  // g_aSkinMatrices c42-c137
++#define SPEC_CONSTANT_WORLD_VIEW_PROJ   (1 << 10) // g_mWorldViewProj c0-c3
++#define SPEC_CONSTANT_WORLD_VIEW        (1 << 11) // g_mWorldView c4-c6
++#define SPEC_CONSTANT_INV_TRANS_WORLD   (1 << 12) // g_mInvTransWorld c8-c11
++#define SPEC_CONSTANT_WORLD             (1 << 13) // g_mWorld c12-c14
++#define SPEC_CONSTANT_VIEWER_POSITION   (1 << 14) // g_vViewerPosition c21
++// g_mShadowTransform0 from c42, three rows per cascade: cascades << 15 (0-4).
++#define SPEC_CONSTANT_SHADOW0_SHIFT     15
++// g_mShadowTransform1 right after it, two rows per cascade: cascades << 18.
++#define SPEC_CONSTANT_SHADOW1_SHIFT     18
+ 
+ #ifdef UNLEASHED_RECOMP
+     #define SPEC_CONSTANT_BICUBIC_GI_FILTER (1 << 2)
+diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
+index 698a418..9878680 100644
+--- a/XenosRecomp/shader_recompiler.cpp
++++ b/XenosRecomp/shader_recompiler.cpp
+@@ -1,6 +1,8 @@
+ #include "shader_recompiler.h"
+ #include "shader_common.h"
+ 
++#include <cstdlib>
++
+ static constexpr char SWIZZLES[] = 
+ { 
+     'x',
+@@ -74,7 +76,9 @@ struct DeclUsageLocation
+     uint32_t location;
+ };
+ 
+-// NOTE: These are specialized Vulkan locations for Unleashed Recompiled. Change as necessary. Likely not going to work with other games.
++// Vulkan locations for Naruto: The Broken Bond. The host renderer binds vertex
++// elements by the same table (kVertexLocations in xenos_shader_common.h).
++// BB's 4648 vertex shaders use only these 16 semantics.
+ static constexpr DeclUsageLocation USAGE_LOCATIONS[] =
+ {
+     { DeclUsage::Position, 0, 0 },
+@@ -85,14 +89,13 @@ static constexpr DeclUsageLocation USAGE_LOCATIONS[] =
+     { DeclUsage::TexCoord, 1, 5 },
+     { DeclUsage::TexCoord, 2, 6 },
+     { DeclUsage::TexCoord, 3, 7 },
+-    { DeclUsage::Color, 0, 8 },
+-    { DeclUsage::BlendIndices, 0, 9 },
+-    { DeclUsage::BlendWeight, 0, 10 },
+-    { DeclUsage::Color, 1, 11 },
+-    { DeclUsage::TexCoord, 4, 12 },
+-    { DeclUsage::TexCoord, 5, 13 },
+-    { DeclUsage::TexCoord, 6, 14 },
+-    { DeclUsage::TexCoord, 7, 15 },
++    { DeclUsage::TexCoord, 4, 8 },
++    { DeclUsage::Color, 0, 9 },
++    { DeclUsage::Color, 1, 10 },
++    { DeclUsage::Color, 2, 11 },
++    { DeclUsage::Color, 3, 12 },
++    { DeclUsage::BlendIndices, 0, 13 },
++    { DeclUsage::BlendWeight, 0, 14 },
+     { DeclUsage::Position, 1, 15 },
+ };
+ 
+@@ -118,13 +121,6 @@ static constexpr std::pair<DeclUsage, size_t> INTERPOLATORS[] =
+     { DeclUsage::Color, 1 }
+ };
+ 
+-static constexpr std::string_view TEXTURE_DIMENSIONS[] = 
+-{
+-    "2D",
+-    "3D", 
+-    "Cube" 
+-};
+-
+ static FetchDestinationSwizzle getDestSwizzle(uint32_t dstSwizzle, uint32_t index)
+ {
+     return FetchDestinationSwizzle((dstSwizzle >> (index * 3)) & 0x7);
+@@ -179,6 +175,44 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+     auto findResult = vertexElements.find(address);
+     assert(findResult != vertexElements.end());
+ 
++    if (indexedFetch)
++    {
++        // Broken Bond: the index is whatever register the shader computed
++        // (instanced particles fetch the mesh by vertex % n and the
++        // instance by vertex / n). The table holds decoded float4s.
++        uint32_t location = 0;
++        for (auto& usageLocation : USAGE_LOCATIONS)
++        {
++            if (usageLocation.usage == findResult->second.usage && usageLocation.usageIndex == findResult->second.usageIndex)
++            {
++                location = usageLocation.location;
++                break;
++            }
++        }
++
++        if (findResult->second.usage == DeclUsage::TexCoord)
++            print("tfetchTexcoord(g_SwappedTexcoords, ");
++
++        print("vfetchIndexed({}, r{}.{}, {})", location, uint32_t(instr.srcRegister), SWIZZLES[instr.srcSwizzle],
++            instr.isIndexRounded ? "true" : "false");
++
++        if (findResult->second.usage == DeclUsage::TexCoord)
++            print(", {})", uint32_t(findResult->second.usageIndex));
++
++        out += '.';
++        printDstSwizzle(instr.dstSwizzle, true);
++        out += ";\n";
++        printDstSwizzle01(instr.dstRegister, instr.dstSwizzle);
++
++        if (instr.isPredicated)
++        {
++            --indentation;
++            indent();
++            out += "}\n";
++        }
++        return;
++    }
++
+     switch (findResult->second.usage)
+     {
+     case DeclUsage::Normal:
+@@ -225,7 +259,8 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+ 
+ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicubic)
+ {
+-    if (instr.opcode != FetchOpcode::TextureFetch && instr.opcode != FetchOpcode::GetTextureWeights)
++    if (instr.opcode != FetchOpcode::TextureFetch && instr.opcode != FetchOpcode::GetTextureWeights &&
++        instr.opcode != FetchOpcode::GetTextureGradients)
+         return;
+ 
+     if (instr.isPredicated)
+@@ -246,6 +281,31 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
+                 out += SWIZZLES[((instr.srcSwizzle >> (i * 2))) & 0x3];
+         };
+ 
++    // getGradients needs no texture: it returns the screen-space derivatives
++    // of its two source components. Cel shaders use their sum as the width
++    // of the light/shadow edge.
++    if (instr.opcode == FetchOpcode::GetTextureGradients)
++    {
++        indent();
++        print("r{}.", instr.dstRegister);
++        printDstSwizzle(instr.dstSwizzle, false);
++        out += " = gradients(";
++        printSrcRegister(2);
++        out += ").";
++        printDstSwizzle(instr.dstSwizzle, true);
++        out += ";\n";
++
++        printDstSwizzle01(instr.dstRegister, instr.dstSwizzle);
++
++        if (instr.isPredicated)
++        {
++            --indentation;
++            indent();
++            out += "}\n";
++        }
++        return;
++    }
++
+     std::string constName;
+     const char* constNamePtr = nullptr;
+ #ifdef UNLEASHED_RECOMP
+@@ -331,11 +391,19 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
+         out += "Bicubic";
+ #endif
+ 
+-    print("({0}_Texture{1}DescriptorIndex, {0}_SamplerDescriptorIndex, ", constNamePtr, dimension);
++    // Descriptor indices are kept per fetch constant slot: the host fills them
++    // from the guest's 32 texture fetch constants, so a sampler the constant
++    // table does not name still resolves.
++    print("(TEXTURE{1}_INDEX({0}), SAMPLER_INDEX({0}), ", instr.constIndex, dimension);
+     printSrcRegister(componentCount);
+ 
+     switch (instr.dimension)
+     {
++    case TextureDimension::Texture1D:
++        // Skinned meshes fetch the three rows of a bone matrix from one
++        // coordinate with offsets 0, 1 and 2 texels.
++        print(", {}", instr.offsetX * 0.5f);
++        break;
+     case TextureDimension::Texture2D:
+         print(", float2({}, {})", instr.offsetX * 0.5f, instr.offsetY * 0.5f);
+         break;
+@@ -1098,6 +1166,88 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+     }
+ }
+ 
++// True when some vertex fetch takes its index from anything but r0.x, the
++// vertex index Xenos loads there. Such shaders compute the index themselves.
++static bool hasComputedFetchIndex(const be<uint32_t>* code, uint32_t size)
++{
++    union
++    {
++        ControlFlowInstruction controlFlow[2];
++        struct
++        {
++            uint32_t code0;
++            uint32_t code1;
++            uint32_t code2;
++            uint32_t code3;
++        };
++    };
++
++    uint32_t instrSize = size;
++    for (uint32_t cf = 0; cf * 12 < instrSize; cf++)
++    {
++        auto controlFlowCode = code + cf * 3;
++        code0 = controlFlowCode[0];
++        code1 = controlFlowCode[1] & 0xFFFF;
++        code2 = (controlFlowCode[1] >> 16) | (controlFlowCode[2] << 16);
++        code3 = controlFlowCode[2] >> 16;
++
++        for (auto& cfInstr : controlFlow)
++        {
++            uint32_t address = 0, count = 0, sequence = 0;
++            switch (cfInstr.opcode)
++            {
++            case ControlFlowOpcode::Exec:
++            case ControlFlowOpcode::ExecEnd:
++                address = cfInstr.exec.address;
++                count = cfInstr.exec.count;
++                sequence = cfInstr.exec.sequence;
++                break;
++            case ControlFlowOpcode::CondExec:
++            case ControlFlowOpcode::CondExecEnd:
++            case ControlFlowOpcode::CondExecPredClean:
++            case ControlFlowOpcode::CondExecPredCleanEnd:
++                address = cfInstr.condExec.address;
++                count = cfInstr.condExec.count;
++                sequence = cfInstr.condExec.sequence;
++                break;
++            case ControlFlowOpcode::CondExecPred:
++            case ControlFlowOpcode::CondExecPredEnd:
++                address = cfInstr.condExecPred.address;
++                count = cfInstr.condExecPred.count;
++                sequence = cfInstr.condExecPred.sequence;
++                break;
++            default:
++                break;
++            }
++
++            if (address == 0)
++                continue;
++
++            instrSize = std::min<uint32_t>(instrSize, address * 12);
++            for (uint32_t i = 0; i < count; i++, sequence >>= 2)
++            {
++                if ((sequence & 0x1) == 0)
++                    continue;
++
++                union
++                {
++                    VertexFetchInstruction vertexFetch;
++                    uint32_t words[3];
++                };
++                words[0] = code[(address + i) * 3];
++                words[1] = code[(address + i) * 3 + 1];
++                words[2] = code[(address + i) * 3 + 2];
++                if (vertexFetch.opcode == FetchOpcode::VertexFetch &&
++                    (vertexFetch.srcRegister != 0 || vertexFetch.srcSwizzle != 0))
++                {
++                    return true;
++                }
++            }
++        }
++    }
++    return false;
++}
++
+ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_view& include)
+ {
+     const auto shaderContainer = reinterpret_cast<const ShaderContainer*>(shaderData);
+@@ -1127,6 +1277,37 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+ 
+         const char* constantName = reinterpret_cast<const char*>(constantTableData + constantInfo->name);
+ 
++        if (!isPixelShader && constantInfo->registerSet == RegisterSet::Float4)
++        {
++            static constexpr struct { const char* name; uint16_t index, count; uint32_t bit; } MOTION[] =
++            {
++                { "g_aSkinMatrices", 42, 96, SPEC_CONSTANT_SKIN_MATRICES },
++                { "g_mWorldViewProj", 0, 4, SPEC_CONSTANT_WORLD_VIEW_PROJ },
++                { "g_mWorldView", 4, 3, SPEC_CONSTANT_WORLD_VIEW },
++                { "g_mInvTransWorld", 8, 4, SPEC_CONSTANT_INV_TRANS_WORLD },
++                { "g_mWorld", 12, 3, SPEC_CONSTANT_WORLD },
++                { "g_vViewerPosition", 21, 1, SPEC_CONSTANT_VIEWER_POSITION },
++            };
++            if (strcmp(constantName, "g_mShadowTransform0") == 0 && constantInfo->registerIndex == 42 &&
++                constantInfo->registerCount % 3 == 0 && constantInfo->registerCount <= 12)
++            {
++                specConstantsMask |= (constantInfo->registerCount / 3) << SPEC_CONSTANT_SHADOW0_SHIFT;
++            }
++            if (strcmp(constantName, "g_mShadowTransform1") == 0 && constantInfo->registerCount % 2 == 0 &&
++                constantInfo->registerCount <= 8)
++            {
++                specConstantsMask |= (constantInfo->registerCount / 2) << SPEC_CONSTANT_SHADOW1_SHIFT;
++            }
++            for (const auto& motion : MOTION)
++            {
++                if (strcmp(constantName, motion.name) == 0 && constantInfo->registerIndex == motion.index &&
++                    constantInfo->registerCount <= motion.count)
++                {
++                    specConstantsMask |= motion.bit;
++                }
++            }
++        }
++
+     #ifdef UNLEASHED_RECOMP
+         if (!isPixelShader)
+         {
+@@ -1154,13 +1335,35 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+             {
+                 uint32_t tailCount = (isPixelShader ? 224 : 256) - constantInfo->registerIndex;
+ 
+-                println("#define {}(INDEX) select((INDEX) < {}, vk::RawBufferLoad<float4>(g_PushConstants.{}ShaderConstants + ({} + min(INDEX, {})) * 16, 0x10), 0.0)",
+-                    constantName, tailCount, shaderName, constantInfo->registerIndex.get(), tailCount - 1);
++                // BROKEN_BOND_WGSL: the push-constant word is a byte offset into
++                // the upload ring. The PC path keeps the GPU virtual address.
++                if (std::getenv("BROKEN_BOND_WGSL") != nullptr)
++                {
++                    // The base is read on both sides. select() around the load makes DXC
++                    // phi the push-constant pointer, and naga cannot store that pointer.
++                    println("#define {}(INDEX) (asfloat(g_Upload.Load4({} + (((INDEX) < {}) ? ({} + min((INDEX), {})) : 0) * 16)) * float((INDEX) < {}))",
++                        constantName, isPixelShader ? "g_WebPixelBase" : "g_WebVertexBase", tailCount,
++                        constantInfo->registerIndex.get(), tailCount - 1, tailCount);
++                }
++                else
++                {
++                    println("#define {}(INDEX) select((INDEX) < {}, vk::RawBufferLoad<float4>(g_PushConstants.{}ShaderConstants + ({} + min(INDEX, {})) * 16, 0x10), 0.0)",
++                        constantName, tailCount, shaderName, constantInfo->registerIndex.get(), tailCount - 1);
++                }
+             }
+             else
+             {
+-                println("#define {} vk::RawBufferLoad<float4>(g_PushConstants.{}ShaderConstants + {}, 0x10)",
+-                    constantName, shaderName, constantInfo->registerIndex * 16);
++                if (std::getenv("BROKEN_BOND_WGSL") != nullptr)
++                {
++                    println("#define {} asfloat(g_Upload.Load4({} + {}))",
++                        constantName, isPixelShader ? "g_WebPixelBase" : "g_WebVertexBase",
++                        constantInfo->registerIndex * 16);
++                }
++                else
++                {
++                    println("#define {} vk::RawBufferLoad<float4>(g_PushConstants.{}ShaderConstants + {}, 0x10)",
++                        constantName, shaderName, constantInfo->registerIndex * 16);
++                }
+             }
+             
+             for (uint16_t j = 0; j < constantInfo->registerCount; j++)
+@@ -1171,15 +1374,6 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+ 
+         case RegisterSet::Sampler:
+         {
+-            for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
+-            {
+-                println("#define {}_Texture{}DescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})",
+-                    constantName, TEXTURE_DIMENSIONS[j], j * 64 + constantInfo->registerIndex * 4);
+-            }
+-
+-            println("#define {}_SamplerDescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})",
+-                constantName, std::size(TEXTURE_DIMENSIONS) * 64 + constantInfo->registerIndex * 4);
+-
+             samplers.emplace(constantInfo->registerIndex, constantName);
+             break;
+         }
+@@ -1220,27 +1414,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+ 
+     out += "cbuffer SharedConstants : register(b2, space4)\n";
+     out += "{\n";
+-
+-    for (uint32_t i = 0; i < constantTableContainer->constantTable.constants; i++)
+-    {
+-        const auto constantInfo = reinterpret_cast<const ConstantInfo*>(
+-            constantTableData + constantTableContainer->constantTable.constantInfo + i * sizeof(ConstantInfo));
+-
+-        if (constantInfo->registerSet == RegisterSet::Sampler)
+-        {
+-            const char* constantName = reinterpret_cast<const char*>(constantTableData + constantInfo->name);
+-
+-            for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
+-            {
+-                println("\tuint {}_Texture{}DescriptorIndex : packoffset(c{}.{});",
+-                    constantName, TEXTURE_DIMENSIONS[j], j * 4 + constantInfo->registerIndex / 4, SWIZZLES[constantInfo->registerIndex % 4]);
+-            }
+-
+-            println("\tuint {}_SamplerDescriptorIndex : packoffset(c{}.{});",
+-                constantName, 4 * std::size(TEXTURE_DIMENSIONS) + constantInfo->registerIndex / 4, SWIZZLES[constantInfo->registerIndex % 4]);
+-        }
+-    }
+-
++    out += "\tDEFINE_DESCRIPTOR_INDICES();\n";
+     out += "\tDEFINE_SHARED_CONSTANTS();\n";
+     out += "};\n\n";
+ 
+@@ -1263,6 +1437,15 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+ 
+     const auto shader = reinterpret_cast<const Shader*>(shaderData + shaderContainer->shaderOffset);
+ 
++    if (!isPixelShader && std::getenv("BROKEN_BOND_WGSL") == nullptr)
++    {
++        indexedFetch = hasComputedFetchIndex(
++            reinterpret_cast<const be<uint32_t>*>(shaderData + shaderContainer->virtualSize + shader->physicalOffset),
++            shader->size);
++        if (indexedFetch)
++            specConstantsMask |= SPEC_CONSTANT_INDEXED_FETCH;
++    }
++
+     out += "#ifndef __spirv__\n";
+ 
+     if (isPixelShader)
+@@ -1322,6 +1505,12 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+             }
+         #endif
+ 
++            if (indexedFetch)
++            {
++                vertexElements.emplace(uint32_t(vertexElement.address), vertexElement);
++                continue;
++            }
++
+             out += '\t';
+ 
+             for (auto& usageLocation : USAGE_LOCATIONS)
+@@ -1347,6 +1536,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+         }
+     #endif
+ 
++        if (indexedFetch)
++            out += "\tin uint iVertexId : SV_VertexID,\n";
++
+         out += "\tout float4 oPos : SV_Position";
+ 
+         for (auto& [usage, usageIndex] : INTERPOLATORS)
+@@ -1356,6 +1548,13 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+     out += ")\n";
+     out += "{\n";
+ 
++    if (std::getenv("BROKEN_BOND_WGSL") != nullptr)
++    {
++        out += "\tg_WebVertexBase = uint(g_PushConstants.VertexShaderConstants);\n";
++        out += "\tg_WebPixelBase = uint(g_PushConstants.PixelShaderConstants);\n";
++        out += "\tg_WebSharedBase = uint(g_PushConstants.SharedConstants);\n";
++    }
++
+ #ifdef UNLEASHED_RECOMP
+     if (hasMtxProjection)
+     {
+@@ -1466,6 +1665,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+             {
+                 out += "float4((iPos.xy - 0.5) * float2(iFace ? 1.0 : -1.0, 1.0), 0.0, 0.0);\n";
+             }
++            else if (!isPixelShader && indexedFetch && i == 0)
++            {
++                out += "float4(float(iVertexId + g_FetchVertexBase), 0.0, 0.0, 0.0);\n";
++            }
+         #ifdef UNLEASHED_RECOMP
+             else if (!isPixelShader && hasIndexCount && i == 0)
+             {
+@@ -1804,7 +2007,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                     out += '{';
+ 
+                     indent();
+-                    out += "\tclip(oC0.w - g_AlphaThreshold);\n";
++                    out += "\talphaTest(oC0.w);\n";
+ 
+                     indent();
+                     out += "}";
+diff --git a/XenosRecomp/shader_recompiler.h b/XenosRecomp/shader_recompiler.h
+index b2e317d..72780f1 100644
+--- a/XenosRecomp/shader_recompiler.h
++++ b/XenosRecomp/shader_recompiler.h
+@@ -33,6 +33,7 @@ struct ShaderRecompiler : StringBuffer
+     std::unordered_map<uint32_t, const char*> samplers;
+     std::unordered_map<uint32_t, uint32_t> ifEndLabels;
+     uint32_t specConstantsMask = 0;
++    bool indexedFetch = false;
+ 
+ #ifdef UNLEASHED_RECOMP
+     bool hasMtxProjection = false;

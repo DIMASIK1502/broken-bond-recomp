@@ -44,10 +44,10 @@ index 96f86fe..bd7e4bd 100644
   public:
    VirtualFileSystem();
 diff --git a/include/rex/perf/counter.h b/include/rex/perf/counter.h
-index b3947e0..3eb66df 100644
+index b3947e0..5b31725 100644
 --- a/include/rex/perf/counter.h
 +++ b/include/rex/perf/counter.h
-@@ -74,6 +74,12 @@ int64_t GetSnapshotCounter(CounterId id);
+@@ -74,6 +74,17 @@ int64_t GetSnapshotCounter(CounterId id);
  // Initialize the counter system (zeroes everything). Safe to call multiple times.
  void Init();
  
@@ -57,14 +57,19 @@ index b3947e0..3eb66df 100644
 +int64_t GetPresentedFrameDtUs();
 +uint64_t GetPresentedFrameSerial();
 +
++// One PM4 DRAW_INDX / DRAW_INDX_2 the command processor read, counted since
++// start. A host thread compares it with the draws the title issued.
++void NoteDrawPacket();
++uint64_t GetDrawPacketCount();
++
  // CSV logging
  void SetCsvLogPath(const std::string& path);
  void WriteCsvFrame();
 diff --git a/src/core/perf/counter.cpp b/src/core/perf/counter.cpp
-index 536009e..eadde85 100644
+index 536009e..93f2d00 100644
 --- a/src/core/perf/counter.cpp
 +++ b/src/core/perf/counter.cpp
-@@ -179,4 +179,20 @@ void FlushCsv() {
+@@ -179,4 +179,30 @@ void FlushCsv() {
    g_csv_path.clear();
  }
  
@@ -82,6 +87,16 @@ index 536009e..eadde85 100644
 +
 +uint64_t GetPresentedFrameSerial() {
 +  return g_presented_serial.load(std::memory_order_acquire);
++}
++
++std::atomic<uint64_t> g_draw_packets{0};
++
++void NoteDrawPacket() {
++  g_draw_packets.fetch_add(1, std::memory_order_relaxed);
++}
++
++uint64_t GetDrawPacketCount() {
++  return g_draw_packets.load(std::memory_order_relaxed);
 +}
 +
  }  // namespace rex::perf
@@ -128,7 +143,7 @@ index a1b4dad..90f99bb 100644
    // flipped to a generic FileAttributeFlags?
  
 diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
-index a744375..f0e1d0a 100644
+index a744375..fdd0d54 100644
 --- a/src/graphics/command_processor.cpp
 +++ b/src/graphics/command_processor.cpp
 @@ -930,19 +930,22 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
@@ -156,3 +171,11 @@ index a744375..f0e1d0a 100644
    rex::perf::Profiler::Flip();
  
    // Xenia-specific VdSwap hook.
+@@ -1296,6 +1299,7 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
+     REXGPU_ERROR("{}: Packet too small, can't read VGT_DRAW_INITIATOR", opcode_name);
+     return false;
+   }
++  rex::perf::NoteDrawPacket();
+   reg::VGT_DRAW_INITIATOR vgt_draw_initiator;
+   vgt_draw_initiator.value = reader->ReadAndSwap<uint32_t>();
+   --count_remaining;
